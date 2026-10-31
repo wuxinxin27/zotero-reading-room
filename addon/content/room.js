@@ -27,11 +27,24 @@
     "problem", "novelty", "contributions",
     "prior-work", "superiority", "technical-uniqueness",
   ]);
+  const DEFAULT_PROVIDER = "openai";
+  const OPENAI_LEGACY_ENDPOINT = "http://127.0.0.1:11434/v1/chat/completions";
+  const MODEL_DISCOVERY_DELAY = 700;
+  // Core.API_PROVIDERS is authoritative. This fallback keeps the UI usable while
+  // an older service bundle is present; it contains provider metadata, never model IDs.
+  const FALLBACK_API_PROVIDERS = Object.freeze([
+    { id: "openai", label: "OpenAI 兼容 API", defaultEndpoint: OPENAI_LEGACY_ENDPOINT, endpointHint: "可填写 base URL，或旧的完整 chat completions 地址。" },
+    { id: "anthropic", label: "Anthropic Messages API", defaultEndpoint: "https://api.anthropic.com/v1", endpointHint: "填写 Anthropic API base URL；密钥仅用于本次会话。" },
+    { id: "gemini", label: "Google Gemini API", defaultEndpoint: "https://generativelanguage.googleapis.com/v1beta", endpointHint: "填写 Gemini API base URL；密钥仅用于本次会话。" },
+    { id: "ollama", label: "Ollama API", defaultEndpoint: "http://127.0.0.1:11434", endpointHint: "填写本机 Ollama API 地址。" },
+  ]);
 
   let state = null;
   let activeJob = null;
   let noteTimer = null;
   let checklistTimer = null;
+  let aiConfigSession = null;
+  let dialogSequence = 0;
   let loadGeneration = 0;
   let itemPaneID = null;
   let columnKey = null;
@@ -46,11 +59,11 @@
   }
 
   function documentBody(doc) {
-    return doc && doc.body || documentNode(doc, "body");
+    return documentNode(doc, "body");
   }
 
   function documentHead(doc) {
-    return doc && doc.head || documentNode(doc, "head");
+    return documentNode(doc, "head");
   }
 
   function setClass(element, className) {
@@ -138,7 +151,82 @@
     if (!element) return;
     element.textContent = message || "";
     setClass(element, "rr-message " + (kind || ""));
+    element.setAttribute("role", kind === "error" ? "alert" : "status");
+    element.setAttribute("aria-live", kind === "error" ? "assertive" : "polite");
     setHidden(element, !message);
+  }
+
+  function getProviderCatalog() {
+    const Core = scope.ReadingRoomCore;
+    const source = Core && Array.isArray(Core.API_PROVIDERS) && Core.API_PROVIDERS.length
+      ? Core.API_PROVIDERS
+      : FALLBACK_API_PROVIDERS;
+    const providers = [];
+    const seen = new Set();
+    for (const provider of source) {
+      const id = provider && String(provider.id || "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      providers.push({
+        id,
+        label: String(provider.label || id),
+        defaultEndpoint: String(provider.defaultEndpoint || ""),
+        endpointHint: String(provider.endpointHint || ""),
+      });
+    }
+    return providers.length ? providers : FALLBACK_API_PROVIDERS.map(provider => ({ ...provider }));
+  }
+
+  function isLoopbackHost(hostname) {
+    const host = String(hostname || "").toLowerCase();
+    return host === "localhost" || host === "[::1]" || host === "127.0.0.1";
+  }
+
+  function isGroupLibrary(item) {
+    try {
+      const library = item && Zotero.Libraries && Zotero.Libraries.get(item.libraryID);
+      return !!library && library.libraryType !== "user";
+    }
+    catch (_) {
+      return false;
+    }
+  }
+
+  function endpointContext(input) {
+    let endpoint;
+    try {
+      endpoint = new URL(String(input || "").trim());
+    }
+    catch (_) {
+      return { ok: false, error: "端点不是有效的 HTTP(S) 地址。" };
+    }
+    if (!["http:", "https:"].includes(endpoint.protocol)
+        || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+      return { ok: false, error: "端点仅允许无内嵌凭据、查询参数和片段的 HTTP(S) 地址。" };
+    }
+    const local = isLoopbackHost(endpoint.hostname);
+    if (!local && endpoint.protocol !== "https:") {
+      return { ok: false, local, origin: endpoint.origin, error: "远程端点必须使用 HTTPS。" };
+    }
+    return { ok: true, local, origin: endpoint.origin, url: endpoint };
+  }
+
+  function modelDiscoveryFailure(error) {
+    const code = String(error && error.code || "");
+    const status = Number(error && (error.status || error.statusCode));
+    if (code === "MODELS_UNSUPPORTED") {
+      return "当前协议或端点未提供模型列表接口；请手工填写模型名称。";
+    }
+    if (code === "MODELS_TIMEOUT") {
+      return "自动获取模型列表超时；请检查服务，或手工填写模型名称。";
+    }
+    if ([401, 403].includes(status)
+        || /(?:AUTH|UNAUTHORIZED|FORBIDDEN|API_KEY)/i.test(code)
+        || /\b(?:401|403)\b|鉴权|认证|密钥|unauthori[sz]ed|forbidden/i.test(String(error && error.message || ""))) {
+      return "模型列表鉴权失败；请检查 API 密钥，或手工填写模型名称。";
+    }
+    const message = error && error.message ? String(error.message) : "未知错误";
+    return `自动获取模型列表失败：${message}。可手工填写模型名称。`;
   }
 
   function newWindow() {
@@ -408,6 +496,19 @@
     if (noteTimer) clearTimeout(noteTimer);
     if (checklistTimer) clearTimeout(checklistTimer);
     noteTimer = checklistTimer = null;
+    if (aiConfigSession) {
+      const session = aiConfigSession;
+      aiConfigSession.generation++;
+      if (aiConfigSession.timer != null) clearTimeout(aiConfigSession.timer);
+      if (aiConfigSession.controller) {
+        try { aiConfigSession.controller.abort(); } catch (_) {}
+      }
+      aiConfigSession.finished = true;
+      aiConfigSession = null;
+      if (typeof session.close === "function") {
+        try { session.close(); } catch (_) {}
+      }
+    }
     if (Zotero.Reader && typeof Zotero.Reader.unregisterEventListener === "function") {
       try { Zotero.Reader.unregisterEventListener("renderToolbar", readerToolbar); } catch (_) {}
     }
@@ -805,23 +906,29 @@
 
   async function runAnalysis(mode) {
     if (!state || !state.currentItem || state.analyzing) return;
+    const targetItem = state.currentItem;
     let config = null;
     if (mode === "model") {
-      config = await openAIConfig();
-      if (!config) return;
+      config = await openAIConfig(targetItem);
+      if (!config || !state || state.currentItem !== targetItem) return;
     }
-    activeJob = { status: "extracting", detail: mode === "model" ? "准备本机模型分析…" : "准备本地抽取式预读…" };
+    activeJob = {
+      status: "extracting",
+      detail: mode === "model"
+        ? `准备通过 ${config.providerLabel || config.provider} 分析…`
+        : "准备本地抽取式预读…",
+    };
     showJob(activeJob);
     try {
-      const result = await state.service.analyze(state.currentItem, Object.assign({
+      const result = await state.service.analyze(targetItem, Object.assign({
         attachmentID: state.currentAttachmentID,
         mode,
         onProgress(job) {
           activeJob = job;
-          showJob(job);
+          if (state && state.currentItem === targetItem) showJob(job);
         },
       }, config || {}));
-      if (!state) return;
+      if (!state || state.currentItem !== targetItem) return;
       state.description.state.analysis = result;
       renderAnalysis(result);
       setBooleanAttribute(state.noteButton, "disabled", false);
@@ -848,112 +955,513 @@
     }
   }
 
-  function dialogShell(title) {
+  function dialogShell(title, onClose) {
     const doc = state && state.document || mainDocument;
+    const body = documentBody(doc);
+    if (!body) throw new Error("阅读室页面缺少 XHTML body 节点。");
+    const dialogID = `rr-dialog-${++dialogSequence}`;
     const overlay = doc.createElementNS(XHTML_NS, "div");
     setClass(overlay, "rr-modal-overlay");
     const modal = doc.createElementNS(XHTML_NS, "section");
     setClass(modal, "rr-modal");
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
-    modal.setAttribute("aria-label", title);
+    modal.setAttribute("aria-labelledby", `${dialogID}-title`);
+    modal.setAttribute("tabindex", "-1");
     const heading = make("div", "rr-modal-head");
-    heading.append(make("h2", null, title));
-    const close = makeApiButton("关闭", "rr-icon-button", () => overlay.remove(), "关闭对话框");
+    const headingText = make("h2", null, title);
+    headingText.setAttribute("id", `${dialogID}-title`);
+    heading.append(headingText);
+    let closed = false;
+    const close = makeApiButton("关闭", "rr-icon-button", () => closeDialog(), "关闭对话框");
+    close.setAttribute("aria-label", "关闭 AI 分析设置");
     heading.append(close);
     modal.append(heading);
     overlay.append(modal);
-    overlay.addEventListener("click", event => {
-      if (event.target === overlay) overlay.remove();
-    });
-    documentBody(doc).append(overlay);
-    return { overlay, modal };
+    const onKeyDown = event => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeDialog();
+      }
+    };
+    const closeDialog = () => {
+      if (closed) return;
+      closed = true;
+      overlay.removeEventListener("click", onOverlayClick);
+      overlay.removeEventListener("keydown", onKeyDown);
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      if (typeof onClose === "function") onClose();
+    };
+    const onOverlayClick = event => {
+      if (event.target === overlay) closeDialog();
+    };
+    overlay.addEventListener("click", onOverlayClick);
+    overlay.addEventListener("keydown", onKeyDown);
+    body.append(overlay);
+    return { overlay, modal, close: closeDialog };
   }
 
-  function openAIConfig() {
+  function openAIConfig(item = state && state.currentItem) {
     return new Promise(resolve => {
-      const { overlay, modal } = dialogShell("AI 分析设置");
-      const finish = value => {
-        overlay.remove();
-        resolve(value);
+      const doc = state && state.document || mainDocument;
+      const providers = getProviderCatalog();
+      const defaultProvider = providers.find(provider => provider.id === DEFAULT_PROVIDER) || providers[0];
+      const groupRemoteForbidden = isGroupLibrary(item);
+      const session = {
+        generation: 0,
+        timer: null,
+        controller: null,
+        finished: false,
+        discoveryAllowedOrigin: null,
+        analysisAllowedOrigin: null,
+        lastEndpoint: defaultProvider.defaultEndpoint,
+        lastProvider: defaultProvider.id,
       };
-      const endpoint = (state && state.document || mainDocument).createElementNS(XHTML_NS, "input");
-      endpoint.setAttribute("type", "url");
-      setValue(endpoint, "http://127.0.0.1:11434/v1/chat/completions");
-      endpoint.setAttribute("autocomplete", "off");
-      const model = (state && state.document || mainDocument).createElementNS(XHTML_NS, "input");
-      model.setAttribute("type", "text");
-      model.setAttribute("placeholder", "必须填写已安装或可用的模型");
-      model.setAttribute("autocomplete", "off");
-      const modelList = (state && state.document || mainDocument).createElementNS(XHTML_NS, "datalist");
-      modelList.setAttribute("id", "rr-model-suggestions");
-      for (const value of ["llama3.3", "qwen3", "mistral-small"]) {
-        const option = (state && state.document || mainDocument).createElementNS(XHTML_NS, "option");
-        setValue(option, value);
-        modelList.append(option);
+      let closeShell = () => {};
+      let settling = false;
+      let sessionMounted = false;
+      const cleanup = () => {
+        if (session.finished) return;
+        session.finished = true;
+        session.generation++;
+        if (session.timer != null) clearTimeout(session.timer);
+        session.timer = null;
+        if (session.controller) {
+          try { session.controller.abort(); } catch (_) {}
+        }
+        session.controller = null;
+        if (aiConfigSession === session) aiConfigSession = null;
+        if (!sessionMounted) {
+          try { closeShell(); } catch (_) {}
+          resolve(null);
+        }
+      };
+      const finish = value => {
+        if (session.finished) return;
+        settling = true;
+        cleanup();
+        if (sessionMounted) {
+          closeShell();
+          resolve(value);
+        }
+      };
+      const shell = dialogShell("AI 分析设置", () => {
+        cleanup();
+        if (!settling) resolve(null);
+      });
+      closeShell = shell.close;
+      session.close = shell.close;
+      const { modal } = shell;
+      sessionMounted = true;
+      aiConfigSession = session;
+
+      const provider = doc.createElementNS(XHTML_NS, "select");
+      provider.setAttribute("aria-label", "AI 协议");
+      for (const entry of providers) {
+        const option = doc.createElementNS(XHTML_NS, "option");
+        option.value = entry.id;
+        option.setAttribute("value", entry.id);
+        option.textContent = entry.label;
+        provider.append(option);
       }
-      model.setAttribute("list", modelList.getAttribute("id"));
-      const apiKey = (state && state.document || mainDocument).createElementNS(XHTML_NS, "input");
+      provider.value = defaultProvider.id;
+      provider.setAttribute("value", defaultProvider.id);
+      const providerHint = make("p", "rr-field-help");
+      const endpoint = doc.createElementNS(XHTML_NS, "input");
+      endpoint.setAttribute("type", "url");
+      setValue(endpoint, defaultProvider.defaultEndpoint);
+      endpoint.setAttribute("autocomplete", "off");
+      endpoint.setAttribute("spellcheck", "false");
+      endpoint.setAttribute("placeholder", "例如 http://127.0.0.1:11434/v1");
+
+      const model = doc.createElementNS(XHTML_NS, "input");
+      model.setAttribute("type", "text");
+      model.setAttribute("placeholder", "搜索自动获取的模型，或手工填写模型 ID");
+      model.setAttribute("autocomplete", "off");
+      model.setAttribute("role", "combobox");
+      model.setAttribute("aria-autocomplete", "list");
+      model.setAttribute("aria-expanded", "false");
+      model.setAttribute("aria-controls", "rr-model-options");
+
+      const modelOptions = doc.createElementNS(XHTML_NS, "div");
+      modelOptions.setAttribute("id", "rr-model-options");
+      modelOptions.setAttribute("role", "listbox");
+      setClass(modelOptions, "rr-model-options");
+      setHidden(modelOptions, true);
+
+      const discoveryStatus = make("div", "rr-message");
+      discoveryStatus.setAttribute("role", "status");
+      discoveryStatus.setAttribute("aria-live", "polite");
+      setHidden(discoveryStatus, true);
+
+      const discoveryActions = make("div", "rr-inline-actions");
+      const refresh = makeApiButton("获取模型列表", "rr-secondary", () => {
+        scheduleDiscovery(0, true);
+      });
+      discoveryActions.append(refresh);
+
+      const apiKey = doc.createElementNS(XHTML_NS, "input");
       apiKey.setAttribute("type", "password");
       apiKey.setAttribute("autocomplete", "off");
       apiKey.setAttribute("placeholder", "可选；仅保存在本次窗口内存");
-      const remote = (state && state.document || mainDocument).createElementNS(XHTML_NS, "input");
-      remote.setAttribute("type", "checkbox");
-      const remoteRow = make("label", "rr-check rr-warning-check");
-      remoteRow.append(remote, make("span", null,
+
+      const discoveryRemote = doc.createElementNS(XHTML_NS, "input");
+      discoveryRemote.setAttribute("type", "checkbox");
+      discoveryRemote.setAttribute("aria-label", "允许连接该远程 API 获取模型列表");
+      const discoveryRemoteRow = make("label", "rr-check rr-warning-check");
+      discoveryRemoteRow.append(discoveryRemote, make("span", null,
+        "允许连接该远程 API 获取模型列表（只发送协议、端点和密钥；不发送论文或 PDF）。"));
+      discoveryRemote.setAttribute("aria-describedby", "rr-discovery-permission-help");
+      discoveryRemoteRow.setAttribute("id", "rr-discovery-permission-help");
+
+      const analysisRemote = doc.createElementNS(XHTML_NS, "input");
+      analysisRemote.setAttribute("type", "checkbox");
+      analysisRemote.setAttribute("aria-label", "允许向该远程 API 发送有界论文正文");
+      const analysisRemoteRow = make("label", "rr-check rr-warning-check");
+      analysisRemoteRow.append(analysisRemote, make("span", null,
         "我明确同意本次把所选 PDF 的有界原文片段发送到上面的非本机 HTTPS 服务，并自行确认服务商与数据用途。"));
+      analysisRemote.setAttribute("aria-describedby", "rr-analysis-permission-help");
+      analysisRemoteRow.setAttribute("id", "rr-analysis-permission-help");
+
       const warning = make("div", "rr-callout rr-warning");
-      warning.textContent = "默认只访问本机端点。密钥不会写入偏好、项目、阅读状态或日志；关闭窗口后即清除。远程端点必须为 HTTPS，并勾选上方确认。";
+      warning.textContent = "模型发现与正文分析是两次独立许可。本机端点可自动发现；远程端点必须使用 HTTPS 并分别授权。密钥不会写入偏好、项目、阅读状态或日志，关闭设置后即从本对话框清除。";
+
       const actions = make("div", "rr-modal-actions");
-      const cancel = makeApiButton("取消", "", () => finish(null));
+      const cancel = makeApiButton("取消", "rr-secondary", () => finish(null));
       const run = makeApiButton("开始 AI 分析", "rr-button-primary", () => {
-        if (!getValue(model).trim()) {
-          setStatus(modalStatus, "请填写模型名称。", "error");
+        const selectedProvider = providers.find(entry => entry.id === getValue(provider)) || defaultProvider;
+        const context = endpointContext(getValue(endpoint));
+        const modelID = getValue(model).trim();
+        if (!context.ok) {
+          setStatus(modalStatus, context.error, "error");
+          endpoint.focus();
+          return;
+        }
+        if (!modelID) {
+          setStatus(modalStatus, "请从模型列表中选择，或手工填写模型 ID。", "error");
           model.focus();
           return;
         }
-        let parsed;
-        try { parsed = new URL(getValue(endpoint)); }
-        catch (_) {
-          setStatus(modalStatus, "端点不是有效的 HTTP(S) 地址。", "error");
+        const allowRemote = getChecked(analysisRemote)
+          && session.analysisAllowedOrigin === context.origin;
+        if (!context.local && groupRemoteForbidden) {
+          setStatus(modalStatus, "群组文库禁止远程正文分析；请改用本机端点。", "error");
           return;
         }
-        const local = ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname.toLowerCase());
-        if (!local && (!getChecked(remote) || parsed.protocol !== "https:")) {
-          setStatus(modalStatus, "远程端点必须使用 HTTPS，并勾选明确同意。", "error");
+        if (!context.local && !allowRemote) {
+          setStatus(modalStatus, "远程正文分析必须勾选上方独立同意；更换端点 origin 后需要重新勾选。", "error");
+          analysisRemote.focus();
           return;
         }
         finish({
+          provider: selectedProvider.id,
+          providerLabel: selectedProvider.label,
           endpoint: getValue(endpoint).trim(),
-          model: getValue(model).trim(),
+          model: modelID,
           apiKey: getValue(apiKey) || undefined,
-          allowRemote: getChecked(remote) && !local,
+          allowRemote,
         });
       });
+
       const modalStatus = make("div", "rr-message");
       setHidden(modalStatus, true);
       actions.append(cancel, run);
+
+      const modelField = makeField("模型（可搜索或手工输入）", model);
+      modelField.append(modelOptions, discoveryStatus, discoveryActions);
+      modelField.setAttribute("role", "group");
+      modelField.setAttribute("aria-labelledby", "rr-model-field-label");
+      const modelFieldLabel = modelField.children[0];
+      if (modelFieldLabel) modelFieldLabel.setAttribute("id", "rr-model-field-label");
+      const providerField = makeField("AI 协议", provider);
+      providerField.append(providerHint);
       modal.append(
-        makeField("模型端点", endpoint),
-        makeField("模型名称", model),
-        modelList,
+        providerField,
+        makeField("API 端点", endpoint),
         makeField("API 密钥（仅本次内存）", apiKey),
-        remoteRow,
+        discoveryRemoteRow,
+        modelField,
+        analysisRemoteRow,
         warning,
         modalStatus,
         actions,
       );
-      endpoint.addEventListener("input", () => {
-        try {
-          const parsed = new URL(getValue(endpoint));
-          setHidden(remoteRow, ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname.toLowerCase()));
+
+      const clearModels = () => {
+        modelOptions.replaceChildren();
+        setHidden(modelOptions, true);
+        model.setAttribute("aria-expanded", "false");
+        refreshModels();
+      };
+      const updateProviderHint = () => {
+        const selected = providers.find(entry => entry.id === getValue(provider)) || defaultProvider;
+        providerHint.textContent = selected.endpointHint
+          || "端点可填写服务商 base URL；后端会统一规范化列表与请求地址。";
+      };
+      const resetRemoteConsent = () => {
+        setChecked(discoveryRemote, false);
+        setChecked(analysisRemote, false);
+        session.discoveryAllowedOrigin = null;
+        session.analysisAllowedOrigin = null;
+      };
+      const resetStaleState = (clearKey) => {
+        session.generation++;
+        session.models = [];
+        session.discoveryPending = false;
+        if (session.timer != null) clearTimeout(session.timer);
+        session.timer = null;
+        if (session.controller) {
+          try { session.controller.abort(); } catch (_) {}
         }
-        catch (_) {
-          setHidden(remoteRow, false);
+        session.controller = null;
+        clearModels();
+        setStatus(discoveryStatus, "", "");
+        setStatus(modalStatus, "", "");
+        if (clearKey) setValue(apiKey, "");
+      };
+      const setDiscoveryPermissionForEndpoint = context => {
+        if (!context.ok) {
+          setHidden(discoveryRemoteRow, false);
+          return;
+        }
+        setHidden(discoveryRemoteRow, context.local);
+        if (context.local) setChecked(discoveryRemote, false);
+        if (session.discoveryAllowedOrigin && session.discoveryAllowedOrigin !== context.origin) {
+          session.discoveryAllowedOrigin = null;
+          setChecked(discoveryRemote, false);
+        }
+      };
+      const setAnalysisPermissionForEndpoint = context => {
+        if (!context.ok) {
+          setHidden(analysisRemoteRow, false);
+          return;
+        }
+        setHidden(analysisRemoteRow, context.local);
+        if (context.local || groupRemoteForbidden) setChecked(analysisRemote, false);
+        setBooleanAttribute(analysisRemote, "disabled", groupRemoteForbidden && !context.local);
+        const description = analysisRemoteRow.lastElementChild;
+        if (description) {
+          description.textContent = groupRemoteForbidden && !context.local
+            ? "群组文库禁止远程正文分析；该端点只能用于获取模型列表。请改用本机端点分析。"
+            : "我明确同意本次把所选 PDF 的有界原文片段发送到上面的非本机 HTTPS 服务，并自行确认服务商与数据用途。";
+        }
+        if (session.analysisAllowedOrigin && session.analysisAllowedOrigin !== context.origin) {
+          session.analysisAllowedOrigin = null;
+          setChecked(analysisRemote, false);
+        }
+      };
+      const addModelOptions = (models, query) => {
+        const needle = query.toLowerCase();
+        const visible = models.filter(entry => !needle
+          || String(entry.id).toLowerCase().includes(needle)
+          || String(entry.name).toLowerCase().includes(needle)).slice(0, 80);
+        modelOptions.replaceChildren();
+        for (const entry of visible) {
+          const option = make("button", "rr-model-option", entry.name || entry.id);
+          option.setAttribute("type", "button");
+          option.setAttribute("role", "option");
+          option.setAttribute("aria-selected", String(entry.id === getValue(model).trim()));
+          if (entry.name && entry.name !== entry.id) option.append(make("span", "rr-model-id", entry.id));
+          option.addEventListener("click", () => {
+            if (session.finished) return;
+            setValue(model, entry.id);
+            modelOptions.replaceChildren();
+            setHidden(modelOptions, true);
+            model.setAttribute("aria-expanded", "false");
+            model.focus();
+          });
+          modelOptions.append(option);
+        }
+        setHidden(modelOptions, visible.length === 0);
+        model.setAttribute("aria-expanded", String(visible.length > 0));
+      };
+      const refreshModels = () => {
+        const models = Array.isArray(session.models) ? session.models : [];
+        if (!models.length && session.discoveryPending) {
+          setBooleanAttribute(refresh, "disabled", true);
+          return;
+        }
+        if (!models.length) {
+          setBooleanAttribute(refresh, "disabled", !session.lastEndpoint);
+          return;
+        }
+        addModelOptions(models, getValue(model));
+        setBooleanAttribute(refresh, "disabled", false);
+      };
+
+      const discover = async (generation) => {
+        if (session.finished || generation !== session.generation) return;
+        const selectedProvider = providers.find(entry => entry.id === getValue(provider)) || defaultProvider;
+        const context = endpointContext(getValue(endpoint));
+        if (!context.ok) {
+          setStatus(discoveryStatus, context.error + " 仍可手工填写模型 ID。", "warning");
+          setBooleanAttribute(refresh, "disabled", true);
+          return;
+        }
+        const allowRemote = !context.local
+          && getChecked(discoveryRemote)
+          && session.discoveryAllowedOrigin === context.origin;
+        if (!context.local && !allowRemote) {
+          setStatus(discoveryStatus,
+            "该远程端点尚未授权获取模型列表；勾选上方许可，或手工填写模型 ID。",
+            "warning");
+          setBooleanAttribute(refresh, "disabled", !getChecked(discoveryRemote));
+          return;
+        }
+        if (!state || !state.service || typeof state.service.listModels !== "function") {
+          setStatus(discoveryStatus,
+            "当前后端未提供模型列表接口；请手工填写模型 ID。", "warning");
+          setBooleanAttribute(refresh, "disabled", true);
+          return;
+        }
+        const controller = new (state.window.AbortController || AbortController)();
+        session.controller = controller;
+        session.discoveryPending = true;
+        setBooleanAttribute(refresh, "disabled", true);
+        setStatus(discoveryStatus, `正在从 ${selectedProvider.label} 获取模型列表…`, "pending");
+        try {
+          const result = await state.service.listModels({
+            provider: selectedProvider.id,
+            endpoint: getValue(endpoint).trim(),
+            apiKey: getValue(apiKey) || undefined,
+            allowRemote,
+            signal: controller.signal,
+            item,
+          });
+          if (session.finished || generation !== session.generation) return;
+          const models = Array.isArray(result && result.models) ? result.models
+            .filter(entry => entry && String(entry.id || "").trim())
+            .map(entry => ({
+              id: String(entry.id).trim(),
+              name: String(entry.name || entry.id).trim() || String(entry.id).trim(),
+            })) : [];
+          session.models = models;
+          if (result && result.endpoint && String(result.endpoint).trim()) {
+            session.lastEndpoint = String(result.endpoint).trim();
+          }
+          if (!models.length) {
+            session.discoveryPending = false;
+            setStatus(discoveryStatus,
+              "服务返回了空模型列表；请确认账号权限，或手工填写模型 ID。", "warning");
+            refresh.textContent = "刷新模型列表";
+          }
+          else {
+            session.discoveryPending = false;
+            setStatus(discoveryStatus,
+              `已获取 ${models.length} 个模型；可在模型框中搜索，也可继续手工输入。`, "success");
+            refresh.textContent = "刷新模型列表";
+          }
+          refreshModels();
+        }
+        catch (error) {
+          if (session.finished || generation !== session.generation) return;
+          session.discoveryPending = false;
+          const cancelled = controller.signal && controller.signal.aborted
+            || String(error && error.code || "") === "CANCELLED";
+          if (!cancelled) {
+            setStatus(discoveryStatus, modelDiscoveryFailure(error), "error");
+            refresh.textContent = "重试获取模型列表";
+          }
+        }
+        finally {
+          session.discoveryPending = false;
+          if (!session.finished && generation === session.generation) {
+            if (session.controller === controller) session.controller = null;
+            setBooleanAttribute(refresh, "disabled", false);
+          }
+        }
+      };
+
+      function scheduleDiscovery(delay = MODEL_DISCOVERY_DELAY, force = false) {
+        if (session.finished) return;
+        session.generation++;
+        const generation = session.generation;
+        if (session.timer != null) clearTimeout(session.timer);
+        session.timer = null;
+        if (session.controller) {
+          try { session.controller.abort(); } catch (_) {}
+        }
+        session.controller = null;
+        session.discoveryPending = false;
+        if (!force) {
+          session.models = [];
+          modelOptions.replaceChildren();
+          setHidden(modelOptions, true);
+          model.setAttribute("aria-expanded", "false");
+        }
+        setStatus(discoveryStatus, delay ? "正在等待地址、协议或密钥变化结束…" : "", delay ? "pending" : "");
+        session.timer = setTimeout(() => {
+          if (session.finished || generation !== session.generation) return;
+          session.timer = null;
+          void discover(generation);
+        }, delay);
+      }
+
+      const providerChanged = () => {
+        const selected = providers.find(entry => entry.id === getValue(provider)) || defaultProvider;
+        resetStaleState(true);
+        resetRemoteConsent();
+        setValue(endpoint, selected.defaultEndpoint);
+        setValue(model, "");
+        session.lastProvider = selected.id;
+        session.lastEndpoint = selected.defaultEndpoint;
+        updateProviderHint();
+        setDiscoveryPermissionForEndpoint(endpointContext(selected.defaultEndpoint));
+        setAnalysisPermissionForEndpoint(endpointContext(selected.defaultEndpoint));
+        scheduleDiscovery();
+      };
+      const endpointChanged = () => {
+        const context = endpointContext(getValue(endpoint));
+        const originChanged = session.lastEndpoint !== getValue(endpoint).trim()
+          && (!context.ok || context.origin !== endpointContext(session.lastEndpoint).origin);
+        resetStaleState(originChanged);
+        session.lastEndpoint = getValue(endpoint).trim();
+        setDiscoveryPermissionForEndpoint(context);
+        setAnalysisPermissionForEndpoint(context);
+        scheduleDiscovery();
+      };
+      const credentialChanged = () => {
+        resetStaleState(false);
+        refresh.textContent = "获取模型列表";
+        scheduleDiscovery();
+      };
+      const remotePermissionChanged = () => {
+        const context = endpointContext(getValue(endpoint));
+        session.discoveryAllowedOrigin = !context.ok || context.local
+          || !getChecked(discoveryRemote) ? null : context.origin;
+        resetStaleState(false);
+        scheduleDiscovery(0, true);
+      };
+      const analysisPermissionChanged = () => {
+        const context = endpointContext(getValue(endpoint));
+        session.analysisAllowedOrigin = groupRemoteForbidden || !context.ok || context.local
+          || !getChecked(analysisRemote) ? null : context.origin;
+        if (session.analysisAllowedOrigin) {
+          setStatus(modalStatus,
+            "已授权向该远程端点发送有界正文；群组文库仍禁止远程正文分析。", "warning");
+        }
+      };
+
+      provider.addEventListener("change", providerChanged);
+      endpoint.addEventListener("input", endpointChanged);
+      endpoint.addEventListener("change", endpointChanged);
+      apiKey.addEventListener("input", credentialChanged);
+      discoveryRemote.addEventListener("change", remotePermissionChanged);
+      analysisRemote.addEventListener("change", analysisPermissionChanged);
+      model.addEventListener("input", refreshModels);
+      model.addEventListener("focus", refreshModels);
+      model.addEventListener("keydown", event => {
+        if (event.key === "Escape" && !modelOptions.hasAttribute("hidden")) {
+          event.stopPropagation();
+          setHidden(modelOptions, true);
+          model.setAttribute("aria-expanded", "false");
         }
       });
-      endpoint.dispatchEvent(new (state.window.Event || Event)("input"));
-      model.focus();
+      updateProviderHint();
+      setDiscoveryPermissionForEndpoint(endpointContext(defaultProvider.defaultEndpoint));
+      setAnalysisPermissionForEndpoint(endpointContext(defaultProvider.defaultEndpoint));
+      scheduleDiscovery();
+      modal.focus();
     });
   }
 
@@ -1091,6 +1599,8 @@
       ].filter(Boolean).join(" · ") || "元数据尚未完整";
       state.metadata.replaceChildren(metadataRows(description));
       state.attachmentSelect.replaceChildren();
+      state.attachmentSelect.value = "";
+      state.attachmentSelect.removeAttribute("value");
       if (!pdfs.length) {
         const option = (state && state.document || mainDocument).createElementNS(XHTML_NS, "option");
         setValue(option, "");
@@ -1106,6 +1616,8 @@
           setBooleanAttribute(option, "selected", attachment.id === state.currentAttachmentID);
           state.attachmentSelect.append(option);
         }
+        state.attachmentSelect.value = String(state.currentAttachmentID);
+        state.attachmentSelect.setAttribute("value", String(state.currentAttachmentID));
       }
       setBooleanAttribute(state.attachmentSelect, "disabled", !pdfs.some(attachment => attachment.available));
       updateStatusPills(state.statusChoices, description.state.status);
@@ -1193,7 +1705,7 @@
     privacy.append(
       make("h3", null, "数据边界"),
       make("p", null, "默认只读取本机 PDF，阅读状态和笔记保存在本地插件存储。"),
-      make("p", null, "“抽取式预读”不联网；AI 分析只有在设置对话框明确提交后才会调用所选端点。"),
+      make("p", null, "“抽取式预读”不联网；模型列表只在主动打开 AI 设置后获取，正文发送需单独明确同意。"),
       make("p", null, "分析结果与阅读记录只有点击对应保存按钮时才写入 Zotero 笔记。"),
     );
     sidebar.append(dashboard, privacy);
@@ -1221,6 +1733,7 @@
     const attachmentField = make("label", "rr-field rr-attachment-field");
     attachmentField.append(make("span", "rr-field-label", "用于分析的本地 PDF"));
     const attachmentSelect = (state && state.document || mainDocument).createElementNS(XHTML_NS, "select");
+      attachmentSelect.value = "";
     attachmentField.append(attachmentSelect);
     const notesLabel = make("label", "rr-field rr-notes-field");
     notesLabel.append(make("span", "rr-field-label", "阅读笔记 · 自动保存到本地插件存储"));
@@ -1328,6 +1841,19 @@
     targetWindow.addEventListener("unload", () => {
       if (noteTimer) clearTimeout(noteTimer);
       if (checklistTimer) clearTimeout(checklistTimer);
+      if (aiConfigSession) {
+        const session = aiConfigSession;
+        aiConfigSession.generation++;
+        if (aiConfigSession.timer != null) clearTimeout(aiConfigSession.timer);
+        if (aiConfigSession.controller) {
+          try { aiConfigSession.controller.abort(); } catch (_) {}
+        }
+        aiConfigSession.finished = true;
+        aiConfigSession = null;
+        if (typeof session.close === "function") {
+          try { session.close(); } catch (_) {}
+        }
+      }
       if (activeJob && state && state.currentItem && state.service) {
         try { state.service.cancelAnalysis(state.currentItem); } catch (_) {}
       }

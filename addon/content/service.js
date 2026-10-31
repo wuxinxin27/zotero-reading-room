@@ -24,6 +24,70 @@
     return !!item && typeof item.isRegularItem === "function" && item.isRegularItem() && !item.deleted;
   }
 
+  function modelName(options, provider) {
+    let model = String(options.model || "").trim();
+    if (provider === "gemini") model = model.replace(/^models\//, "");
+    if (!model) throw Core.error("MODEL_REQUIRED", "请明确填写已安装或可用的模型名称。");
+    if (model.length > 256 || /[\u0000-\u001f\u007f]/.test(model)
+        || (provider === "gemini" && !/^[A-Za-z0-9._-]+$/.test(model))) {
+      throw Core.error("INVALID_MODEL", "模型名称格式无效；请使用服务提供的模型 ID。");
+    }
+    return model;
+  }
+
+  function apiHeaders(provider, apiKey) {
+    const headers = { "Content-Type": "application/json", Accept: "application/json" };
+    if (provider === "anthropic") headers["anthropic-version"] = "2023-06-01";
+    if (apiKey) {
+      const key = String(apiKey);
+      if (key.length > 8192 || /[\u0000-\u001f\u007f]/.test(key)) throw Core.error("INVALID_API_KEY", "API 密钥格式无效。");
+      if (provider === "anthropic") headers["x-api-key"] = key;
+      else if (provider === "gemini") headers["x-goog-api-key"] = key;
+      else headers.Authorization = "Bearer " + key;
+    }
+    return headers;
+  }
+
+  function textBlocks(value) {
+    if (typeof value === "string") return value;
+    return Array.isArray(value) ? value.filter(block => block && !block.thought
+      && (!block.type || ["text", "output_text"].includes(block.type)) && typeof block.text === "string")
+      .map(block => block.text).join("") : "";
+  }
+
+  function parseModelResponse(response, provider) {
+    let content;
+    if (provider === "anthropic") content = textBlocks(response && response.content);
+    else if (provider === "gemini") content = textBlocks(response && response.candidates && response.candidates[0]
+      && response.candidates[0].content && response.candidates[0].content.parts);
+    else if (provider === "ollama") content = textBlocks(response && response.message && response.message.content);
+    else content = textBlocks(response && response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content);
+    if (!content || content.length > 1000000) throw Core.error("INVALID_MODEL_OUTPUT", "模型未返回有效且大小受限的 JSON 文本。");
+    try {
+      // Only parse data. Tool calls, HTML, and source instructions are never executed.
+      return JSON.parse(content.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/, ""));
+    }
+    catch (_) { throw Core.error("INVALID_MODEL_OUTPUT", "模型未返回有效 JSON；请检查模型是否支持结构化文本输出。"); }
+  }
+
+  function rejectCredentialEcho(value, apiKey, code = "INVALID_MODEL_OUTPUT") {
+    if (!apiKey) return;
+    const key = String(apiKey);
+    const pending = [value];
+    while (pending.length) {
+      const entry = pending.pop();
+      if (typeof entry === "string" && entry.includes(key)) {
+        throw Core.error(code, "API 返回包含凭据；已拒绝保存或显示。");
+      }
+      if (entry && typeof entry === "object") {
+        for (const [name, child] of Object.entries(entry)) {
+          if (name.includes(key)) throw Core.error(code, "API 返回包含凭据；已拒绝保存或显示。");
+          pending.push(child);
+        }
+      }
+    }
+  }
+
   class ReadingRoomService {
     constructor(Zotero, { rootURI } = {}) {
       if (!Zotero) throw Core.error("ZOTERO_REQUIRED", "需要 Zotero 运行环境。");
@@ -229,7 +293,7 @@
       if (this._closed || (signal && signal.aborted)) throw Core.error("CANCELLED", "分析已取消。");
     }
 
-    async _bounded(promise, signal, timeout, failureCode) {
+    async _bounded(promise, signal, timeout, failureCode, failureMessage) {
       this._checkAbort(signal);
       const win = this.Zotero.getMainWindow && this.Zotero.getMainWindow();
       const setTimer = scope.setTimeout || (win && win.setTimeout.bind(win));
@@ -237,7 +301,7 @@
       let timer;
       let abort;
       const interruption = new Promise((_, reject) => {
-        if (setTimer) timer = setTimer(() => reject(Core.error(failureCode, "提取等待超时；Zotero 内部 PDF 工作任务可能仍在结束处理中。")), timeout);
+        if (setTimer) timer = setTimer(() => reject(Core.error(failureCode, failureMessage || "提取等待超时；Zotero 内部 PDF 工作任务可能仍在结束处理中。")), timeout);
         if (signal) {
           abort = () => reject(Core.error("CANCELLED", "分析已取消。"));
           signal.addEventListener("abort", abort, { once: true });
@@ -245,7 +309,7 @@
       });
       try { return await Promise.race([promise, interruption]); }
       finally {
-        if (timer && clearTimer) clearTimer(timer);
+        if (timer !== undefined && clearTimer) clearTimer(timer);
         if (signal && abort) signal.removeEventListener("abort", abort);
       }
     }
@@ -270,8 +334,9 @@
       if (!["extractive", "model"].includes(mode)) throw Core.error("INVALID_MODE", "未知分析模式。");
       let endpoint;
       if (mode === "model") {
-        endpoint = Core.validateEndpoint(options.endpoint, options.allowRemote === true);
-        if (!String(options.model || "").trim()) throw Core.error("MODEL_REQUIRED", "请明确填写已安装或可用的模型名称。");
+        endpoint = Core.validateEndpoint(options.endpoint, options.allowRemote === true, options.provider);
+        options = { ...options, model: modelName(options, endpoint.provider) };
+        apiHeaders(endpoint.provider, options.apiKey);
         const library = this._library(parent);
         if (library && library.libraryType !== "user" && !endpoint.local) {
           throw Core.error("GROUP_REMOTE_FORBIDDEN", "群组文库在此 MVP 中仅允许本机分析。");
@@ -333,6 +398,7 @@
         this._checkAbort(options.signal);
         result.createdAt = new Date().toISOString();
         result.id = "rr-" + Date.now().toString(36) + "-" + Core.hash(key + result.createdAt + Math.random()).slice(0, 10);
+        if (mode === "model") rejectCredentialEcho(result, options.apiKey);
         this._progress(parent, options, "saving", "正在保存到本地阅读侧文件");
         await this._serialize(() => {
           this._checkAbort(options.signal);
@@ -355,38 +421,146 @@
       }
     }
 
-    async _requestModel(endpoint, payload, options) {
+    async _requestAPI(method, url, payload, options, listing = false, timeout = listing ? 30000 : 120000) {
       if (!this.Zotero.HTTP || typeof this.Zotero.HTTP.request !== "function") {
         throw Core.error("HTTP_UNAVAILABLE", "Zotero 模型 HTTP 接口不可用。");
       }
       this._checkAbort(options.signal);
-      const headers = { "Content-Type": "application/json" };
-      if (options.apiKey) headers.Authorization = "Bearer " + String(options.apiKey);
+      const headers = apiHeaders(options.provider, options.apiKey);
+      const failureCode = listing ? "MODELS_REQUEST_FAILED" : "MODEL_REQUEST_FAILED";
+      const timeoutCode = listing ? "MODELS_TIMEOUT" : "MODEL_TIMEOUT";
       let cancel;
-      const abort = () => { if (cancel) cancel(); };
+      const abort = () => { try { if (cancel) cancel(); } catch (_) { /* Cancellation remains bounded by our own race. */ } };
       if (options.signal) options.signal.addEventListener("abort", abort, { once: true });
       try {
-        const xhr = await this.Zotero.HTTP.request("POST", endpoint.url, {
-          body: JSON.stringify(payload), headers, responseType: "json", successCodes: [200],
-          timeout: 120000, errorDelayMax: 0, noRetryOnThrottle: true,
-          logBodyLength: 0, debug: false, anon: true, followRedirects: false,
-          cancellerReceiver: receiver => { cancel = receiver; if (options.signal && options.signal.aborted) receiver(); }
+        const pending = this.Zotero.HTTP.request(method, url, {
+          ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
+          // Inspect status ourselves: avoid Zotero's error-body logging/retry path.
+          headers, responseType: "json", successCodes: false,
+          timeout, errorDelayMax: 0, noRetryOnThrottle: true,
+          logBodyLength: 0, debug: false, anon: true, noCache: true, followRedirects: false,
+          cancellerReceiver: receiver => { cancel = receiver; if (options.signal && options.signal.aborted) abort(); }
         });
+        const xhr = await this._bounded(pending, options.signal, timeout, timeoutCode, "API 请求超时；请检查服务状态后重试。");
         this._checkAbort(options.signal);
-        if (xhr.status !== 200) throw Core.error("MODEL_REQUEST_FAILED", "模型请求失败，或端点返回重定向。");
+        if (!xhr || xhr.status !== 200) return this._apiStatusError(xhr && xhr.status, listing);
         let response = xhr.response;
+        const serialized = typeof response === "string" ? response : JSON.stringify(response);
+        if (!serialized || serialized.length > 1000000) throw Core.error(listing ? "MODELS_INVALID_RESPONSE" : "INVALID_MODEL_OUTPUT", "API 返回为空或超出 100 万字符限制。");
+        if (options.apiKey && serialized.includes(String(options.apiKey))) throw Core.error(listing ? "MODELS_INVALID_RESPONSE" : "INVALID_MODEL_OUTPUT", "API 返回包含凭据；已拒绝保存或显示。");
         if (typeof response === "string") response = JSON.parse(response);
-        const content = response && response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;
-        if (typeof content !== "string" || content.length > 1000000) throw Core.error("INVALID_MODEL_OUTPUT", "模型未返回有效且大小受限的 JSON 文本。");
-        // Do not execute model text, HTML, tools, or actions. Parse data only.
-        return JSON.parse(content.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/, ""));
+        rejectCredentialEcho(response, options.apiKey, listing ? "MODELS_INVALID_RESPONSE" : "INVALID_MODEL_OUTPUT");
+        return response;
       }
       catch (cause) {
         this._checkAbort(options.signal);
-        if (cause && ["INVALID_MODEL_OUTPUT", "MODEL_REQUEST_FAILED"].includes(cause.code)) throw cause;
-        throw Core.error("MODEL_REQUEST_FAILED", "模型请求失败或未返回 JSON；请检查端点、模型名称与服务状态。密钥不会写入阅读状态。");
+        const Timeout = this.Zotero.HTTP.TimeoutException;
+        if (cause && (cause.code === timeoutCode || cause.name === "TimeoutException" || (typeof Timeout === "function" && cause instanceof Timeout))) {
+          abort(); throw Core.error(timeoutCode, "API 请求超时；请检查服务状态后重试。");
+        }
+        const status = cause && (cause.status || (cause.xmlhttp && cause.xmlhttp.status));
+        if (status) return this._apiStatusError(status, listing);
+        // Never expose upstream messages, response bodies, headers, or URLs in errors.
+        const safeCodes = [failureCode, "MODELS_UNSUPPORTED", "MODELS_AUTH_FAILED", "MODEL_AUTH_FAILED", "MODELS_INVALID_RESPONSE", "INVALID_MODEL_OUTPUT"];
+        if (cause && safeCodes.includes(cause.code)) throw Core.error(cause.code, {
+          MODELS_UNSUPPORTED: "服务未提供此协议的模型列表；可手工填写模型 ID。",
+          MODELS_AUTH_FAILED: "模型列表鉴权失败；请检查 API 密钥与访问权限。",
+          MODEL_AUTH_FAILED: "模型鉴权失败；请检查 API 密钥与访问权限。",
+          MODELS_INVALID_RESPONSE: "模型列表返回格式无效；可手工填写模型 ID。",
+          INVALID_MODEL_OUTPUT: "模型返回格式无效或超出大小限制。"
+        }[cause.code] || "API 请求失败；请检查端点与所选协议。");
+        throw Core.error(failureCode, "API 请求失败或未返回 JSON；请检查端点、协议与服务状态。密钥不会写入阅读状态。");
       }
-      finally { if (options.signal) options.signal.removeEventListener("abort", abort); }
+      finally { if (options.signal) options.signal.removeEventListener("abort", abort); cancel = null; }
+    }
+
+    _apiStatusError(status, listing) {
+      if ([401, 403].includes(Number(status))) throw Core.error(listing ? "MODELS_AUTH_FAILED" : "MODEL_AUTH_FAILED", "API 鉴权失败；请检查密钥与权限。");
+      if (listing && [404, 405, 501].includes(Number(status))) throw Core.error("MODELS_UNSUPPORTED", "服务未提供此协议的模型列表；可手工填写模型 ID。");
+      throw Core.error(listing ? "MODELS_REQUEST_FAILED" : "MODEL_REQUEST_FAILED", "API 请求失败；请检查端点、所选协议与服务状态。重定向不会跟随。");
+    }
+
+    async listModels(options = {}) {
+      // Discovery is independent of reading state: no init(), extraction, job, note, or write.
+      this._checkAbort(options.signal);
+      const endpoint = Core.validateEndpoint(options.endpoint, options.allowRemote === true, options.provider);
+      if (options.item) this._item(options.item);
+      const Controller = this._environment("AbortController");
+      const controller = Controller ? new Controller() : null;
+      const callerSignal = options.signal;
+      const callerAbort = () => controller && controller.abort();
+      if (controller) {
+        this._controllers.add(controller);
+        if (callerSignal) callerSignal.addEventListener("abort", callerAbort, { once: true });
+      }
+      options = { ...options, provider: endpoint.provider, signal: controller ? controller.signal : callerSignal };
+      const models = new Map();
+      const cursors = new Set();
+      const deadline = Date.now() + 60000;
+      let cursor = "";
+      try {
+        for (let page = 0; page < 5 && models.size < 500; page++) {
+          this._checkAbort(options.signal);
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw Core.error("MODELS_TIMEOUT", "模型列表读取超时；可重试或手工填写模型 ID。");
+          const url = new URL(endpoint.modelsURL);
+          if (endpoint.provider === "gemini") {
+            url.searchParams.set("pageSize", "100");
+            if (cursor) url.searchParams.set("pageToken", cursor);
+          }
+          else if (endpoint.provider === "anthropic") {
+            url.searchParams.set("limit", "100");
+            if (cursor) url.searchParams.set("after_id", cursor);
+          }
+          else if (cursor) url.searchParams.set("after", cursor);
+          const response = await this._requestAPI("GET", url.href, undefined, options, true, Math.min(30000, remaining));
+          const entries = response && (endpoint.provider === "gemini" || endpoint.provider === "ollama" ? response.models : response.data);
+          if (!Array.isArray(entries) || entries.length > 10000) throw Core.error("MODELS_INVALID_RESPONSE", "模型列表返回格式无效；可手工填写模型 ID。");
+          for (const entry of entries) {
+            if (!entry || typeof entry !== "object") continue;
+            if (endpoint.provider === "gemini" && !(Array.isArray(entry.supportedGenerationMethods) && entry.supportedGenerationMethods.includes("generateContent"))) continue;
+            const candidate = endpoint.provider === "gemini" ? entry.name : endpoint.provider === "ollama" ? entry.model || entry.name : entry.id;
+            if (typeof candidate !== "string") continue;
+            let id;
+            try { id = modelName({ model: candidate }, endpoint.provider); } catch (_) { continue; }
+            if (models.has(id)) continue;
+            const name = [entry.display_name, entry.displayName, entry.name].find(value => typeof value === "string" && value.trim()) || id;
+            models.set(id, { id, name: name.slice(0, 256) });
+            if (models.size >= 500) break;
+          }
+          const next = endpoint.provider === "gemini" ? response.nextPageToken
+            : endpoint.provider !== "ollama" && response.has_more === true ? response.last_id || (entries[entries.length - 1] || {}).id : "";
+          if (typeof next !== "string" || !next || next.length > 4096 || cursors.has(next)) break;
+          cursors.add(next);
+          cursor = next;
+        }
+        this._checkAbort(options.signal);
+        return { provider: endpoint.provider, endpoint: endpoint.modelsURL, models: Array.from(models.values()) };
+      }
+      finally {
+        if (controller) this._controllers.delete(controller);
+        if (callerSignal) callerSignal.removeEventListener("abort", callerAbort);
+      }
+    }
+
+    async _requestModel(endpoint, chunk, options) {
+      const provider = endpoint.provider;
+      const model = options.model;
+      const user = JSON.stringify(chunk);
+      const messages = [{ role: "system", content: MODEL_PROMPT }, { role: "user", content: user }];
+      let url = endpoint.url;
+      let payload;
+      if (provider === "anthropic") payload = { model, max_tokens: 4096, stream: false, system: MODEL_PROMPT, messages: [{ role: "user", content: user }] };
+      else if (provider === "gemini") {
+        url += "/" + encodeURIComponent(model) + ":generateContent";
+        payload = { systemInstruction: { parts: [{ text: MODEL_PROMPT }] }, contents: [{ role: "user", parts: [{ text: user }] }],
+          generationConfig: { responseMimeType: "application/json", maxOutputTokens: 8192 } };
+      }
+      else if (provider === "ollama") payload = { model, stream: false, format: "json", options: { temperature: 0 }, messages };
+      else payload = { model, temperature: 0, stream: false, response_format: { type: "json_object" }, messages };
+      const parsed = parseModelResponse(await this._requestAPI("POST", url, payload, { ...options, provider }), provider);
+      rejectCredentialEcho(parsed, options.apiKey);
+      return parsed;
     }
 
     async _modelAnalysis(parent, document, source, base, options, endpoint) {
@@ -399,11 +573,7 @@
         this._checkAbort(options.signal);
         const chunk = chunks[index];
         this._progress(parent, options, "analyzing", "模型片段 " + (index + 1) + "/" + chunks.length);
-        const raw = await this._requestModel(endpoint, {
-          model: String(options.model).trim(), temperature: 0, stream: false,
-          response_format: { type: "json_object" },
-          messages: [{ role: "system", content: MODEL_PROMPT }, { role: "user", content: JSON.stringify({ chunk: index + 1, pageIndex: chunk.pageIndex, text: chunk.text }) }]
-        }, options);
+        const raw = await this._requestModel(endpoint, { chunk: index + 1, pageIndex: chunk.pageIndex, text: chunk.text }, options);
         const chunkDocument = { text: chunk.text, segments: [chunk], pageAware: document.pageAware };
         for (const dimension of Core.validateModelOutput(raw, chunkDocument, source)) collected.get(dimension.id).push(dimension);
         analyzedCharacters += chunk.text.length;
@@ -425,7 +595,7 @@
         if (spec.id === "contributions") dimension.subtypes = base.dimensions.find(value => value.id === spec.id).subtypes;
         return dimension;
       });
-      return { ...base, mode: "model", model: String(options.model).trim(), dimensions,
+      return { ...base, mode: "model", provider: endpoint.provider, model: String(options.model).trim(), dimensions,
         coverage: { ...base.coverage, extractedCharacters: plan.totalCharacters, analyzedCharacters, ratio: plan.totalCharacters ? analyzedCharacters / plan.totalCharacters : 0,
           chunksAnalyzed: chunks.length, chunksAvailable: plan.chunks.length,
           completeDocument: base.coverage.completeDocument && analyzedCharacters === plan.totalCharacters },

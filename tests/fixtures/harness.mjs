@@ -15,7 +15,7 @@ export function loadCore() {
 
 // All paths, Zotero objects, storage, extraction results, and HTTP replies are synthetic.
 // No running Zotero, real profile, database, PDF, or network is consulted by these tests.
-export function createHarness({ libraryType = "user", editable = true, files = new Map(), extracted = paper } = {}) {
+export function createHarness({ libraryType = "user", editable = true, files = new Map(), extracted = paper, timers = {} } = {}) {
   const records = new Map();
   const calls = { extracts: 0, requests: [], noteSaves: 0, writes: [], opened: [], fileChecks: 0 };
   let nextID = 100;
@@ -91,7 +91,7 @@ export function createHarness({ libraryType = "user", editable = true, files = n
     },
     Reader: { async open(id, location) { calls.opened.push({ id, location }); return { id, location }; } }
   };
-  const context = vm.createContext({ URL, AbortController, setTimeout, clearTimeout,
+  const context = vm.createContext({ URL, AbortController, setTimeout: timers.setTimeout || setTimeout, clearTimeout: timers.clearTimeout || clearTimeout,
     IOUtils: io, PathUtils: { join: (...parts) => path.posix.join(...parts) } });
   vm.runInContext(coreSource, context, { filename: "core.js" });
   vm.runInContext(serviceSource, context, { filename: "service.js" });

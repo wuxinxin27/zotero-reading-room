@@ -4,6 +4,12 @@
 
   const SCHEMA_VERSION = 1;
   const STATUSES = Object.freeze(["unread", "to_read", "reading", "read", "parked"]);
+  const API_PROVIDERS = Object.freeze([
+    { id: "openai", label: "OpenAI 兼容", defaultEndpoint: "http://127.0.0.1:11434/v1", endpointHint: "基础地址或完整 /v1/chat/completions 地址" },
+    { id: "anthropic", label: "Anthropic Messages", defaultEndpoint: "https://api.anthropic.com/v1", endpointHint: "基础地址或完整 /v1/messages 地址" },
+    { id: "gemini", label: "Google Gemini", defaultEndpoint: "https://generativelanguage.googleapis.com/v1beta", endpointHint: "基础地址或完整 /v1beta/models/模型:generateContent 地址" },
+    { id: "ollama", label: "Ollama 原生", defaultEndpoint: "http://127.0.0.1:11434", endpointHint: "基础地址或完整 /api/chat 地址" }
+  ].map(Object.freeze));
   const DIMENSIONS = Object.freeze([
     { id: "problem", label: "解决的问题", cues: /\b(problem|challenge|aim|objective|address|limitation|bottleneck)\b|问题|挑战|旨在|解决|局限/i },
     { id: "novelty", label: "新颖性", cues: /\b(novel|new|first|introduce|propos\w*|unlike|innovation)\b|首次|新颖|提出|创新/i },
@@ -218,21 +224,40 @@
     };
   }
 
-  function validateEndpoint(input, allowRemote = false) {
+  function validateEndpoint(input, allowRemote = false, provider = "openai") {
+    const specification = API_PROVIDERS.find(entry => entry.id === provider);
+    if (!specification) throw error("UNKNOWN_PROVIDER", "未知 API 协议；请明确选择受支持的协议。");
     let endpoint;
-    try { endpoint = new URL(input || "http://127.0.0.1:11434/v1/chat/completions"); }
+    try { endpoint = new URL(input || specification.defaultEndpoint); }
     catch (_) { throw error("UNSAFE_ENDPOINT", "模型端点必须是有效的 HTTP(S) 地址。"); }
-    if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash
+        || /[?#]/.test(String(input || ""))) {
       throw error("UNSAFE_ENDPOINT", "模型端点仅允许无内嵌凭据、查询参数和片段的 HTTP(S) 地址。");
     }
     const local = ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname.toLowerCase());
     if (!local && (!allowRemote || endpoint.protocol !== "https:")) {
-      throw error("REMOTE_CONSENT_REQUIRED", "远程模型必须使用 HTTPS，并明确允许发送本文文本。");
+      throw error("REMOTE_CONSENT_REQUIRED", "远程 API 必须使用 HTTPS，并明确允许本次访问。");
     }
-    if (!/\/chat\/completions\/?$/.test(endpoint.pathname)) {
-      endpoint.pathname = endpoint.pathname.replace(/\/$/, "") + "/chat/completions";
+    let path = endpoint.pathname.replace(/\/+$/, "");
+    const routes = { openai: /\/chat\/completions$/, anthropic: /\/messages$/, gemini: /\/models\/[^/]+:generateContent$/, ollama: /\/api\/(?:chat|tags)$/ };
+    for (const [id, route] of Object.entries(routes)) {
+      if (id !== provider && route.test(path)) throw error("ENDPOINT_PROTOCOL_MISMATCH", "端点路径与所选 API 协议不一致。");
     }
-    return { url: endpoint.href, local };
+    const generationRoute = routes[provider].test(path);
+    const complete = generationRoute || (provider !== "ollama" && /\/models$/.test(path));
+    if (provider === "ollama") {
+      if (generationRoute) path = path.replace(/\/(?:chat|tags)$/, "");
+      if (!/\/api$/.test(path)) path += "/api";
+    }
+    else {
+      path = generationRoute ? path.replace(routes[provider], "") : path.replace(/\/models$/, "");
+      if (!complete && !/\/v\d+(?:beta\d*|alpha\d*)?$/.test(path)) path += provider === "gemini" ? "/v1beta" : "/v1";
+    }
+    endpoint.pathname = path;
+    const baseURL = endpoint.href.replace(/\/$/, "");
+    const modelsURL = baseURL + (provider === "ollama" ? "/tags" : "/models");
+    const url = baseURL + ({ openai: "/chat/completions", anthropic: "/messages", gemini: "/models", ollama: "/chat" })[provider];
+    return { provider, url, modelsURL, baseURL, local };
   }
 
   function chunkDocument(document, options = {}) {
@@ -297,7 +322,7 @@
     return html + "</div>";
   }
 
-  scope.ReadingRoomCore = Object.freeze({ SCHEMA_VERSION, STATUSES, DIMENSIONS, CONTRIBUTION_TYPES, error, clone, identity,
+  scope.ReadingRoomCore = Object.freeze({ SCHEMA_VERSION, STATUSES, API_PROVIDERS, DIMENSIONS, CONTRIBUTION_TYPES, error, clone, identity,
     defaultState, patchState, escapeHTML, hash, normalizeText, documentFromFullText, validateEvidence,
     extractiveAnalysis, validateEndpoint, chunkDocument, validateModelOutput, analysisNoteHTML });
 })(this);

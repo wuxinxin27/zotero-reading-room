@@ -386,6 +386,13 @@ summary:focus-visible {
   margin: 14px 0;
 }
 
+.rr-field-help {
+  margin: -1px 0 2px;
+  color: var(--rr-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .rr-field input,
 .rr-field select,
 .rr-field textarea,
@@ -451,6 +458,53 @@ summary:focus-visible {
   margin: 16px 0;
   border: 1px solid #ebd7a6;
   background: var(--rr-gold-soft);
+}
+
+.rr-inline-actions {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 6px;
+}
+
+.rr-model-options {
+  max-height: 190px;
+  overflow: auto;
+  border: 1px solid var(--rr-line-strong);
+  border-radius: 9px;
+  background: #fff;
+  box-shadow: 0 8px 22px rgba(29, 63, 56, 0.1);
+}
+
+.rr-model-option {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 0;
+  border-top: 1px solid var(--rr-line);
+  background: #fff;
+  color: var(--rr-ink);
+  text-align: left;
+}
+
+.rr-model-option:first-child {
+  border-top: 0;
+}
+
+.rr-model-option:hover,
+.rr-model-option:focus-visible {
+  background: var(--rr-teal-pale);
+}
+
+.rr-model-id {
+  flex: 0 1 auto;
+  color: var(--rr-muted);
+  font-family: ui-monospace, "Cascadia Mono", "SFMono-Regular", monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
 }
 
 .rr-button {
@@ -889,8 +943,10 @@ summary:focus-visible {
 .rr-modal {
   width: min(650px, calc(100vw - 48px));
   max-height: calc(100vh - 48px);
+  min-height: 0;
   padding: 21px;
   overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--rr-line);
   border-radius: 16px;
   background: var(--rr-paper);
@@ -1057,6 +1113,26 @@ summary:focus-visible {
   .rr-count-badge {
     max-width: 100%;
     white-space: normal;
+  }
+
+  .rr-modal-overlay {
+    align-items: stretch;
+    padding: 10px;
+  }
+
+  .rr-modal {
+    width: 100%;
+    max-height: calc(100vh - 20px);
+    padding: 17px;
+  }
+
+  .rr-modal-actions {
+    position: sticky;
+    bottom: -17px;
+    margin-right: -17px;
+    margin-left: -17px;
+    padding: 12px 17px;
+    background: var(--rr-paper);
   }
 }
 

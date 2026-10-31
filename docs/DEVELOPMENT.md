@@ -7,8 +7,8 @@
 | 路径 | 职责 |
 | --- | --- |
 | `addon/manifest.json`、`bootstrap.js` | Zotero 插件标识、兼容范围、启停生命周期 |
-| `addon/content/core.js` | 无文件/网络访问的领域逻辑：状态、提取候选、分页、证据和端点校验 |
-| `addon/content/service.js` | Zotero、PDF worker、本地侧文件、模型 HTTP、专用笔记适配 |
+| `addon/content/core.js` | 无文件/网络访问的领域逻辑：状态、提取候选、分页、证据、提供商元数据和端点规范化 |
+| `addon/content/service.js` | Zotero、PDF worker、本地侧文件、多协议模型发现/请求、专用笔记适配 |
 | `addon/content/room.*`、`addon/locale/` | 阅读室与宿主入口、样式、语言资源 |
 | `tests/core.test.mjs`、`tests/service.test.mjs`、`tests/fixtures/` | 虚构文库、PDF 提取结果、存储与 HTTP 测试适配器 |
 | `tests/package.test.mjs` | 独立读取 ZIP 结构、检查标准 CRC 向量、复现性、源文件边界与发布校验 |
@@ -22,7 +22,7 @@
 npm test
 npm run check
 npm run build
-node scripts/check.mjs --tag v0.1.0
+node scripts/check.mjs --tag v0.2.0
 ```
 
 `check` 校验 package/manifest 版本、固定插件 ID、Zotero 10.0–10.* 范围、必需资源、源文件类型与 JavaScript 语法。它不替代宿主运行、界面和 PDF worker 实测。
@@ -37,7 +37,9 @@ node scripts/check.mjs --tag v0.1.0
 
 插件 ID 为 `zotero-reading-room@wuxinxin27.github.io`，不要在更新中更换。版本由 `package.json` 与 manifest 一起更新。首版只声明 Zotero 10，初始实机目标为 10.0.7；不要未经验证扩大范围。
 
-`ReadingRoomCore` 是纯逻辑接口，`ReadingRoomService` 持有存储、分析与笔记方法，`ReadingRoomUI` 管理宿主入口。API 的真实签名和行为以源码为准。
+`ReadingRoomCore` 是纯逻辑接口，`ReadingRoomService` 持有存储、分析与笔记方法，`ReadingRoomUI` 管理宿主入口。提供商元数据由 `Core.API_PROVIDERS` 提供；模型发现接口为 `service.listModels({ provider, endpoint, apiKey, allowRemote, signal, item })`，返回规范化端点和 `{ id, name }` 模型项。开始分析时在 options 中传 `provider`。这些接口的真实行为以源码为准，详细路由和返回格式见 [API 提供商说明](API-PROVIDERS.md)。
+
+模型发现只在用户主动打开 AI 设置后触发，地址、协议或密钥变化约 700ms 后发起。UI 必须取消旧请求并通过代际检查忽略迟到结果；关闭弹窗、切换文献或卸载时清理计时器和请求。远程发现与远程正文许可分开，更改端点 origin 时撤销许可并清除保留密钥。不得在 UI 中硬编码模型名作为可用列表。
 
 PDF 提取使用 `Zotero.PDFWorker.getFullText(itemID, null)`。服务注释记录的宿主 manager 契约为 `getFullText(itemID, maxPages, isPriority, password)`；分页解析依据 worker 输出的 form-feed（`\f`）分隔符，只有分隔段数与 `extractedPages` 相等才建立页索引。升级宿主接口前，针对实际版本核对官方 Zotero 与 document-worker 源码，记录源链接/提交、签名及最小验证结果。不能只依据本测试适配器证明真实宿主支持。
 

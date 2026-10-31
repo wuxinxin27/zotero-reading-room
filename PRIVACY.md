@@ -1,6 +1,6 @@
 # 隐私与数据边界 / Privacy
 
-本说明对应 0.1.0。项目没有自建云服务或遥测收集。插件代码的请求与写入边界以 `addon/content/service.js` 和 `core.js` 为准。
+本说明覆盖 0.2.0 未发布变更，并保留 0.1.0 的既有边界。项目没有自建云服务或遥测收集。插件代码的请求与写入边界以 `addon/content/service.js` 和 `core.js` 为准。
 
 ## 本地读取和保存
 
@@ -14,11 +14,13 @@
 
 - Zotero 可按自身插件更新设置访问 GitHub 的更新清单及安装包。此宿主更新行为不发送论文正文、笔记或模型密钥；GitHub 仍会接收普通网络请求信息。
 
-- 初始化、查看文献、保存本地状态和抽取式预读不调用模型，也不自动探测端点。
-- 只有提交“AI 分析…”对话框后，才向所选 OpenAI 兼容端点发送提取文字片段及页位置。默认是 `http://127.0.0.1:11434/v1/chat/completions`。
+- 初始化、查看文献、保存本地状态和抽取式预读不调用模型，也不探测端点。只有主动打开“AI 分析设置”后，才会按约 700ms 防抖自动获取模型列表；关闭对话框会清理计时器并取消尚未完成的发现请求。
+- 支持 OpenAI 兼容、Anthropic Messages、Google Gemini 与 Ollama 原生协议。模型发现只发送协议、规范化端点和（若提供）密钥，不初始化阅读侧文件、不提取 PDF、不发送论文正文，也不创建分析任务。
+- 本机端点可直接发现模型。远程 HTTPS 模型发现需要单独勾选许可；拒绝、没有列表接口、鉴权失败、超时或返回空列表时，界面明确提示并允许手工填写模型 ID。插件不把内置名称当作服务端可用模型。
+- 开始分析另需明确同意发送论文正文。向所选端点发送有界提取文字片段及页位置；默认 OpenAI 兼容端点保持 `http://127.0.0.1:11434/v1/chat/completions`。
 - 上限是前 12 个片段、最多 120000 字符，可能仅覆盖部分论文。请求包含模型名称和生成参数；若提供密钥，会使用 Authorization 请求头。
-- 非本机端点需 HTTPS 和明确同意；群组文库禁止远程模型。请求不跟随重定向。内嵌用户名、密码、查询参数或片段的端点被拒绝。
-- 密钥仅存于本次窗口/请求内存，插件不把它写入状态、导出或笔记。操作系统内存、宿主或端点自身的日志策略不由本插件控制。
+- 非本机端点需 HTTPS 和各项操作对应的明确同意；群组文库禁止远程正文分析。更换端点 origin 会撤销远程发现和正文许可。请求不跟随重定向。内嵌用户名、密码、查询参数或片段的端点被拒绝。
+- 密钥仅存于本次窗口/请求内存，插件不把它写入状态、导出或笔记。端点 origin 改变时，设置界面清除保留的密钥，避免自动发送给新主机。操作系统内存、宿主或端点自身的日志策略不由本插件控制。
 - 本机服务可能自行调用云服务；“本机地址”并不替你担保其后续行为。选择远程服务前应确认你有权发送相关文本，并查阅其保留与训练政策。
 
 ## Zotero 写入和同步
@@ -38,4 +40,4 @@ Zotero 的账户和同步设置可能上传显式创建的个人库笔记；这�
 - 不上传真实文库数据库、状态文件、配置、完整调试日志或截图。
 - 不提交密钥；误泄漏时先在相应提供方撤销，再私密告知维护者。
 
-English: no plugin telemetry or automatic model requests. Local state and extracts remain in the Zotero data directory unless you explicitly export, call a chosen model, or create Zotero notes. Remote model use requires explicit HTTPS consent; group remote analysis and group note writes are blocked. Keys are not persisted by the plugin. Uninstalling preserves records.
+English: no plugin telemetry. Model discovery starts only when AI settings are opened; remote discovery and remote paper analysis have separate HTTPS permissions. Discovery does not send paper text. Group remote analysis and group note writes are blocked. Keys are not persisted and are cleared when the endpoint origin changes. Local state and extracts remain in the Zotero data directory unless you explicitly export, call a chosen model, or create Zotero notes. Uninstalling preserves records.

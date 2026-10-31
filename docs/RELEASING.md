@@ -5,7 +5,7 @@
 1. 在 `package.json` 和 `addon/manifest.json` 同时修改版本，更新 CHANGELOG 与兼容性/隐私说明。保持插件 ID 不变。
 2. 运行 `npm test`、`npm run check`、`npm run build`；完成受影响的[实机清单](TESTING.md)，明确区分已通过、失败和未验证。
 3. 检查仓库与 XPI 中没有个人库、profile、路径、标题、正文、截图或密钥。核对 MIT、README、支持入口和安全报告渠道。
-4. 推送与版本完全一致的 `v<version>` 标签，例如 `v0.1.0`。`release.yml` 会拒绝标签/package/manifest 版本不一致的构建。
+4. 推送与版本完全一致的 `v<version>` 标签，例如 `v0.2.0`。`release.yml` 会拒绝标签/package/manifest 版本不一致的构建。
 5. 工作流在 Node 22 下检查、测试和构建；只在 publish job 给 `contents: write`。发布资产为 `.xpi`、`SHA256SUMS` 和 `updates.json`，普通 CI 工件没有发布权限。
 6. 检查实际 GitHub Release、下载校验和与 XPI；在 Zotero 使用“从文件安装插件”验证发布后的文件。记录结果，不能把配置工作流当作已运行通过。
 
