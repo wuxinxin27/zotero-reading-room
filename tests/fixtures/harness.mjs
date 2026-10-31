@@ -15,11 +15,21 @@ export function loadCore() {
 
 // All paths, Zotero objects, storage, extraction results, and HTTP replies are synthetic.
 // No running Zotero, real profile, database, PDF, or network is consulted by these tests.
-export function createHarness({ libraryType = "user", editable = true, files = new Map(), extracted = paper, timers = {} } = {}) {
+export function createHarness({ libraryType = "user", editable = true, files = new Map(), extracted = paper, timers = {}, configured = true, secureStorage = true } = {}) {
   const records = new Map();
   const calls = { extracts: 0, requests: [], noteSaves: 0, writes: [], opened: [], fileChecks: 0 };
   let nextID = 100;
   const library = { libraryID: 1, libraryType, editable };
+  const libraries = new Map([[1, library]]);
+  const logins = [];
+  const loginStore = {
+    async searchLoginsAsync({ origin, httpRealm }) { return logins.filter(login => login.origin === origin && login.httpRealm === httpRealm); },
+    async addLoginAsync(login) { logins.push(login); return login; },
+    removeLogin(login) { const index = logins.indexOf(login); if (index >= 0) logins.splice(index, 1); }
+  };
+  class LoginInfo {
+    init(origin, formActionOrigin, httpRealm, username, password) { Object.assign(this, { origin, formActionOrigin, httpRealm, username, password }); }
+  }
   const parent = {
     id: 1, key: "PAPER001", libraryID: 1, itemTypeID: 1, deleted: false,
     fields: { title: "A Synthetic Calibration Study", date: "2025-04-08", DOI: "10.0000/synthetic", publicationTitle: "Synthetic Robotics" },
@@ -78,7 +88,13 @@ export function createHarness({ libraryType = "user", editable = true, files = n
       async getAll(libraryID) { return Array.from(records.values()).filter(item => item.libraryID === libraryID); },
       async getByLibraryAndKeyAsync(libraryID, key) { return Array.from(records.values()).find(item => item.libraryID === libraryID && item.key === key); }
     },
-    Libraries: { userLibraryID: 1, get(id) { return id === 1 ? library : null; } },
+    Libraries: { userLibraryID: 1, get(id) { return libraries.get(id); }, getAll() { return [...libraries.values()]; } },
+    OSKeyStore: {
+      available: secureStorage,
+      isEncrypted(value) { return typeof value === "string" && value.startsWith("oskv1:"); },
+      async encrypt(value) { return "oskv1:" + Buffer.from(value).toString("base64"); },
+      async decrypt(value) { if (!this.isEncrypted(value)) throw new Error("not encrypted"); return Buffer.from(value.slice(6), "base64").toString(); }
+    },
     ItemTypes: { getName() { return "journalArticle"; } },
     Item: Note,
     URI: { getItemURI(item) { return "http://zotero.org/users/local/SYNTHETIC/items/" + item.key; } },
@@ -92,11 +108,16 @@ export function createHarness({ libraryType = "user", editable = true, files = n
     Reader: { async open(id, location) { calls.opened.push({ id, location }); return { id, location }; } }
   };
   const context = vm.createContext({ URL, AbortController, setTimeout: timers.setTimeout || setTimeout, clearTimeout: timers.clearTimeout || clearTimeout,
-    IOUtils: io, PathUtils: { join: (...parts) => path.posix.join(...parts) } });
+    IOUtils: io, PathUtils: { join: (...parts) => path.posix.join(...parts) },
+    Services: secureStorage ? { logins: loginStore } : null,
+    Cc: { "@mozilla.org/login-manager/loginInfo;1": { createInstance() { return new LoginInfo(); } } }, Ci: { nsILoginInfo: {} } });
   vm.runInContext(coreSource, context, { filename: "core.js" });
   vm.runInContext(serviceSource, context, { filename: "service.js" });
   const service = new context.ReadingRoomService(Zotero);
+  // An explicitly preconfigured synthetic local model keeps unrelated regressions concise.
+  if (configured) service._document.aiConfig = { provider: "openai", endpoint: "http://127.0.0.1:11434/v1", model: "demo",
+    allowRemoteDiscovery: false, allowRemoteAnalysis: false, consentOrigin: null, rememberKey: false, updatedAt: "2026-01-01T00:00:00Z" };
   return { service, Core: context.ReadingRoomCore, Service: context.ReadingRoomService, Zotero,
-    parent, attachment, files, io, records, calls, library, Note,
+    parent, attachment, files, io, records, calls, library, libraries, logins, loginStore, Note,
     statePath: "/synthetic/zotero-data/reading-room/state-v1.json" };
 }

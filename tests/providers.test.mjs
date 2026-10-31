@@ -95,7 +95,9 @@ for (const provider of providers) {
       assert.equal(method, "POST");
       const payload = JSON.parse(options.body);
       const chunk = JSON.parse(provider === "gemini" ? payload.contents[0].parts[0].text : payload.messages[provider === "anthropic" ? 0 : 1].content);
-      assert.ok(chunk.text.length > 30);
+      const quote = chunk.stage === "synthesis" ? chunk.excerpts[0].quote : chunk.text.slice(0, 80);
+      const pageIndex = chunk.stage === "synthesis" ? chunk.excerpts[0].pageIndex : chunk.pageIndex;
+      assert.ok(quote.length > 30);
       if (provider === "anthropic") {
         assert.equal(payload.model, "demo");
         assert.ok(payload.max_tokens > 0);
@@ -115,7 +117,7 @@ for (const provider of providers) {
         else assert.equal(payload.response_format.type, "json_object");
       }
       const text = "```json\n" + JSON.stringify({ dimensions: [
-        { id: "problem", summary: "有引文支持的候选解释", evidence: [{ quote: chunk.text.slice(0, 80), pageIndex: chunk.pageIndex }] },
+        { id: "problem", summary: "有引文支持的候选解释", evidence: [{ quote, pageIndex }] },
         { id: "novelty", summary: "杜撰结论", evidence: [{ quote: "Fabricated quotation outside the paper.", pageIndex: chunk.pageIndex }] }
       ] }) + "\n```";
       const middle = Math.floor(text.length / 2);
@@ -135,7 +137,7 @@ for (const provider of providers) {
     assert.ok(result.dimensions[1].evidence.every(entry => !entry.verified));
     assert.equal(result.coverage.ratio, 1);
     assert.equal(result.coverage.completeDocument, true);
-    assert.equal(h.calls.requests.length, 2);
+    assert.equal(h.calls.requests.length, 3);
     assert.equal(h.calls.requests[0].url, provider === "gemini" ? "http://localhost:8123/proxy/v1beta/models/demo:generateContent" : endpointFor(provider));
     assert.equal(h.calls.requests[0].options.timeout, 120000);
     assert.equal(h.calls.noteSaves, 0);
@@ -288,7 +290,7 @@ test("upstream analysis errors, executable text, and echoed credentials never re
     { choices: [{ message: { tool_calls: [{ function: { name: "execute" } }] } }] }
   ]) {
     fakeHTTP(h, () => response);
-    await assert.rejects(h.service.analyze(h.parent, { mode: "model", model: "demo", apiKey: secret }), error => error.code === "INVALID_MODEL_OUTPUT" && !error.message.includes(secret));
+    await assert.rejects(h.service.analyze(h.parent, { force: true, mode: "model", model: "demo", apiKey: secret }), error => error.code === "INVALID_MODEL_OUTPUT" && !error.message.includes(secret));
     assert.equal(h.service.getState(h.parent).analysis.id, earlier.id);
     assert.equal(h.files.get(h.statePath).includes(secret), false);
   }
@@ -314,7 +316,7 @@ for (const provider of providers) {
       return response;
     });
     await assert.rejects(h.service.analyze(h.parent, {
-      mode: "model", provider, endpoint: endpointFor(provider), model: "demo", apiKey: secret,
+      force: true, mode: "model", provider, endpoint: endpointFor(provider), model: "demo", apiKey: secret,
     }), error => error.code === "INVALID_MODEL_OUTPUT" && !error.message.includes(secret));
     assert.equal(h.service.getState(h.parent).analysis.id, earlier.id);
     assert.equal(h.calls.writes.length, writesBefore);
@@ -342,7 +344,7 @@ test("cancelling an active model upload preserves previous analysis and ignores 
     started();
     return new Promise(resolve => { release = resolve; });
   };
-  const pending = h.service.analyze(h.parent, { mode: "model", provider: "ollama", model: "demo", endpoint: "http://localhost" });
+  const pending = h.service.analyze(h.parent, { force: true, mode: "model", provider: "ollama", model: "demo", endpoint: "http://localhost" });
   await ready;
   assert.equal(h.service.cancelAnalysis(h.parent), true);
   await assert.rejects(pending, { code: "CANCELLED" });

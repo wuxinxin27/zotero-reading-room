@@ -7,7 +7,7 @@ export const projectRoot = fileURLToPath(new URL("../", import.meta.url));
 export const addonID = "zotero-reading-room@wuxinxin27.github.io";
 export const requiredFiles = Object.freeze([
   "manifest.json", "bootstrap.js", "icon.svg",
-  "content/core.js", "content/service.js", "content/room.js",
+  "content/core.js", "content/service.js", "content/reader.js", "content/room.js",
   "content/room.xhtml", "content/room.css",
   "locale/en-US/reading-room.ftl", "locale/zh-CN/reading-room.ftl",
 ]);

@@ -78,13 +78,14 @@ test("corrupt or future schema files fail closed without overwriting bytes", asy
   }
 });
 
-test("explicit extractive analysis quotes real text, preserves reading state, and writes no Zotero note", async () => {
+test("default AI analysis preserves reading state, persists results, and writes no Zotero note", async () => {
   const h = createHarness();
   await h.service.setState(h.parent, { status: "reading", notes: "我自己的判断", checklist: { novelty: true } });
   const progress = [];
   const result = await h.service.analyze(h.attachment, { onProgress: job => progress.push(job.status) });
   assert.equal(h.calls.extracts, 1);
-  assert.equal(h.calls.requests.length, 0);
+  assert.equal(h.calls.requests.length, 3);
+  assert.equal(result.mode, "model");
   assert.equal(h.calls.noteSaves, 0);
   assert.equal(result.dimensions.length, 6);
   assert.equal(result.source.attachmentKey, h.attachment.key);
@@ -95,7 +96,9 @@ test("explicit extractive analysis quotes real text, preserves reading state, an
   assert.equal(h.service.getState(h.parent).notes, "我自己的判断");
   assert.equal(h.service.getState(h.parent).checklist.novelty, true);
   assert.equal(h.service.getState(h.parent).analysis.id, result.id);
-  assert.deepEqual(progress, ["extracting", "analyzing", "saving", "complete"]);
+  assert.equal(progress[0], "preparing");
+  assert.ok(progress.includes("extracting") && progress.includes("analyzing"));
+  assert.deepEqual(progress.slice(-2), ["saving", "complete"]);
   assert.equal(h.service.getState(h.parent).analysisJob.status, "complete");
   assert.equal(JSON.stringify(result).includes("/synthetic/library"), false);
 });
@@ -153,7 +156,7 @@ test("analysis note writes are explicit, idempotent per result, append new versi
   h.records.get(saved.id).setNote(h.records.get(saved.id).getNote() + "<p>我的补充</p>");
   await h.service.saveAnalysisNote(h.parent, first);
   assert.match(h.records.get(saved.id).getNote(), /我的补充/);
-  const second = await h.service.analyze(h.parent);
+  const second = await h.service.analyze(h.parent, { force: true });
   const next = await h.service.saveAnalysisNote(h.parent, second);
   assert.notEqual(next.id, saved.id);
   assert.equal(handwritten.getNote(), "<p>自己的原始笔记</p>");
@@ -190,7 +193,7 @@ test("state-note synchronization escapes text, updates only its own snapshot, an
 test("unsafe model endpoints and missing models fail before PDF extraction or upload", async () => {
   const h = createHarness();
   await assert.rejects(h.service.analyze(h.parent, { mode: "model", model: "demo", endpoint: "https://example.org/v1" }), { code: "REMOTE_CONSENT_REQUIRED" });
-  await assert.rejects(h.service.analyze(h.parent, { mode: "model" }), { code: "MODEL_REQUIRED" });
+  await assert.rejects(h.service.analyze(h.parent, { mode: "model", model: "" }), { code: "MODEL_REQUIRED" });
   assert.equal(h.calls.extracts, 0);
   assert.equal(h.calls.requests.length, 0);
   const group = createHarness({ libraryType: "group" });
@@ -203,19 +206,20 @@ test("genuine model HTTP requests are bounded and validated; API keys are never 
     h.calls.requests.push({ method, url, options });
     const sent = JSON.parse(options.body);
     const chunk = JSON.parse(sent.messages[1].content);
-    const validQuote = chunk.text.slice(0, 80);
+    const validQuote = chunk.stage === "synthesis" ? chunk.excerpts[0].quote : chunk.text.slice(0, 80);
+    const pageIndex = chunk.stage === "synthesis" ? chunk.excerpts[0].pageIndex : chunk.pageIndex;
     return { status: 200, response: { choices: [{ message: { content: JSON.stringify({ dimensions: [
-      { id: "problem", summary: "模型候选解释", evidence: [{ quote: validQuote, pageIndex: chunk.pageIndex }] },
+      { id: "problem", summary: "模型候选解释", evidence: [{ quote: validQuote, pageIndex }] },
       { id: "novelty", summary: "不能凭空确认的创新", evidence: [{ quote: "A fabricated quotation not in this paper.", pageIndex: chunk.pageIndex }] }
     ] }) } }] } };
   };
   const secret = "unit-test-memory-key-ONLY";
   const result = await h.service.analyze(h.parent, { mode: "model", model: "synthetic-model", apiKey: secret });
-  assert.equal(h.calls.requests.length, 2);
+  assert.equal(h.calls.requests.length, 3);
   assert.equal(result.mode, "model");
   assert.equal(result.dimensions[0].summary, "模型候选解释");
   assert.equal(result.dimensions[1].summary, "信息不足");
-  assert.equal(result.dimensions[1].evidence[0].verified, false);
+  assert.equal(result.dimensions[1].evidence.length, 0);
   assert.equal(result.coverage.ratio, 1);
   assert.equal(result.coverage.completeDocument, true);
   const request = h.calls.requests[0];
@@ -233,7 +237,7 @@ test("model errors redact response content and preserve previous analysis", asyn
   const h = createHarness();
   const earlier = await h.service.analyze(h.parent);
   h.Zotero.HTTP.request = async () => { throw new Error("secret key and private PDF text"); };
-  await assert.rejects(h.service.analyze(h.parent, { mode: "model", model: "demo" }), error => error.code === "MODEL_REQUEST_FAILED" && !error.message.includes("private PDF"));
+  await assert.rejects(h.service.analyze(h.parent, { force: true, mode: "model", model: "demo" }), error => error.code === "MODEL_REQUEST_FAILED" && !error.message.includes("private PDF"));
   assert.equal(h.service.getState(h.parent).analysis.id, earlier.id);
 });
 

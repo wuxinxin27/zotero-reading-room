@@ -49,30 +49,33 @@ test("evidence must match actual text and specified page; fabricated tails never
   assert.equal(Core.validateEvidence({ quote, pageIndex: null }, noPages, "ATTACH01").verified, true);
 });
 
-test("extractive analysis returns six cautious dimensions, actual terms and citation candidates", () => {
-  const result = Core.extractiveAnalysis(Core.documentFromFullText(paper), { attachmentKey: "ATTACH01" });
-  assert.equal(result.dimensions.length, 6);
-  assert.equal(result.dimensions[2].subtypes.length, 4);
-  const theory = result.dimensions[2].subtypes.find(type => type.id === "theory");
-  assert.equal(theory.summary, "信息不足");
-  for (const dimension of result.dimensions) {
-    assert.equal(dimension.confidence, "low");
-    for (const entry of dimension.evidence) {
-      assert.equal(entry.verified, true);
-      assert.ok(paper.text.includes(entry.quote));
-    }
-  }
-  assert.ok(result.terms.some(entry => entry.term === "calibration"));
-  assert.ok(result.figureTableReferences.some(entry => entry.reference === "Table 2" && entry.pageIndex === 1));
-  assert.ok(result.sectionCues.some(entry => entry.text === "2 Experiments"));
-  assert.ok(result.citationCandidates.length > 0);
-  assert.ok(result.citationCandidates.every(entry => entry.requiresVerification));
+test("removed extractive classifier cannot manufacture claims from cue words", () => {
+  assert.equal(Core.extractiveAnalysis, undefined);
+  const doc = Core.documentFromFullText("A quiet green orchard stands beside the river. The birds sing in the morning.");
+  const result = Core.validateModelOutput({ dimensions: [] }, doc, { attachmentKey: "ATTACH01" });
+  assert.ok(result.every(dimension => dimension.summary === "信息不足" && dimension.evidence.length === 0));
+  assert.ok(result[2].subtypes.every(value => value.summary === "信息不足"));
 });
 
-test("unrelated text yields information insufficient rather than invented scientific claims", () => {
-  const doc = Core.documentFromFullText("A quiet green orchard stands beside the river. The birds sing in the morning.");
-  const result = Core.extractiveAnalysis(doc, { attachmentKey: "ATTACH01" });
-  assert.ok(result.dimensions.every(dimension => dimension.summary === "信息不足" && dimension.evidence.length === 0));
+test("model contribution categories and narrative require literal source evidence", () => {
+  const doc = Core.documentFromFullText(paper);
+  const evidence = [{ quote: "We propose a novel calibration algorithm using a sparse graph representation.", pageIndex: 0 }];
+  const dimensions = Core.validateModelOutput({ dimensions: [{ id: "contributions", summary: "算法贡献", evidence,
+    subtypes: [{ id: "algorithm", summary: "稀疏校准", evidence }, { id: "theory", summary: "证明最优", evidence: [] }] }] }, doc, { attachmentKey: "ATTACH01" });
+  assert.equal(dimensions[2].subtypes[1].summary, "稀疏校准");
+  assert.equal(dimensions[2].subtypes[0].summary, "信息不足");
+  const narrative = Core.validateModelNarrative({ overview: "有证据的自然概述", overviewEvidence: evidence,
+    readingGuide: "未经证据支持的判断", figureTableReferences: [
+      { reference: "Table 2", explanation: "比较条件的候选表格", quote: "Table 2 reports better accuracy under the stated noise conditions.", pageIndex: 1 },
+      { reference: "Fig. 99", explanation: "伪造", quote: evidence[0].quote, pageIndex: 0 }
+    ] }, doc, { attachmentKey: "ATTACH01" });
+  assert.equal(narrative.overview, "有证据的自然概述");
+  assert.equal(narrative.readingGuide, "");
+  assert.equal(narrative.figureTableReferences.length, 1);
+  assert.equal(narrative.figureTableReferences[0].kind, "table");
+  assert.equal(narrative.figureTableReferences[0].verified, true);
+  assert.equal(narrative.figureTableReferences[0].visualVerified, false);
+  assert.equal(narrative.figureTableReferences[0].candidate, true);
 });
 
 test("endpoint validation defaults to loopback and requires explicit HTTPS remote consent", () => {
@@ -86,6 +89,34 @@ test("endpoint validation defaults to loopback and requires explicit HTTPS remot
   assert.throws(() => Core.validateEndpoint("http://example.org/v1", true), { code: "REMOTE_CONSENT_REQUIRED" });
   assert.throws(() => Core.validateEndpoint("http://localhost.evil.test/v1"), { code: "REMOTE_CONSENT_REQUIRED" });
   assert.equal(Core.validateEndpoint("https://example.org/v1", true).local, false);
+});
+
+test("figure and table references match complete identifiers with supported aliases and whitespace", () => {
+  const cases = [
+    ["Figure 1", "Figure 10", false], ["Table 2", "Table 20", false],
+    ["图1", "图10", false], ["表2", "表20", false],
+    ["Figure 10", "Figure10附录A", false], ["Table 20", "Table20附录A", false],
+    ["Figure 10", "Figure10A", false], ["Table 20", "Table20a", false],
+    ["Figure 10", "PrefixedFigure10", false], ["Table 20", "myTable20", false],
+    ["Figure 10", "Figure10", true], ["Figure 10", "Fig.\n10", true],
+    ["Fig.10", "Figure 10", true], ["图 10", "图10", true],
+    ["图10", "FIG. 10", true], ["Table20", "表 20", true],
+    ["表20", "TABLE 20", true], ["Figure10A", "Fig.\t10a", true],
+    ["Table 20", "Table   20", true]
+  ];
+  for (const [reference, mention, accepted] of cases) {
+    const quote = mention + " presents the synthetic result.";
+    const doc = Core.documentFromFullText({ text: quote, extractedPages: 1, totalPages: 1 });
+    const narrative = Core.validateModelNarrative({ figureTableReferences: [
+      { reference, explanation: "文字引用候选", quote, pageIndex: 0 }
+    ] }, doc, { attachmentKey: "ATTACH01" });
+    assert.equal(narrative.figureTableReferences.length, accepted ? 1 : 0, reference + " in " + mention);
+    if (accepted) {
+      assert.equal(narrative.figureTableReferences[0].verified, true);
+      assert.equal(narrative.figureTableReferences[0].candidate, true);
+      assert.equal(narrative.figureTableReferences[0].visualVerified, false);
+    }
+  }
 });
 
 test("model claims without literal evidence are suppressed and invalid evidence is visibly unverified", () => {

@@ -11,18 +11,18 @@
     { id: "ollama", label: "Ollama 原生", defaultEndpoint: "http://127.0.0.1:11434", endpointHint: "基础地址或完整 /api/chat 地址" }
   ].map(Object.freeze));
   const DIMENSIONS = Object.freeze([
-    { id: "problem", label: "解决的问题", cues: /\b(problem|challenge|aim|objective|address|limitation|bottleneck)\b|问题|挑战|旨在|解决|局限/i },
-    { id: "novelty", label: "新颖性", cues: /\b(novel|new|first|introduce|propos\w*|unlike|innovation)\b|首次|新颖|提出|创新/i },
-    { id: "contributions", label: "贡献", cues: /\b(contribut\w*|theorem|algorithm|experiment\w*|implementation|framework|release|prove)\b|贡献|定理|算法|实验|实现|开源/i },
-    { id: "prior-work", label: "与前人工作的关系", cues: /\b(previous|prior|related work|existing|et al\.|baseline|literature)\b|前人|相关工作|已有|现有|文献/i },
-    { id: "superiority", label: "优势与适用边界", cues: /\b(outperform\w*|improv\w*|better|accuracy|efficien\w*|speedup|trade.off|limitation|failure)\b|优于|提升|准确率|效率|局限|失败|权衡/i },
-    { id: "technical-uniqueness", label: "技术独特之处", cues: /\b(architecture|mechanism|formulation|optimization|objective function|representation|module|pipeline|design)\b|架构|机制|优化|目标函数|表征|模块|流程|设计/i }
+    { id: "problem", label: "解决的问题" },
+    { id: "novelty", label: "新颖性" },
+    { id: "contributions", label: "贡献" },
+    { id: "prior-work", label: "与前人工作的关系" },
+    { id: "superiority", label: "优势与适用边界" },
+    { id: "technical-uniqueness", label: "技术独特之处" }
   ]);
   const CONTRIBUTION_TYPES = Object.freeze([
-    { id: "theory", label: "理论", cues: /\b(theorem|proof|prove|bound|convergence|lemma|theoretical)\b|定理|证明|收敛|理论/i },
-    { id: "algorithm", label: "算法", cues: /\b(algorithm|optimization|procedure|pseudocode|solver)\b|算法|优化|求解/i },
-    { id: "experiment", label: "实验", cues: /\b(experiment\w*|benchmark|evaluation|ablation|dataset|empirical)\b|实验|评估|消融|数据集/i },
-    { id: "engineering", label: "工程", cues: /\b(implementation|release|open.source|software|system|deployment|code)\b|工程|实现|开源|部署|代码/i }
+    { id: "theory", label: "理论" },
+    { id: "algorithm", label: "算法" },
+    { id: "experiment", label: "实验" },
+    { id: "engineering", label: "工程" }
   ]);
 
   function error(code, message) {
@@ -44,7 +44,7 @@
   }
 
   function defaultState() {
-    return { schemaVersion: SCHEMA_VERSION, status: "unread", notes: "", checklist: {}, lastPage: null, updatedAt: null };
+    return { schemaVersion: SCHEMA_VERSION, status: "unread", focused: false, notes: "", checklist: {}, lastPage: null, updatedAt: null };
   }
 
   function patchState(previous, patch, timestamp) {
@@ -52,6 +52,10 @@
       throw error("INVALID_STATE", "阅读状态更新必须是对象。");
     }
     const next = Object.assign(defaultState(), clone(previous || {}));
+    if (Object.hasOwn(patch, "focused")) {
+      if (typeof patch.focused !== "boolean") throw error("INVALID_FOCUS", "关注标记必须为布尔值。");
+      next.focused = patch.focused;
+    }
     if (Object.hasOwn(patch, "status")) {
       if (!STATUSES.includes(patch.status)) throw error("INVALID_STATUS", "未知阅读状态。");
       next.status = patch.status;
@@ -133,97 +137,6 @@
     };
   }
 
-  function sentences(document) {
-    const result = [];
-    for (const segment of document.segments) {
-      for (const paragraph of segment.text.split(/\n\s*\n|(?<=[.!?。！？])\s+(?=[A-Z\u4e00-\u9fff])/u)) {
-        const trimmed = paragraph.trim();
-        if (trimmed.length < 20) continue;
-        // Preserve exact substrings, including whitespace, for independently verifiable evidence.
-        for (let offset = 0; offset < trimmed.length; offset += 700) {
-          const quote = trimmed.slice(offset, offset + 700).trim();
-          if (quote.length >= 20) result.push({ quote, pageIndex: segment.pageIndex });
-        }
-      }
-    }
-    return result;
-  }
-
-  function candidates(parts, cues, document, attachmentKey, limit = 3) {
-    const found = [];
-    const seen = new Set();
-    for (const part of parts) {
-      if (!cues.test(part.quote)) continue;
-      const key = normalizeText(part.quote);
-      if (seen.has(key)) continue;
-      const evidence = validateEvidence(part, document, attachmentKey);
-      if (!evidence.verified) continue;
-      seen.add(key);
-      found.push(evidence);
-      if (found.length >= limit) break;
-    }
-    return found;
-  }
-
-  function dimensionValue(spec, evidence) {
-    return {
-      id: spec.id, label: spec.label,
-      summary: evidence.length ? "原文候选摘录；仅按词语线索归类，请核对上下文。" : "信息不足",
-      confidence: evidence.length ? "low" : "none", evidence
-    };
-  }
-
-  function extractTerms(text) {
-    const stop = new Set(("about after again against also among analysis another approach based because been before being between both can cannot could data does each from further have however into itself more most must only other ours over paper results same section should show shown shows some such than that their them then there these they this those through under using used very were what when where which while will with within without work would text figure table proposed method methods study studies model models" ).split(/\s+/));
-    const counts = new Map();
-    for (const token of text.toLowerCase().match(/[a-z][a-z-]{3,35}/g) || []) {
-      if (!stop.has(token)) counts.set(token, (counts.get(token) || 0) + 1);
-    }
-    return Array.from(counts, ([term, count]) => ({ term, count })).filter(entry => entry.count > 1)
-      .sort((a, b) => b.count - a.count || a.term.localeCompare(b.term)).slice(0, 24);
-  }
-
-  function extractiveAnalysis(document, source) {
-    const parts = sentences(document);
-    const dimensions = DIMENSIONS.map(spec => {
-      const dimension = dimensionValue(spec, candidates(parts, spec.cues, document, source.attachmentKey));
-      if (spec.id === "contributions") {
-        dimension.subtypes = CONTRIBUTION_TYPES.map(type => dimensionValue(type, candidates(parts, type.cues, document, source.attachmentKey, 2)));
-      }
-      return dimension;
-    });
-    const sectionCues = [];
-    const figureTableReferences = [];
-    for (const segment of document.segments) {
-      for (const line of segment.text.split(/\r?\n/)) {
-        if (line.trim().length < 140 && /^(?:\d+(?:\.\d+)*\.?\s*)?(?:abstract|introduction|related work|method\w*|experiment\w*|evaluation|results|discussion|conclusion\w*|references|摘要|引言|相关工作|方法|实验|结论|参考文献)(?:\s|$|[:：])/i.test(line.trim())) {
-          if (sectionCues.length < 40) sectionCues.push({ text: line.trim(), pageIndex: segment.pageIndex });
-        }
-      }
-      const seen = new Set();
-      for (const match of segment.text.matchAll(/\b(?:Figure|Fig\.?|Table)\s*\d+[A-Za-z]?|[图表]\s*\d+[A-Za-z]?/gi)) {
-        if (figureTableReferences.length >= 60) break;
-        const ref = match[0];
-        if (seen.has(ref)) continue;
-        seen.add(ref);
-        const start = Math.max(0, match.index - 70);
-        const quote = segment.text.slice(start, match.index + ref.length + 130).trim();
-        figureTableReferences.push({ reference: ref, ...validateEvidence({ quote, pageIndex: segment.pageIndex }, document, source.attachmentKey) });
-      }
-    }
-    const citationCandidates = candidates(parts, /\[\d+(?:\s*[,–-]\s*\d+)*\]|\bet al\.|\([A-Z][A-Za-z-]+(?:\s+et al\.)?,?\s+(?:19|20)\d{2}\)/, document, source.attachmentKey, 12)
-      .map(entry => ({ ...entry, requiresVerification: true, label: "引用上下文候选，需核对参考文献" }));
-    return {
-      schemaVersion: SCHEMA_VERSION, mode: "extractive", dimensions,
-      terms: extractTerms(document.text), sectionCues, figureTableReferences, citationCandidates,
-      coverage: { extractedCharacters: document.text.length, analyzedCharacters: document.text.length, ratio: 1,
-        extractedPages: document.extractedPages, totalPages: document.totalPages, pageAware: document.pageAware,
-        completeDocument: document.totalPages != null && document.extractedPages === document.totalPages },
-      limitations: [...document.limitations, "这是本地抽取式预读：只展示原文线索，不据此断言创新性、优越性、理论正确性或引用关系；低置信度归类需人工核对。"],
-      source: clone(source)
-    };
-  }
-
   function validateEndpoint(input, allowRemote = false, provider = "openai") {
     const specification = API_PROVIDERS.find(entry => entry.id === provider);
     if (!specification) throw error("UNKNOWN_PROVIDER", "未知 API 协议；请明确选择受支持的协议。");
@@ -280,8 +193,7 @@
     if (!raw || !Array.isArray(raw.dimensions) || raw.dimensions.length > 12) {
       throw error("INVALID_MODEL_OUTPUT", "模型没有返回约定的 dimensions JSON 结构。");
     }
-    return DIMENSIONS.map(spec => {
-      const value = raw.dimensions.find(entry => entry && entry.id === spec.id);
+    function validateValue(spec, value) {
       const evidence = (Array.isArray(value && value.evidence) ? value.evidence : []).slice(0, 8)
         .map(entry => validateEvidence(entry, document, source.attachmentKey));
       const supported = evidence.some(entry => entry.verified);
@@ -291,12 +203,51 @@
         confidence: supported ? "low" : "none", evidence,
         modelInference: true
       };
+    }
+    return DIMENSIONS.map(spec => {
+      const value = raw.dimensions.find(entry => entry && entry.id === spec.id);
+      const dimension = validateValue(spec, value);
+      if (spec.id === "contributions") dimension.subtypes = CONTRIBUTION_TYPES.map(type =>
+        validateValue(type, (Array.isArray(value && value.subtypes) ? value.subtypes : []).find(entry => entry && entry.id === type.id)));
+      return dimension;
     });
+  }
+
+  function validateModelNarrative(raw, document, source) {
+    const result = {};
+    for (const name of ["overview", "readingGuide"]) {
+      const evidence = (Array.isArray(raw[name + "Evidence"]) ? raw[name + "Evidence"] : []).slice(0, 12)
+        .map(entry => validateEvidence(entry, document, source.attachmentKey)).filter(entry => entry.verified);
+      result[name] = evidence.length && typeof raw[name] === "string" ? raw[name].slice(0, 10000) : "";
+      result[name + "Evidence"] = evidence;
+    }
+    result.figureTableReferences = (Array.isArray(raw.figureTableReferences) ? raw.figureTableReferences : []).slice(0, 40)
+      .filter(entry => entry && typeof entry.reference === "string" && typeof entry.explanation === "string")
+      .map(entry => {
+        const evidence = validateEvidence(entry, document, source.attachmentKey);
+        const reference = entry.reference.trim().slice(0, 100);
+        const identifier = /^(Figure|Fig\.?|图|Table|表)\s*(\d+[A-Za-z]?)$/i.exec(reference);
+        const figure = !!identifier && /^(?:Figure|Fig\.?|图)$/i.test(identifier[1]);
+        const labels = figure ? "(?:Figure|Fig\\.?|图)" : "(?:Table|表)";
+        // Match the entire identifier, including its suffix. Adjacent Unicode letters or
+        // digits (e.g. Figure10附录A) cannot supply evidence for a shorter reference.
+        const mentionsReference = !!identifier && new RegExp("(?:^|[^\\p{L}\\p{N}\\p{M}_])" + labels + "\\s*" + identifier[2]
+          + "(?![\\p{L}\\p{N}\\p{M}_])", "iu").test(normalizeText(evidence.quote));
+        return { reference, kind: figure ? "figure" : "table", explanation: entry.explanation.slice(0, 3000), ...evidence,
+          candidate: true, requiresVerification: true, visualVerified: false,
+          label: "图表文字引用候选；未解析图像或确认图注", accepted: mentionsReference && evidence.verified };
+      }).filter(entry => entry.accepted).map(({ accepted, ...entry }) => entry);
+    return result;
   }
 
   function analysisNoteHTML(result, marker) {
     let html = '<div data-schema-version="9"><h1>Reading Room · 论文预读</h1><p>' + escapeHTML(marker) + '</p>';
     html += "<p>生成时间：" + escapeHTML(result.createdAt) + "；模式：" + escapeHTML(result.mode) + "</p>";
+    for (const [name, label] of [["overview", "论文概述"], ["readingGuide", "阅读建议"]]) {
+      if (!result[name]) continue;
+      html += "<h2>" + label + "</h2><p>" + escapeHTML(result[name]) + "</p>";
+      for (const entry of result[name + "Evidence"] || []) html += "<blockquote><p>" + escapeHTML(entry.quote) + "</p></blockquote>";
+    }
     for (const dimension of result.dimensions || []) {
       html += "<h2>" + escapeHTML(dimension.label) + "</h2><p>" + escapeHTML(dimension.summary) + "</p>";
       html += "<p>置信度：" + escapeHTML(dimension.confidence) + "</p>";
@@ -315,6 +266,7 @@
     html += "<h2>图表与引用上下文候选</h2>";
     for (const entry of [...(result.figureTableReferences || []), ...(result.citationCandidates || [])]) {
       html += "<p>" + escapeHTML(entry.reference || entry.label || "需人工核对") + "</p><blockquote><p>" + escapeHTML(entry.quote) + "</p></blockquote>";
+      if (entry.explanation) html += "<p>" + escapeHTML(entry.explanation) + "</p>";
     }
     const source = result.source || {};
     html += "<h2>来源</h2><pre>" + escapeHTML(JSON.stringify({ itemURI: source.itemURI, itemKey: source.itemKey,
@@ -324,5 +276,5 @@
 
   scope.ReadingRoomCore = Object.freeze({ SCHEMA_VERSION, STATUSES, API_PROVIDERS, DIMENSIONS, CONTRIBUTION_TYPES, error, clone, identity,
     defaultState, patchState, escapeHTML, hash, normalizeText, documentFromFullText, validateEvidence,
-    extractiveAnalysis, validateEndpoint, chunkDocument, validateModelOutput, analysisNoteHTML });
+    validateEndpoint, chunkDocument, validateModelOutput, validateModelNarrative, analysisNoteHTML });
 })(this);

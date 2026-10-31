@@ -1,8 +1,14 @@
 # 发布与分发
 
+## 默认开发与发布批准
+
+默认只创建并推送普通 commit；`main` 的 CI 构建不等于正式发布。修改正式版本号、创建版本 tag 或发布 GitHub Release，均须先获得用户明确允许。长期公开维护授权不自动涵盖发版。
+
+未获准发版时保留现有正式版本号，用 CHANGELOG 的 Unreleased 节记录改动。可本地构建和安装开发包，不覆盖已有 Release 的安装包、校验和或更新清单。
+
 ## 版本发布
 
-1. 在 `package.json` 和 `addon/manifest.json` 同时修改版本，更新 CHANGELOG 与兼容性/隐私说明。保持插件 ID 不变。
+1. 获得明确发版允许后，在 `package.json` 和 `addon/manifest.json` 同时修改版本，更新 CHANGELOG 与兼容性/隐私说明。保持插件 ID 不变。
 2. 运行 `npm test`、`npm run check`、`npm run build`；完成受影响的[实机清单](TESTING.md)，明确区分已通过、失败和未验证。
 3. 检查仓库与 XPI 中没有个人库、profile、路径、标题、正文、截图或密钥。核对 MIT、README、支持入口和安全报告渠道。
 4. 推送与版本完全一致的 `v<version>` 标签，例如 `v0.2.0`。`release.yml` 会拒绝标签/package/manifest 版本不一致的构建。

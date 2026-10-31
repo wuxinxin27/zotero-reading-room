@@ -75,9 +75,10 @@ var ReadingRoomBootstrap = {
       const scope = this.prepareSharedScope(rootURI);
       this.loadScript(scope, rootURI, "core.js");
       this.loadScript(scope, rootURI, "service.js");
+      this.loadScript(scope, rootURI, "reader.js");
       this.loadScript(scope, rootURI, "room.js");
 
-      if (!scope.ReadingRoomCore || !scope.ReadingRoomService || !scope.ReadingRoomUI) {
+      if (!scope.ReadingRoomCore || !scope.ReadingRoomService || !scope.ReadingRoomPDF || !scope.ReadingRoomUI) {
         throw new Error("插件脚本未导出预期的共享接口。");
       }
       this.service = new scope.ReadingRoomService(Zotero, { rootURI });
@@ -196,6 +197,7 @@ var ReadingRoomBootstrap = {
       try { delete scope.ReadingRoomCore; } catch (_) {}
       try { delete scope.ReadingRoomService; } catch (_) {}
       try { delete scope.ReadingRoomUI; } catch (_) {}
+      try { delete scope.ReadingRoomPDF; } catch (_) {}
       try { delete scope.ReadingRoomWindow; } catch (_) {}
       try { delete scope.ReadingRoomRootURI; } catch (_) {}
     }

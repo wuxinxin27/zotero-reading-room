@@ -7,14 +7,17 @@
 | 路径 | 职责 |
 | --- | --- |
 | `addon/manifest.json`、`bootstrap.js` | Zotero 插件标识、兼容范围、启停生命周期 |
-| `addon/content/core.js` | 无文件/网络访问的领域逻辑：状态、提取候选、分页、证据、提供商元数据和端点规范化 |
-| `addon/content/service.js` | Zotero、PDF worker、本地侧文件、多协议模型发现/请求、专用笔记适配 |
+| `addon/content/core.js` | 无文件/网络访问的状态、分页、AI 输出与证据校验、提供商和端点规范化；不生成抽取式预读 |
+| `addon/content/service.js` | 文库搜索/关注、配置和 OSKeyStore 凭据、AI 缓存与多协议请求、PDF worker、专用笔记 |
+| `addon/content/reader.js` | 捆绑 PDF.js iframe、本机 PDF 字节、页码/查找、串行原页 PNG 和生命周期清理 |
 | `addon/content/room.*`、`addon/locale/` | 阅读室与宿主入口、样式、语言资源 |
 | `tests/core.test.mjs`、`tests/service.test.mjs`、`tests/fixtures/` | 虚构文库、PDF 提取结果、存储与 HTTP 测试适配器 |
 | `tests/package.test.mjs` | 独立读取 ZIP 结构、检查标准 CRC 向量、复现性、源文件边界与发布校验 |
 | `scripts/` | 检查与确定性 ZIP32 打包 |
 
-`core.js` 和 `service.js` 以特权子脚本加载，不依赖 Node 的模块解析或第三方运行库。Node 只用于开发与构建，不随插件分发。
+`core.js`、`service.js`、`reader.js`、`room.js` 按顺序以特权子脚本加载；PDF.js 使用 Zotero 捆绑资源，不加远程运行时依赖。Node 只用于构建，不随插件分发。
+
+日常开发默认只 commit/push，正式版本号、tag 和 Release 需要事先明确批准，见 [AGENTS.md](../AGENTS.md) 和[发布说明](RELEASING.md)。未发布构建可能与同版本号的既有 Release 代码不同，不能覆盖已发布资产。
 
 ## 命令
 
