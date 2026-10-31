@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "name": "Reading Room · 论文阅读室",
+  "version": "0.1.0",
+  "description": "本地优先的论文预读、证据核查与阅读状态管理。",
+  "homepage_url": "https://github.com/wuxinxin27/zotero-reading-room",
+  "author": "wuxinxin27",
+  "icons": {
+    "48": "icon.svg",
+    "96": "icon.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "zotero-reading-room@wuxinxin27.github.io",
+      "update_url": "https://github.com/wuxinxin27/zotero-reading-room/releases/latest/download/updates.json",
+      "strict_min_version": "10.0",
+      "strict_max_version": "10.*"
+    }
+  }
+}

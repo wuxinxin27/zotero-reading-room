@@ -1,0 +1,5 @@
+{
+  "text": "Abstract\nWe address the problem of unreliable sensor calibration in small robots.\n\nWe propose a novel calibration algorithm using a sparse graph representation.\n\n1 Introduction\nPrevious work by Example et al. [1] uses a dense calibration model.\n\nOur contribution is an algorithm that optimizes a robust objective function.\n\nFigure 1 illustrates the sparse graph architecture and calibration pipeline.\n\f2 Experiments\nThe experiment compares calibration accuracy against a dense baseline on a synthetic dataset.\n\nTable 2 reports better accuracy under the stated noise conditions.\n\nThe main limitation is reduced accuracy when no calibration targets are visible.\n\nWe release an open-source implementation of the calibration algorithm.\n\n3 Conclusion\nThe sparse graph mechanism is a candidate design for resource-limited robots.",
+  "extractedPages": 2,
+  "totalPages": 2
+}

@@ -1,0 +1,47 @@
+name: Release XPI
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node scripts/check.mjs --tag "$GITHUB_REF_NAME"
+      - run: npm test
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: |
+            dist/*.xpi
+            dist/SHA256SUMS
+            dist/updates.json
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+      - name: Publish versioned XPI and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          printf '%s\n' 'Install the XPI through Zotero Tools → Plugins → Install Plugin From File. Verify SHA256SUMS. See repository README and CHANGELOG for features, privacy boundaries and compatibility limits.' > release-notes.txt
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.xpi dist/SHA256SUMS dist/updates.json --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.xpi dist/SHA256SUMS dist/updates.json --verify-tag --title "Reading Room $GITHUB_REF_NAME" --notes-file release-notes.txt
+          fi
