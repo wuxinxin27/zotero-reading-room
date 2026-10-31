@@ -1,0 +1,65 @@
+{
+  "xerjVersion": "1.0.0-rc.100",
+  "port": 9217,
+  "project": {
+    "id": "project",
+    "prefix": "zrrlocal"
+  },
+  "repositories": [
+    {
+      "id": "zotero",
+      "repository": "zotero/zotero",
+      "branch": "main",
+      "commit": "212a7d6a585d1209bc4e698a904490205f139500",
+      "sourcePaths": ["chrome/content/zotero/xpcom", "test/tests", "COPYING", "README.md"],
+      "license": "AGPL-3.0-or-later",
+      "prefix": "zrrzotero",
+      "purpose": "Zotero 宿主 API、Reader、文库搜索、凭据和生命周期行为参考；内部 API 需核对实际安装的宿主版本。",
+      "queries": ["ReaderInstance navigate pageIndex", "Items getAll libraryID", "Search addCondition libraryID", "OSKeyStore Services logins", "PDFWorker getFullText"]
+    },
+    {
+      "id": "reader",
+      "repository": "zotero/reader",
+      "branch": "master",
+      "commit": "b10db2071013d3c8b8db86e28c657621d75d8620",
+      "sourcePaths": ["src", "test", "COPYING", "README.md"],
+      "license": "AGPL-3.0-only",
+      "prefix": "zrrreader",
+      "purpose": "PDF 阅读器页索引、导航、查找、选区、事件和销毁流程参考。",
+      "queries": ["pageIndex navigate", "findController find", "selection annotation", "destroy cleanup"]
+    },
+    {
+      "id": "toolkit",
+      "repository": "windingwind/zotero-plugin-toolkit",
+      "branch": "main",
+      "commit": "0fbfd0258921044de1854b89d66b27762b10ee0a",
+      "sourcePaths": ["src", "LICENSE", "README.md"],
+      "license": "MIT",
+      "prefix": "zrrtoolkit",
+      "purpose": "插件 ReaderTool、对话框、事件注册和清理模式参考。",
+      "queries": ["ReaderTool", "DialogHelper dialog", "unregisterAll cleanup", "registerEventListener"]
+    },
+    {
+      "id": "template",
+      "repository": "windingwind/zotero-plugin-template",
+      "branch": "main",
+      "commit": "306d4e2a0959a7b2f5e44bb38169fb25f841dbaf",
+      "sourcePaths": ["src", "addon", "LICENSE", "README.md"],
+      "license": "AGPL-3.0",
+      "prefix": "zrrtemplate",
+      "purpose": "插件启动、关闭、窗口钩子、chrome 注册和 item pane 集成参考。",
+      "queries": ["onStartup onShutdown", "registerChrome", "onMainWindowLoad onMainWindowUnload", "registerSection itemPane"]
+    },
+    {
+      "id": "papersgpt",
+      "repository": "papersgpt/papersgpt-for-zotero",
+      "branch": "main",
+      "commit": "e2706780651bf4af439e2a703a5b595d5ca0b910",
+      "sourcePaths": ["src", "addon", "LICENSE", "README.md"],
+      "license": "AGPL-3.0-or-later",
+      "prefix": "zrrpapersgpt",
+      "purpose": "Zotero AI 请求、模型响应和 PDF 文本抽取路径参考。",
+      "queries": ["getResponseByOnlineModel", "PDF text getFullText", "AbortController signal", "chat completions stream"]
+    }
+  ]
+}

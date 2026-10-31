@@ -23,3 +23,5 @@ state-v*.json
 *.xpi
 screenshots/
 local-test-results/
+.xerj/
+.codex/config.toml
