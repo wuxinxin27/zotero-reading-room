@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHarness, paper, plain } from "./fixtures/harness.mjs";
+import { parseTaskInput, createHarness, paper, plain } from "./fixtures/harness.mjs";
 
 const quote = "We propose a novel calibration algorithm using a sparse graph representation.";
 const answer = { answer: "论文提出稀疏图标定算法，仍需人工核对。", evidence: [{ quote, pageIndex: 0 }] };
@@ -20,7 +20,7 @@ function mockChat(h, provider = "openai", value = answer) {
 }
 function userPayload(call, provider = "openai") {
   const payload = JSON.parse(call.options.body);
-  return JSON.parse(provider === "gemini" ? payload.contents[0].parts[0].text
+  return parseTaskInput(provider === "gemini" ? payload.contents[0].parts[0].text
     : payload.messages.find(entry => entry.role === "user").content);
 }
 function addPaper(h, id, libraryID = 1, key = "PAPER" + String(id).padStart(3, "0")) {
@@ -74,7 +74,7 @@ for (const provider of ["openai", "anthropic", "gemini", "ollama"]) {
     assert.equal(body.question, "方法是什么？"); assert.deepEqual(body.history, []);
     assert.ok(body.excerpts.some(entry => entry.pageIndex === 0 && entry.text.includes(quote)));
     assert.equal(call.method, "POST"); assert.equal(call.options.followRedirects, false); assert.equal(call.options.logBodyLength, 0);
-    if (provider === "anthropic") { assert.equal(payload.max_tokens, 4096); assert.equal(call.options.headers["x-api-key"], "synthetic-chat-key"); }
+    if (provider === "anthropic") { assert.equal(payload.max_tokens, 8192); assert.equal(call.options.headers["x-api-key"], "synthetic-chat-key"); }
     else if (provider === "gemini") { assert.ok(call.url.endsWith("/models/chat-test:generateContent")); assert.equal(payload.generationConfig.responseMimeType, "application/json"); assert.equal(call.options.headers["x-goog-api-key"], "synthetic-chat-key"); }
     else { assert.equal(payload.stream, false); assert.equal(call.options.headers.Authorization, "Bearer synthetic-chat-key"); }
     if (provider === "openai") assert.equal(payload.response_format.type, "json_object");

@@ -7,6 +7,13 @@ const serviceSource = await fs.readFile(new URL("../../addon/content/service.js"
 export const paper = JSON.parse(await fs.readFile(new URL("./paper.json", import.meta.url), "utf8"));
 export const plain = value => JSON.parse(JSON.stringify(value));
 
+export function parseTaskInput(message) {
+  const marker = "\n\nREADING_ROOM_INPUT_JSON:\n\n";
+  const start = message.lastIndexOf(marker);
+  if (start < 0) throw new Error("Missing explicit task/source boundary");
+  return JSON.parse(message.slice(start + marker.length));
+}
+
 export function loadCore() {
   const context = vm.createContext({ URL, AbortController, setTimeout, clearTimeout });
   vm.runInContext(coreSource, context, { filename: "core.js" });

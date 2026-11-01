@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHarness, paper, plain } from "./fixtures/harness.mjs";
+import { parseTaskInput, createHarness, paper, plain } from "./fixtures/harness.mjs";
 
 test("initialization and description do not extract, index, upload, or create notes", async () => {
   const h = createHarness();
@@ -205,7 +205,7 @@ test("genuine model HTTP requests are bounded and validated; API keys are never 
   h.Zotero.HTTP.request = async (method, url, options) => {
     h.calls.requests.push({ method, url, options });
     const sent = JSON.parse(options.body);
-    const chunk = JSON.parse(sent.messages[1].content);
+    const chunk = parseTaskInput(sent.messages[1].content);
     const validQuote = chunk.stage === "synthesis" ? chunk.excerpts[0].quote : chunk.text.slice(0, 80);
     const pageIndex = chunk.stage === "synthesis" ? chunk.excerpts[0].pageIndex : chunk.pageIndex;
     return { status: 200, response: { choices: [{ message: { content: JSON.stringify({ dimensions: [

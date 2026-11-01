@@ -1042,6 +1042,87 @@ test("legacy persisted analysis errors omit a safe code instead of guessing", as
   assert.equal(text.includes("raw-model-output"), false);
 });
 
+test("analysis JSON parse failures show the model-JSON fix without blaming size", async () => {
+  const parseFailure = new Error(
+    "Model body was plain text. endpoint=/secret/path raw-model-output");
+  parseFailure.code = "MODEL_JSON_INVALID";
+  const h = await fixture({ failAnalysis: parseFailure });
+  button(h.document.body, "AI 分析").click();
+  await tick();
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("分析失败 [MODEL_JSON_INVALID]"));
+  assert.ok(text.includes(
+    "模型正文不是完整、无歧义的 JSON 对象；请检查提示词及服务是否保留任务指令后重试。"));
+  // The parse failure must not be reported as a size/truncation problem.
+  assert.equal(/超出大小限制|截断|提高模型输出上限/.test(text), false);
+  // Untrusted upstream text is never injected into the room.
+  assert.equal(text.includes("endpoint=/secret/path"), false);
+  assert.equal(text.includes("raw-model-output"), false);
+  assert.equal(text.includes("plain text"), false);
+});
+
+test("analysis schema failures identify an invalid dimensions array", async () => {
+  const schemaFailure = new Error(
+    "JSON parsed but dimensions missing. endpoint=/secret/path raw-model-output");
+  schemaFailure.code = "MODEL_SCHEMA_INVALID";
+  const h = await fixture({ failAnalysis: schemaFailure });
+  button(h.document.body, "AI 分析").click();
+  await tick();
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("分析失败 [MODEL_SCHEMA_INVALID]"));
+  assert.ok(text.includes(
+    "模型 JSON 的 dimensions 数组缺失、类型错误或条目数超限；请检查分析提示词与模型输出。"));
+  // Schema failure and parse failure stay distinguishable to the reader.
+  assert.equal(text.includes("不是完整、无歧义的 JSON 对象"), false);
+  assert.equal(/超出大小限制|截断|提高模型输出上限/.test(text), false);
+  assert.equal(text.includes("endpoint=/secret/path"), false);
+  assert.equal(text.includes("raw-model-output"), false);
+});
+
+test("a restored view shows a persisted new-code analysis error safely", async () => {
+  const h = await fixture();
+  const originalDescribe = h.service.describe;
+  h.service.describe = async item => {
+    const description = await originalDescribe(item);
+    description.state.analysisJob = {
+      status: "error",
+      code: "MODEL_JSON_INVALID",
+      detail: "endpoint=/secret/path raw-model-output",
+    };
+    return description;
+  };
+  await h.switchContext(secondPDFContext(h));
+  await tick();
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("分析失败 [MODEL_JSON_INVALID]"));
+  assert.ok(text.includes(
+    "模型正文不是完整、无歧义的 JSON 对象；请检查提示词及服务是否保留任务指令后重试。"));
+  assert.equal(/超出大小限制|截断/.test(text), false);
+  assert.equal(text.includes("endpoint=/secret/path"), false);
+  assert.equal(text.includes("raw-model-output"), false);
+});
+
+test("unknown analysis error codes fall back to generic text and keep the old analysis", async () => {
+  const h = await fixture({ cached: true });
+  h.service.analyze = async (item, options) => {
+    h.service.calls.push({ type: "analyze", item, options });
+    options.onProgress({ status: "analyzing", detail: "requesting model" });
+    throw Object.assign(new Error(
+      "Markup <img src=x onerror=alert(1)> endpoint=/secret/path"), {
+      code: "SOMETHING_UNMAPPED",
+    });
+  };
+  button(h.document.body, "AI 分析").click();
+  await tick();
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("分析失败 [SOMETHING_UNMAPPED]"));
+  assert.ok(text.includes("分析未完成；此前的阅读状态与分析仍保留。"));
+  assert.equal(text.includes("onerror"), false);
+  assert.equal(text.includes("endpoint=/secret/path"), false);
+  // The previously saved analysis stays on screen after a failed re-run.
+  assert.ok(text.includes("Cached overview."));
+});
+
 test("embedded layout hides its PDF workspace and shows paper chat without model calls on open", async () => {
   const h = await fixture();
   assert.equal(h.document.documentElement.getAttribute("data-embedded"), "true");

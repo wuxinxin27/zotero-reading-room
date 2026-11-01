@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHarness, plain, paper } from "./fixtures/harness.mjs";
+import { parseTaskInput, createHarness, plain, paper } from "./fixtures/harness.mjs";
 
 const localConfig = { provider: "openai", endpoint: "http://localhost:8123/v1", model: "synthetic" };
 const remoteConfig = { ...localConfig, endpoint: "https://api.synthetic.example/v1", consentOrigin: "https://api.synthetic.example",
@@ -473,7 +473,7 @@ test("bounded final synthesis uses verified excerpts, writes natural narrative a
   let stages = [];
   h.Zotero.HTTP.request = async (method, url, options) => {
     h.calls.requests.push({ method, url, options });
-    const chunk = JSON.parse(JSON.parse(options.body).messages[1].content);
+    const chunk = parseTaskInput(JSON.parse(options.body).messages[1].content);
     stages.push(chunk.stage);
     const quote = chunk.stage === "synthesis" ? chunk.excerpts[0] : { quote: chunk.text.split("\n").find(line => /Figure 1|Table 2/.test(line)), pageIndex: chunk.pageIndex };
     if (chunk.stage === "synthesis") {
@@ -556,7 +556,7 @@ test("final synthesis cannot smuggle real but unsubmitted quotes or escaped cred
   const writes = h.calls.writes.length;
   for (const echoCredential of [false, true]) {
     h.Zotero.HTTP.request = async (_method, _url, options) => {
-      const chunk = JSON.parse(JSON.parse(options.body).messages[1].content);
+      const chunk = parseTaskInput(JSON.parse(options.body).messages[1].content);
       const evidence = chunk.stage === "synthesis"
         ? [{ quote: "The main limitation is reduced accuracy when no calibration targets are visible.", pageIndex: 1 }]
         : [{ quote: chunk.text.slice(0, 50), pageIndex: chunk.pageIndex }];
@@ -582,7 +582,7 @@ test("long papers cap reading uploads and final synthesis size while reporting i
   let reading = 0;
   let finalSize = 0;
   h.Zotero.HTTP.request = async (_method, _url, options) => {
-    const input = JSON.parse(JSON.parse(options.body).messages[1].content);
+    const input = parseTaskInput(JSON.parse(options.body).messages[1].content);
     const evidence = input.stage === "synthesis" ? [input.excerpts[0]] : [{ quote: input.text.slice(0, 3900), pageIndex: input.pageIndex }];
     if (input.stage === "synthesis") finalSize = JSON.stringify(input).length;
     else reading++;

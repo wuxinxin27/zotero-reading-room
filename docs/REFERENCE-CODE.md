@@ -120,3 +120,11 @@ npm run xref -- configure-mcp
 本轮在编辑前检索项目与固定上游；只借鉴接口和生命周期，不复制上游实现。Template `306d4e2a0959a7b2f5e44bb38169fb25f841dbaf` 的 `src/modules/examples.ts:265` 及 `addon/locale/zh-CN/mainWindow.ftl:4` 给出 Reader section 和属性式 Fluent 消息；Toolkit `0fbfd0258921044de1854b89d66b27762b10ee0a` 的 `src/managers/keyboard.ts:62` 给出注册后覆盖已打开 Reader 的行为参考。Zotero 参考 SHA 仍为清单内 `212a7d6a585d1209bc4e698a904490205f139500`。
 
 另外核对实际安装 Zotero 10.0.7 的 `itemPaneCustomSection.js:188`（HTML body、同步/异步 hook、toggle event）、`itemDetails.js` 与 `contextPane.js`（每标签实例、tabID 和原生侧栏）、`xpcom/reader.js:767`（物理页导航）、`item.js:4805`（标签及事务）、`pdfWorker/manager.js:612`（提取文本）。宿主打包源码用于版本适配核查，不加入索引或分发。旧源码索引未包含新 sidebar 文件的首次查询只能返回附近符号；新增源码加入跟踪后再刷新项目索引。
+
+## 明确模型任务与安全错误参考（2026-11-01）
+
+编辑前执行本项目 `parseModelResponse invalidJSON`、`fixedTaskErrorMessage visibleAnalysisError` 查询，分别定位 `addon/content/service.js:280` 和 `addon/content/room.js:386/397`（修复前位置）。PapersGPT 固定提交 `e2706780651bf4af439e2a703a5b595d5ca0b910` 的 `src/modules/Meet/integratellms.ts:226–228,273–277,326–346` 把任务文本放入 user，并为 Gemini 传入同一文本；借鉴的是用户消息携带明确任务的行为，不代表其结构化解析可靠，也未复制 AGPL 实现。
+
+Zotero 固定提交 `212a7d6a585d1209bc4e698a904490205f139500` 的 `chrome/content/zotero/xpcom/http.js` 用于核对 JSON 响应、取消及日志选项，`sync.js:174` 的错误处理用于参考固定用户提示与内部错误分离。本项目继续拒绝向用户或日志转发接口正文、隐藏推理和密钥，未照搬上游的原始响应日志行为。XERJ 仅定位获准的源码，实际模型和 Zotero 主配置诊断不加入索引。
+
+显示验收追加查询本项目 `rr-reading-workspace rr-app overflow`，定位 `room.js:2818` 的当前 DOM 构造；Toolkit `iframe overflow height` 仅命中 `src/helpers/settingsDialog.ts:346` 等对话框内容，没有直接可复用的侧栏解法。随后直接核对本项目 CSS 祖先选择器与实际只读布局数据，给现有嵌入自动高度规则补上当前 DOM 选择器；未采用上游对话框的 overflow 设置。

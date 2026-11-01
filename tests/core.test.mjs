@@ -125,7 +125,7 @@ test("model claims without literal evidence are suppressed and invalid evidence 
   assert.equal(validated[1].summary, "信息不足");
   assert.equal(validated[1].evidence[0].verified, false);
   assert.equal(validated[0].summary, "信息不足");
-  assert.throws(() => Core.validateModelOutput({ actions: ["execute"] }, document, {}), { code: "INVALID_MODEL_OUTPUT" });
+  assert.throws(() => Core.validateModelOutput({ actions: ["execute"] }, document, {}), { code: "MODEL_SCHEMA_INVALID" });
 });
 
 test("chunk coverage counts actual content and respects limits", () => {

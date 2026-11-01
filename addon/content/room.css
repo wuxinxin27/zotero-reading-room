@@ -2365,7 +2365,8 @@ html[data-embedded="true"] .rr-identity { gap: 7px; }
 html[data-embedded="true"] .rr-identity > img { width: 28px; height: 28px; }
 html[data-embedded="true"] .rr-brand-copy strong { font-size: 15px; white-space: nowrap; }
 html[data-embedded="true"] .rr-header-actions { gap: 4px; flex-wrap: wrap; }
-html[data-embedded="true"] .rr-workspace-embedded {
+html[data-embedded="true"] .rr-workspace-embedded,
+html[data-embedded="true"] .rr-app > .rr-reading-workspace {
   flex: 0 0 auto;
   height: auto;
   overflow: visible;

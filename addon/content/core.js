@@ -191,7 +191,7 @@
 
   function validateModelOutput(raw, document, source) {
     if (!raw || !Array.isArray(raw.dimensions) || raw.dimensions.length > 12) {
-      throw error("INVALID_MODEL_OUTPUT", "模型没有返回约定的 dimensions JSON 结构。");
+      throw error("MODEL_SCHEMA_INVALID", "模型 JSON 的 dimensions 数组缺失、类型错误或条目数超限；请检查分析提示词与模型输出。");
     }
     function validateValue(spec, value) {
       const evidence = (Array.isArray(value && value.evidence) ? value.evidence : []).slice(0, 8)

@@ -366,8 +366,12 @@
       "模型服务拒答或触发安全拦截；请核对请求内容及服务设置。",
     MODEL_OUTPUT_TOOL_ONLY:
       "模型返回了工具调用；请使用支持直接文本回答的模型或配置。",
+    MODEL_JSON_INVALID:
+      "模型正文不是完整、无歧义的 JSON 对象；请检查提示词及服务是否保留任务指令后重试。",
+    MODEL_SCHEMA_INVALID:
+      "模型 JSON 的 dimensions 数组缺失、类型错误或条目数超限；请检查分析提示词与模型输出。",
     INVALID_MODEL_OUTPUT:
-      "模型返回格式无效或超出大小限制。",
+      "模型响应未通过格式与安全检查；可能是输出、凭据或传输问题，请检查模型服务后重试。",
     MODEL_REQUEST_FAILED:
       "模型请求失败，请检查服务后重试。",
     MODEL_AUTH_FAILED:

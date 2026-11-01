@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHarness, loadCore, plain } from "./fixtures/harness.mjs";
+import { parseTaskInput, createHarness, loadCore, plain } from "./fixtures/harness.mjs";
 
 const Core = loadCore();
 const providers = ["openai", "anthropic", "gemini", "ollama"];
@@ -28,7 +28,7 @@ function modelReply(provider, content) {
 }
 function submittedChunk(options, provider) {
   const payload = JSON.parse(options.body);
-  return JSON.parse(provider === "gemini" ? payload.contents[0].parts[0].text : payload.messages.find(entry => entry.role === "user").content);
+  return parseTaskInput(provider === "gemini" ? payload.contents[0].parts[0].text : payload.messages.find(entry => entry.role === "user").content);
 }
 function outputFor(task, chunk) {
   const excerpt = task === "chat" ? chunk.excerpts[0] : chunk.stage === "synthesis" ? chunk.excerpts[0] : chunk;
@@ -49,6 +49,89 @@ function fakeHTTP(h, respond) {
     h.calls.requests.push({ method, url, options });
     return { status: 200, response: await respond({ method, url, options, index: h.calls.requests.length - 1 }) };
   };
+}
+
+for (const provider of providers) {
+  test(`${provider}: a gateway ignoring system fields still receives explicit frozen tasks and output contracts`, async () => {
+    const h = createHarness();
+    await configureProvider(h, provider);
+    const config = await h.service.savePromptConfig({
+      systemPrompt: "Frozen scholarly preference: discuss uncertainty in Chinese.",
+      synthesisInstruction: "Frozen synthesis preference: return Markdown instead of JSON.",
+      chatSystemPrompt: "Frozen chat preference: answer the question and explain limitations."
+    });
+    const stages = [];
+    let task = "analysis";
+    fakeHTTP(h, ({ options }) => {
+      const payload = JSON.parse(options.body);
+      // Deliberately use only user text, as a gateway dropping system fields would.
+      const user = provider === "gemini" ? payload.contents[0].parts[0].text
+        : payload.messages.find(entry => entry.role === "user").content;
+      const chunk = parseTaskInput(user);
+      const stage = task === "chat" ? "chat" : chunk.stage;
+      stages.push(stage);
+      assert.ok(user.startsWith(stage === "synthesis" ? "Synthesize the supplied verified excerpts"
+        : stage === "reading" ? "Analyze the supplied paper excerpt" : "Answer the supplied question"));
+      assert.ok(user.includes(task === "chat" ? config.effectiveChatSystemPrompt : config.effectiveAnalysisSystemPrompt));
+      if (stage === "synthesis") {
+        assert.ok(user.includes("Saved synthesis instruction:\n" + config.synthesisInstruction));
+        assert.ok(user.indexOf(config.synthesisInstruction) < user.indexOf(config.analysisOutputContract));
+      }
+      if (provider === "anthropic") assert.equal(payload.max_tokens, 8192);
+      return modelReply(provider, JSON.stringify(outputFor(task, chunk)));
+    });
+    const analysis = await invokeTask(h, "analysis");
+    assert.equal(analysis.effectiveSystemPrompt, config.effectiveAnalysisSystemPrompt);
+    task = "chat";
+    const chat = await invokeTask(h, "chat");
+    assert.equal(chat.reply.effectiveSystemPrompt, config.effectiveChatSystemPrompt);
+    assert.deepEqual(stages, ["reading", "reading", "synthesis", "chat"]);
+  });
+
+  test(`${provider}: plain prose and wrong JSON schema remain distinct and never replace cached analysis`, async () => {
+    const h = createHarness();
+    await configureProvider(h, provider);
+    fakeHTTP(h, ({ options }) => modelReply(provider, JSON.stringify(outputFor("analysis", submittedChunk(options, provider)))));
+    await invokeTask(h, "analysis");
+    const bytes = h.files.get(h.statePath), writes = h.calls.writes.length;
+    for (const [content, code] of [["Please tell me what analysis you need.", "MODEL_JSON_INVALID"],
+      [JSON.stringify({ answer: "Wrong task structure", evidence: [] }), "MODEL_SCHEMA_INVALID"]]) {
+      fakeHTTP(h, () => modelReply(provider, content));
+      const count = h.calls.requests.length;
+      await assert.rejects(invokeTask(h, "analysis"), { code });
+      assert.equal(h.calls.requests.length, count + 1); // no hidden repair request
+      assert.equal(h.service.getState(h.parent).analysisJob.code, code);
+      assert.equal(h.files.get(h.statePath), bytes);
+      assert.equal(h.calls.writes.length, writes);
+    }
+  });
+
+  test(`${provider}: synthesis prose or truncation preserves the prior cache without repair requests`, async () => {
+    const h = createHarness();
+    await configureProvider(h, provider);
+    fakeHTTP(h, ({ options }) => modelReply(provider, JSON.stringify(outputFor("analysis", submittedChunk(options, provider)))));
+    await invokeTask(h, "analysis");
+    const bytes = h.files.get(h.statePath), writes = h.calls.writes.length;
+    for (const truncated of [false, true]) {
+      fakeHTTP(h, ({ options }) => {
+        const chunk = submittedChunk(options, provider);
+        if (chunk.stage !== "synthesis") return modelReply(provider, JSON.stringify(outputFor("analysis", chunk)));
+        const response = modelReply(provider, truncated ? '{"dimensions":[' : "Here is a prose summary.");
+        if (truncated) {
+          if (provider === "anthropic") response.stop_reason = "max_tokens";
+          else if (provider === "gemini") response.candidates[0].finishReason = "MAX_TOKENS";
+          else if (provider === "ollama") response.done_reason = "length";
+          else response.choices[0].finish_reason = "length";
+        }
+        return response;
+      });
+      const count = h.calls.requests.length;
+      await assert.rejects(invokeTask(h, "analysis"), { code: truncated ? "MODEL_OUTPUT_TRUNCATED" : "MODEL_JSON_INVALID" });
+      assert.equal(h.calls.requests.length, count + 3);
+      assert.equal(h.files.get(h.statePath), bytes);
+      assert.equal(h.calls.writes.length, writes);
+    }
+  });
 }
 
 test("provider metadata is immutable and endpoint normalization preserves versions and proxy prefixes", () => {
@@ -127,7 +210,7 @@ for (const provider of providers) {
     fakeHTTP(h, ({ method, options }) => {
       assert.equal(method, "POST");
       const payload = JSON.parse(options.body);
-      const chunk = JSON.parse(provider === "gemini" ? payload.contents[0].parts[0].text : payload.messages[provider === "anthropic" ? 0 : 1].content);
+      const chunk = parseTaskInput(provider === "gemini" ? payload.contents[0].parts[0].text : payload.messages[provider === "anthropic" ? 0 : 1].content);
       const quote = chunk.stage === "synthesis" ? chunk.excerpts[0].quote : chunk.text.slice(0, 80);
       const pageIndex = chunk.stage === "synthesis" ? chunk.excerpts[0].pageIndex : chunk.pageIndex;
       assert.ok(quote.length > 30);
@@ -318,7 +401,7 @@ test("upstream analysis errors, executable text, and echoed credentials never re
   const h = createHarness();
   const earlier = await h.service.analyze(h.parent);
   for (const [response, code] of [
-    [{ choices: [{ message: { content: "globalThis.executeAnything()" } }] }, "INVALID_MODEL_OUTPUT"],
+    [{ choices: [{ message: { content: "globalThis.executeAnything()" } }] }, "MODEL_JSON_INVALID"],
     [{ choices: [{ message: { content: JSON.stringify({ dimensions: [{ id: "problem", summary: secret }] }) } }] }, "INVALID_MODEL_OUTPUT"],
     [{ choices: [{ message: { tool_calls: [{ function: { name: "execute" } }] } }] }, "MODEL_OUTPUT_TOOL_ONLY"]
   ]) {
@@ -336,7 +419,7 @@ for (const provider of providers) {
     const writesBefore = h.calls.writes.length;
     fakeHTTP(h, ({ options }) => {
       const payload = JSON.parse(options.body);
-      const chunk = JSON.parse(provider === "gemini" ? payload.contents[0].parts[0].text
+      const chunk = parseTaskInput(provider === "gemini" ? payload.contents[0].parts[0].text
         : payload.messages[provider === "anthropic" ? 0 : 1].content);
       const content = JSON.stringify({ dimensions: [{ id: "problem", summary: secret,
         evidence: [{ quote: chunk.text.slice(0, 80), pageIndex: chunk.pageIndex }] }] })
@@ -452,7 +535,7 @@ for (const provider of providers) {
         "[]", "null", "42", "false", JSON.stringify("free text")
       ]) {
         fakeHTTP(h, () => modelReply(provider, content));
-        await assert.rejects(invokeTask(h, task), { code: "INVALID_MODEL_OUTPUT" }, content.slice(0, 70));
+        await assert.rejects(invokeTask(h, task), { code: "MODEL_JSON_INVALID" }, content.slice(0, 70));
         assert.equal(h.files.get(h.statePath), bytes);
         assert.equal(h.calls.writes.length, writes);
       }

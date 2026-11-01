@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHarness, paper, plain } from "./fixtures/harness.mjs";
+import { parseTaskInput, createHarness, paper, plain } from "./fixtures/harness.mjs";
 
 function addPaper(h, id, { libraryID = 1, key = "PAPER" + String(id).padStart(3, "0"), available = true } = {}) {
   const parent = { ...h.parent, id, key, libraryID, fields: { ...h.parent.fields, title: "Synthetic paper " + id } };
@@ -32,7 +32,7 @@ function payloadSystem(payload, provider) {
 }
 
 function payloadUser(payload, provider) {
-  return JSON.parse(provider === "gemini" ? payload.contents[0].parts[0].text
+  return parseTaskInput(provider === "gemini" ? payload.contents[0].parts[0].text
     : payload.messages.find(entry => entry.role === "user").content);
 }
 
@@ -47,7 +47,7 @@ test("prompt defaults, editing, reset and reload are independent of model config
   assert.equal(defaults.isCustom, false);
   assert.equal(defaults.updatedAt, null);
   assert.equal(defaults.systemPrompt, defaults.defaultSystemPrompt);
-  assert.equal(defaults.outputContractVersion, "1");
+  assert.equal(defaults.outputContractVersion, "2");
   assert.equal(defaults.effectiveAnalysisSystemPrompt, defaults.systemPrompt + "\n\n" + defaults.analysisOutputContract);
   assert.equal(defaults.effectiveChatSystemPrompt, defaults.chatSystemPrompt + "\n\n" + defaults.chatOutputContract);
   assert.equal(defaults.promptHash, h.Core.hash(JSON.stringify([defaults.effectiveAnalysisSystemPrompt, defaults.synthesisInstruction])));
@@ -260,7 +260,7 @@ test("per-paper missing PDFs, malformed provider output and network errors do no
   assert.equal(done.status, "completed");
   assert.equal(done.counts.failed, 3);
   assert.equal(done.counts.succeeded, 1);
-  assert.deepEqual(plain(done.entries.slice(0, 3).map(entry => entry.error.code)), ["PDF_MISSING", "INVALID_MODEL_OUTPUT", "MODEL_REQUEST_FAILED"]);
+  assert.deepEqual(plain(done.entries.slice(0, 3).map(entry => entry.error.code)), ["PDF_MISSING", "MODEL_JSON_INVALID", "MODEL_REQUEST_FAILED"]);
   assert.equal(JSON.stringify(done).includes("private"), false);
   assert.equal(JSON.stringify(done).includes("synthetic-secret"), false);
   assert.ok(h.service.getState(h.records.get(30)).analysis);
