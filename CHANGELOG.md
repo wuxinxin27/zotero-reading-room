@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased — reading workspace
+## Unreleased — current-paper assistant
+
+- Limit Reading Room to the paper in Zotero's current normal PDF reader. Zotero handles library browsing and switching; remove catalog, collection/search, focus shortcuts and batch UI, without complete-library enumeration or background calls.
+- Enable the section only for a matching PDF reader context. Resolve the exact attachment from its owning `item-details.tabID` through `Reader.getByTabID`, retaining `tabID`, parent `itemID`/`parentItemID`, `attachmentID` and `attachmentKey` across host callbacks. Missing or mismatched context fails closed and can retry on a later render; never fall back to another PDF under the same parent.
+- Preserve Tools and selected-item context menus for opening one normal PDF, and reader-toolbar access to the sidebar. Keep independent iframe lifecycles, Fluent attributes, reload/remount, per-section collapse, hot-reload rebinding and cleanup. Remove the custom main item-tree status column; manual native status tags remain.
+- Retain single-paper analysis/chat, all three editable prompts, notes and status tags. Legacy focus fields and backend catalog/batch APIs remain dormant for compatibility, without data migration or cleanup.
+- Add synthetic host regression coverage and update privacy/development/testing documentation. Core current-paper flows, fresh-tab binding and full-width native panels have been checked on Windows Zotero 10.0.7; remaining native coverage is listed in docs/TESTING.md. Formal version remains 0.2.0; no new tag or Release.
+
+## Earlier Unreleased development history — superseded scope
+
+The following records describe earlier development, including library navigation, batch operations and standalone layouts that are absent from the current interface. They do not promise those features or establish acceptance of the current-paper scope.
 
 - Move default entry points into the right sidebar of Zotero's normal PDF reader instead of opening a top-level Reading Room window. Paper selection and evidence navigation follow the current reader attachment. Native UI acceptance for this migration remains pending; earlier standalone-window checks below describe that earlier implementation.
 - Add full editing/reset of the analysis system prompt, multi-chunk synthesis instruction and paper-chat system prompt, with verbatim defaults in docs/AI-PROMPTS.md. Prompt saves do not call models or invalidate cached analyses; explicit reanalysis stores prompt provenance.

@@ -225,9 +225,9 @@ function paper(id, title, focused = false) {
 async function fixture({
   cached = false,
   failAnalysis = null,
-  batchFactory = null,
   promptConfig = null,
-  initialBatchState = null,
+  contextOverrides = {},
+  sharedService = null,
 } = {}) {
   const windowListeners = new Map();
   const document = new Document();
@@ -306,17 +306,6 @@ async function fixture({
     isCustom: false,
     updatedAt: null,
   };
-  let batchState = {
-    id: null,
-    status: "idle",
-    force: false,
-    entries: [],
-    counts: {
-      total: 0, queued: 0, running: 0, reused: 0,
-      succeeded: 0, failed: 0, cancelled: 0,
-    },
-  };
-  if (initialBatchState) batchState = initialBatchState;
   const cachedAnalysis = {
     mode: "model",
     source: { attachmentKey: "ATTACH01" },
@@ -337,7 +326,7 @@ async function fixture({
     savedConfigs,
     promptSaves,
     promptResets,
-    normalizeItem(item) { return item || null; },
+    normalizeItem(item) { return item && (item.parentID ? parents.get(item.parentID) : item) || null; },
     getState() {
       return {
         status: "unread",
@@ -346,81 +335,40 @@ async function fixture({
         analysis: cached ? cachedAnalysis : null,
       };
     },
-    async listLibraries() {
-      return [
-        { id: 1, name: "Synthetic Library",
-          type: "user", editable: true },
-        { id: 7, name: "Synthetic Group",
-          type: "group", editable: false },
-      ];
-    },
-    async listCollections(options = {}) {
-      calls.push({ type: "listCollections", options });
-      return [
-        { id: 11, key: "COL11", libraryID: 1,
-          name: "Methods", parentID: null },
-        { id: 12, key: "COL12", libraryID: 1,
-          name: "Nested", parentID: 11 },
-        { id: 13, key: "COL13", libraryID: 1,
-          name: "Empty folder", parentID: null },
-        { id: 71, key: "COL71", libraryID: 7,
-          name: "Group folder", parentID: null },
-      ].filter(row => options.libraryID == null
-        || row.libraryID === options.libraryID);
-    },
-    async listPapers(options) {
-      calls.push({ type: "listPapers", options });
-      let items = papers.map(entry => ({ ...entry }));
-      if (options.collectionID === 12) {
-        items = items.filter(entry => entry.id === 3);
-      }
-      else if (options.collectionID === 13) items = [];
-      if (options.focusOnly) items = items.filter(entry => entry.focused);
-      if (options.query) {
-        items = items.filter(entry =>
-          entry.title.toLowerCase().includes(options.query.toLowerCase()));
-      }
-      return {
-        items: items.slice(options.offset, options.offset + options.limit),
-        total: items.length,
-        offset: options.offset,
-        limit: options.limit,
-      };
-    },
-    async setFocused(item, value) {
-      calls.push({ type: "setFocused", item, value });
-      const target = papers.find(entry => entry.id === item.id);
-      if (target) target.focused = value;
-    },
+    ...Object.fromEntries(["listLibraries", "listCollections", "listPapers",
+      "loadCatalog", "setFocused", "analyzeBatch", "getBatchState"].map(name => [name, () => {
+      calls.push({ type: name });
+      throw new Error(`current-only view must never call ${name}`);
+    }])),
     async describe(item) {
       calls.push({ type: "describe", item });
       const metadata = papers.find(entry => entry.id === item.id);
       return {
         item: { ...metadata, doi: "10.0000/synthetic" },
-        attachments: [{ id: 101, key: "ATTACH01",
-          title: "Synthetic PDF", contentType: "application/pdf",
-          available: true }],
+        attachments: [...attachments.values()].filter(value => value.parentID === item.id)
+          .map(value => ({ id: value.id, key: value.key, title: value.title,
+            contentType: value.attachmentContentType, available: true })),
         counts: { notes: 0, annotations: 0 },
-        state: {
-          status: metadata && metadata.status || "unread",
-          notes: "Unsaved synthetic note",
-          checklist: {},
-          analysisJob: { status: "idle" },
-          analysis: item.id === 2 && cached ? cachedAnalysis : null,
-        },
+        state: structuredClone(readings.get(item.id)),
       };
     },
     async setState(item, patch) {
       calls.push({ type: "setState", item, patch });
-      return {
-        status: patch.status || "unread",
-        notes: patch.notes || "",
-        checklist: patch.checklist || {},
+      const reading = { ...readings.get(item.id), ...patch,
         tagSync: Object.hasOwn(patch, "status") ? {
           status: "synced", tag: `阅读室/${patch.status}`,
         } : undefined,
-        analysis: null,
       };
+      readings.set(item.id, reading);
+      return structuredClone(reading);
+    },
+    async saveAnalysisNote(item) {
+      calls.push({ type: "saveAnalysisNote", item });
+      return { created: true };
+    },
+    async syncStateNote(item) {
+      calls.push({ type: "syncStateNote", item });
+      return { changed: true, created: true };
     },
     async getConversation(item, options) {
       calls.push({ type: "getConversation", item, options });
@@ -451,14 +399,14 @@ async function fixture({
       calls.push({ type: "cancelChat", item });
       return true;
     },
-    async getReaderAttachment() {
+    async getReaderAttachment(item, options) {
+      calls.push({ type: "getReaderAttachment", item, options });
+      const attachment = attachments.get(options.attachmentID);
+      assert.equal(attachment.parentID, item.id);
+      assert.equal(attachment.key, options.attachmentKey);
       return {
-        id: 101,
-        key: "ATTACH01",
-        libraryID: 1,
-        title: "Synthetic PDF",
-        path: "/synthetic/paper.pdf",
-        available: true,
+        id: attachment.id, key: attachment.key, libraryID: attachment.libraryID,
+        title: attachment.title, path: "/synthetic/paper.pdf", available: true,
         contentType: "application/pdf",
       };
     },
@@ -468,7 +416,7 @@ async function fixture({
       if (failAnalysis) throw failAnalysis;
       return cachedAnalysis;
     },
-    cancelAnalysis() { return false; },
+    cancelAnalysis(item) { calls.push({ type: "cancelAnalysis", item }); return false; },
     async getPromptConfig() {
       calls.push({ type: "getPromptConfig" });
       return { ...currentPrompt };
@@ -505,49 +453,6 @@ async function fixture({
         updatedAt: "2026-11-01T02:00:00.000Z",
       };
       return { ...currentPrompt };
-    },
-    getBatchState() {
-      return JSON.parse(JSON.stringify(batchState));
-    },
-    async analyzeBatch(items, options) {
-      calls.push({ type: "analyzeBatch", items, options });
-      if (batchFactory) {
-        return batchFactory({
-          items,
-          options,
-          service: this,
-          setState(value) { batchState = value; },
-        });
-      }
-      const entries = items.map(item => {
-        const id = typeof item === "number" ? item : item.itemID;
-        const metadata = papers.find(entry => entry.id === id);
-        return {
-          itemID: id,
-          libraryID: 1,
-          key: metadata.key,
-          title: metadata.title,
-          status: "succeeded",
-        };
-      });
-      batchState = {
-        id: "batch-test",
-        status: "completed",
-        force: options.force,
-        entries,
-        counts: {
-          total: entries.length, queued: 0, running: 0, reused: 0,
-          succeeded: entries.length, failed: 0, cancelled: 0,
-        },
-        startedAt: "2026-11-01T01:00:00.000Z",
-        finishedAt: "2026-11-01T01:01:00.000Z",
-      };
-      options.onProgress?.(JSON.parse(JSON.stringify(batchState)));
-      return JSON.parse(JSON.stringify(batchState));
-    },
-    cancelBatch() {
-      calls.push({ type: "cancelBatch" });
-      return batchState.status === "running";
     },
     async getAIConfig() {
       return {
@@ -592,6 +497,25 @@ async function fixture({
     },
     async flush() {},
   };
+  const attachments = new Map([
+    [101, { id: 101, key: "ATTACH01", parentID: 2, title: "Synthetic PDF" }],
+    [102, { id: 102, key: "ATTACH02", parentID: 2, title: "Synthetic second PDF" }],
+    [301, { id: 301, key: "ATTACH03", parentID: 3, title: "Gamma PDF" }],
+  ].map(([id, attachment]) => [id, { ...attachment, libraryID: 1,
+    attachmentContentType: "application/pdf", isAttachment() { return true; } }]));
+  const readings = new Map(papers.map(metadata => [metadata.id, {
+    status: "unread", notes: "Unsaved synthetic note", checklist: {},
+    analysisJob: { status: "idle" },
+    analysis: metadata.id === 2 && cached ? cachedAnalysis : null,
+    analyses: metadata.id === 2 && cached ? {
+      ATTACH01: cachedAnalysis,
+      ATTACH02: { ...cachedAnalysis, source: { attachmentKey: "ATTACH02" },
+        overview: "Second PDF cached overview." },
+    } : {},
+  }]));
+  const nativeContext = { embedded: true, itemID: 2, parentItemID: 2,
+    attachmentID: 101, attachmentKey: "ATTACH01", tabID: "reader-tab-2", ...contextOverrides };
+  const readers = new Map([["reader-tab-2", { itemID: 101, async navigate() {} }]]);
   const context = vm.createContext({
     window: win,
     document,
@@ -613,8 +537,13 @@ async function fixture({
           },
         };
       },
-      Items: { get(id) { return parents.get(Number(id)) || null; } },
-      Reader: { async open() {} },
+      Items: {
+        get(id) { return parents.get(Number(id)) || attachments.get(Number(id)) || null; },
+        getAll() { throw new Error("must not enumerate Zotero library"); },
+      },
+      Reader: { getByTabID(tabID) { return readers.get(tabID) || null; },
+        getByItemID() { throw new Error("must not select a fallback reader"); },
+        async open() { throw new Error("current view must not open a different Reader"); } },
       debug() {},
     },
     Services: {
@@ -642,28 +571,31 @@ async function fixture({
     rootURI: "file:///test/",
     cssURL: "file:///test/room.css",
     iconURL: "file:///test/icon.svg",
-    service,
+    service: sharedService || service,
     version: "0.2.0",
   });
   context.ReadingRoomWindow.start({
     window: win,
     document,
     itemID: 2,
-    nativeContext: {
-      embedded: true,
-      itemID: 2,
-      tabID: "reader-tab-2",
-    },
+    nativeContext,
   });
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
   return {
     context,
+    win,
+    parents,
+    attachments,
+    readings,
+    readers,
+    nativeContext,
+    switchContext(next) { return win.ReadingRoomWindow.updateContext(next); },
     document,
     timers,
     clearedTimers,
     controllers,
-    service,
+    service: sharedService || service,
     windowListeners,
     async openSettings() {
       const open = button(document.body, "模型设置");
@@ -690,22 +622,6 @@ async function fixture({
   };
 }
 
-test("workspace uses catalog and prior analysis without model request", async () => {
-  const h = await fixture({ cached: true });
-  assert.ok(descendants(h.document.body,
-    node => node.textContent === "Synthetic Alpha").length);
-  assert.ok(descendants(h.document.body,
-    node => node.textContent === "Cached overview.").length);
-  assert.equal(h.service.calls.some(call => call.type === "analyze"), false);
-  assert.equal(h.service.calls.some(call => call.type === "listModels"), false);
-  assert.equal(h.service.calls.some(
-    call => call.type === "listConfiguredModels"), false);
-  const listCalls = h.service.calls.filter(
-    call => call.type === "listPapers");
-  assert.ok(listCalls.some(call => call.options.libraryID === 1
-    && call.options.collectionID === 11));
-});
-
 test("AI button analyzes directly and handles preparing state", async () => {
   const h = await fixture({ cached: true });
   const run = button(h.document.body, "AI 分析");
@@ -731,41 +647,6 @@ test("missing configuration points to independent model settings", async () => {
     node => node.getAttribute("role") === "dialog").length, 0);
 });
 
-test("focus changes persist and refresh focused chips", async () => {
-  const h = await fixture();
-  const focusButtons = descendants(h.document.body,
-    node => node.localName === "button"
-      && node.getAttribute("aria-label") === "关注此论文");
-  assert.ok(focusButtons.length >= 2);
-  focusButtons[0].click();
-  await new Promise(resolve => setImmediate(resolve));
-  const call = h.service.calls.find(entry => entry.type === "setFocused");
-  assert.ok(call);
-  assert.equal(call.value, true);
-});
-
-test("switching papers flushes pending notes before describe", async () => {
-  const h = await fixture();
-  const notes = descendants(h.document.body,
-    node => node.localName === "textarea"
-      && node.getAttribute("aria-label") !== "询问当前论文")[0];
-  notes.value = "changed synthetic notes";
-  notes.dispatchEvent({ type: "input", target: notes });
-  const target = descendants(h.document.body,
-    node => node.localName === "button"
-      && descendants(node,
-        child => child.textContent === "Synthetic Gamma").length)[0];
-  assert.ok(target);
-  target.click();
-  await new Promise(resolve => setImmediate(resolve));
-  const setState = h.service.calls.find(call =>
-    call.type === "setState"
-      && call.patch.notes === "changed synthetic notes");
-  assert.ok(setState);
-  assert.ok(h.service.calls.filter(
-    call => call.type === "describe").length >= 2);
-});
-
 test("closing a room flushes notes before its debounce timer", async () => {
   const h = await fixture();
   const notes = descendants(h.document.body,
@@ -777,25 +658,6 @@ test("closing a room flushes notes before its debounce timer", async () => {
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
   assert.ok(h.service.calls.some(call => call.type === "setState" && call.patch.notes === "last edit before closing"));
-});
-
-test("a failed switch keeps dirty edits available for a subsequent retry", async () => {
-  const h = await fixture();
-  const notes = descendants(h.document.body,
-    node => node.localName === "textarea"
-      && node.getAttribute("aria-label") !== "询问当前论文")[0];
-  notes.value = "keep this after a disk failure";
-  notes.dispatchEvent({ type: "input", target: notes });
-  const target = descendants(h.document.body, node => node.localName === "button"
-    && descendants(node, child => child.textContent === "Synthetic Gamma").length)[0];
-  const original = h.service.setState;
-  h.service.setState = async () => { throw new Error("synthetic disk failure"); };
-  target.click();
-  await new Promise(resolve => setImmediate(resolve));
-  h.service.setState = original;
-  target.click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.ok(h.service.calls.some(call => call.type === "setState" && call.patch.notes === "keep this after a disk failure"));
 });
 
 test("settings load config without exposing plaintext key", async () => {
@@ -933,154 +795,6 @@ test("missing consentProvider does not restore remote permissions", async () => 
   assert.ok(permissions.every(permission => !permission.checked));
 });
 
-test("collection tree keeps nested and empty folders and scopes catalog selection", async () => {
-  const h = await fixture();
-  assert.ok(descendants(h.document.body,
-    node => node.textContent === "Synthetic Library").length);
-  assert.ok(descendants(h.document.body,
-    node => node.textContent === "Empty folder").length);
-  const methods = descendants(h.document.body,
-    node => node.localName === "button"
-      && node.textContent === "Methods")[0];
-  assert.ok(methods);
-  const toggle = descendants(h.document.body,
-    node => node.localName === "button"
-      && node.getAttribute("aria-label") === "展开 Methods")[0];
-  assert.ok(toggle);
-  toggle.click();
-  const expandedToggle = descendants(h.document.body,
-    node => node.localName === "button"
-      && node.getAttribute("aria-label") === "收起 Methods")[0];
-  assert.ok(expandedToggle);
-  assert.equal(expandedToggle.getAttribute("aria-expanded"), "true");
-  const nested = descendants(h.document.body,
-    node => node.localName === "button"
-      && node.textContent === "Nested")[0];
-  assert.ok(nested);
-  nested.click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.ok(descendants(h.document.body,
-    node => node.localName === "button"
-      && node.textContent === "Nested"
-      && node.getAttribute("aria-current") === "true").length);
-  const scoped = h.service.calls.filter(call =>
-    call.type === "listPapers"
-    && call.options.collectionID === 12).at(-1);
-  assert.ok(scoped);
-  assert.equal(scoped.options.libraryID, 1);
-  assert.ok(descendants(h.document.body,
-    node => node.textContent === "Synthetic Library / Methods / Nested").length);
-  assert.ok(descendants(h.document.body,
-    node => node.textContent === "Synthetic Gamma").length);
-  assert.equal(descendants(h.document.body,
-    node => node.textContent === "Synthetic Alpha").length, 0);
-});
-
-test("library trees never duplicate folders across libraries and remain available after selection", async () => {
-  const h = await fixture();
-  const libraries = descendants(h.document.body, node =>
-    node.classList.contains("rr-tree-library"));
-  assert.equal(libraries.length, 2);
-  assert.equal(descendants(libraries[0], node => node.textContent === "Group folder").length, 0);
-  assert.equal(descendants(libraries[1], node => node.textContent === "Methods").length, 0);
-  choose(h.document.body, "选择文库", "Synthetic Group · 群组");
-  await new Promise(resolve => setImmediate(resolve));
-  const personal = descendants(h.document.body, node => node.localName === "button"
-    && node.textContent === "Methods")[0];
-  assert.ok(personal, "other library tree must remain available");
-  personal.click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.ok(h.service.calls.some(call => call.type === "listPapers"
-    && call.options.libraryID === 1 && call.options.collectionID === 11));
-});
-
-test("attachment choices populate after selecting a paper", async () => {
-  const h = await fixture();
-  const { trigger, menu } = choice(h.document.body, "选择用于原文与分析的本地 PDF");
-  trigger.click();
-  const options = descendants(menu, node => node.getAttribute("role") === "option");
-  assert.equal(options.length, 1);
-  assert.equal(options[0].textContent, "Synthetic PDF");
-  options[0].click();
-  assert.equal(trigger.getAttribute("aria-expanded"), "false");
-});
-
-test("focused-paper shortcuts survive selecting an empty collection", async () => {
-  const h = await fixture();
-  const empty = descendants(h.document.body, node => node.localName === "button"
-    && node.textContent === "Empty folder")[0];
-  empty.click();
-  await new Promise(resolve => setImmediate(resolve));
-  const chips = descendants(h.document.body, node => node.classList.contains("rr-focus-chip"));
-  assert.ok(chips.some(node => node.textContent === "Synthetic Beta"));
-  const query = h.service.calls.filter(call => call.type === "listPapers"
-    && call.options.focusOnly).at(-1).options;
-  assert.equal(query.libraryID, null);
-  assert.equal(query.collectionID, null);
-});
-
-test("scope switch flushes dirty notes and search resets page and scope", async () => {
-  const h = await fixture();
-  const notes = descendants(h.document.body,
-    node => node.localName === "textarea")[0];
-  notes.value = "scope switch must save";
-  notes.dispatchEvent({ type: "input", target: notes });
-  choose(h.document.body, "选择文库", "Synthetic Group · 群组");
-  await new Promise(resolve => setImmediate(resolve));
-  const groupFolder = descendants(h.document.body,
-    node => node.localName === "button"
-      && node.textContent === "Group folder")[0];
-  assert.ok(groupFolder);
-  groupFolder.click();
-  await new Promise(resolve => setImmediate(resolve));
-  await new Promise(resolve => setImmediate(resolve));
-  // Switching a directory scope updates only the catalog query; it does not
-  // replace the current paper, so dirty notes remain queued for paper switch.
-  const draft = descendants(h.document.body,
-    node => node.localName === "textarea")[0];
-  assert.equal(draft.value, "scope switch must save");
-  const scoped = h.service.calls.filter(call =>
-    call.type === "listPapers"
-    && call.options.libraryID === 7
-    && call.options.collectionID === 71).at(-1);
-  assert.ok(scoped);
-  const search = descendants(h.document.body,
-    node => node.localName === "input"
-      && node.getAttribute("type") === "search")[0];
-  search.value = "Gamma";
-  search.dispatchEvent({ type: "input", target: search });
-  const callback = h.timers.at(-1);
-  callback();
-  await new Promise(resolve => setImmediate(resolve));
-  const searched = h.service.calls.filter(call =>
-    call.type === "listPapers"
-    && call.options.query === "Gamma").at(-1);
-  assert.ok(searched);
-  assert.equal(searched.options.offset, 0);
-  assert.equal(searched.options.libraryID, 7);
-  assert.equal(searched.options.collectionID, 71);
-});
-
-test("navigation collapse updates the root workspace class and restores it", async () => {
-  const h = await fixture();
-  const workspace = descendants(h.document.body,
-    node => node.localName === "div"
-      && node.classList.contains("rr-workspace"))[0];
-  const navigation = descendants(h.document.body,
-    node => node.localName === "aside")[0];
-  assert.ok(workspace && navigation);
-  const collapse = button(h.document.body, "展开");
-  assert.ok(workspace.classList.contains("navigation-collapsed"));
-  assert.ok(navigation.classList.contains("collapsed"));
-  assert.equal(collapse.getAttribute("aria-expanded"), "false");
-  collapse.click();
-  assert.equal(workspace.classList.contains("navigation-collapsed"), false);
-  assert.equal(navigation.classList.contains("collapsed"), false);
-  assert.equal(collapse.getAttribute("aria-expanded"), "true");
-  collapse.click();
-  assert.ok(workspace.classList.contains("navigation-collapsed"));
-});
-
 test("prompt settings display, edit, save and reset through real UI events", async () => {
   const h = await fixture();
   let dialog = await h.openPrompt();
@@ -1113,7 +827,7 @@ test("prompt settings display, edit, save and reset through real UI events", asy
     chatSystemPrompt: "Custom full chat system prompt.",
   });
   assert.equal(h.service.calls.some(call =>
-    ["analyze", "analyzeBatch", "listModels", "listConfiguredModels"]
+    ["analyze", "askPaper", "listModels", "listConfiguredModels"]
       .includes(call.type)), false);
 
   dialog = await h.openPrompt();
@@ -1128,376 +842,6 @@ test("prompt settings display, edit, save and reset through real UI events", asy
     && node.getAttribute("aria-label") === "论文对话系统提示词")[0];
   assert.equal(restored.value, "Default complete system prompt.");
   assert.equal(restoredChat.value, "Default complete chat system prompt.");
-});
-
-test("batch selection persists across pages and starts only after review", async () => {
-  const h = await fixture();
-  const pageChecks = descendants(h.document.body, node =>
-    node.localName === "input"
-    && node.getAttribute("class") === "rr-paper-select");
-  assert.equal(pageChecks.length, 3);
-  pageChecks[0].checked = true;
-  pageChecks[0].dispatchEvent({ type: "change", target: pageChecks[0] });
-  button(h.document.body, "下一页").click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.ok(textOf(h.document.body).includes("已选 1 篇"));
-  button(h.document.body, "批量 AI 分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  const dialog = descendants(h.document.body,
-    node => node.getAttribute("role") === "dialog")[0];
-  assert.ok(dialog);
-  assert.ok(textOf(dialog).includes("已明确选择 1 篇"));
-  assert.ok(textOf(dialog).includes("Synthetic Alpha"));
-  assert.equal(h.service.calls.some(call => call.type === "analyzeBatch"),
-    false);
-  button(dialog, "开始批量分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  const call = h.service.calls.find(entry =>
-    entry.type === "analyzeBatch");
-  assert.deepEqual(Array.from(call.items, item => ({ itemID: item.itemID })),
-    [{ itemID: 1 }]);
-  assert.equal(call.options.force, false);
-  assert.ok(textOf(h.document.body).includes("批量分析已完成"));
-});
-
-test("current filtered selection enumerates every page and caps explicitly", async () => {
-  const h = await fixture();
-  const addAll = button(h.document.body, "加入当前筛选全部");
-  addAll.click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.ok(textOf(h.document.body).includes("已选 3 篇"));
-  const selectionCalls = h.service.calls.filter(call =>
-    call.type === "listPapers"
-    && call.options.query === ""
-    && call.options.libraryID === 1
-    && call.options.collectionID === 11);
-  assert.ok(selectionCalls.length >= 2);
-  assert.ok(selectionCalls.every(call =>
-    call.options.offset % call.options.limit === 0));
-  button(h.document.body, "清空选择").click();
-  assert.ok(textOf(h.document.body).includes("已选 0 篇"));
-});
-
-test("batch progress locks manual analysis and allows failed-item retry", async () => {
-  let release;
-  const h = await fixture({
-    cached: true,
-    batchFactory({ items, options, setState }) {
-      const running = {
-        id: "batch-running",
-        status: "running",
-        force: false,
-        currentItemID: 1,
-        entries: [{
-          itemID: 1,
-          libraryID: 1,
-          key: "KEY1",
-          title: "Synthetic Alpha",
-          status: "running",
-          stage: "analyzing",
-        }],
-        counts: {
-          total: 1, queued: 0, running: 1, reused: 0,
-          succeeded: 0, failed: 0, cancelled: 0,
-        },
-      };
-      setState(running);
-      options.onProgress?.(running);
-      return new Promise(resolve => {
-        release = () => {
-          const failed = {
-            ...running,
-            status: "completed",
-            entries: [{
-              ...running.entries[0],
-              status: "failed",
-              error: { code: "MODEL_TIMEOUT", message: "模型请求超时。" },
-            }],
-            counts: {
-              total: 1, queued: 0, running: 0, reused: 0,
-              succeeded: 0, failed: 1, cancelled: 0,
-            },
-          };
-          setState(failed);
-          resolve(failed);
-        };
-      });
-    },
-  });
-  const pageCheck = descendants(h.document.body, node =>
-    node.localName === "input"
-    && node.getAttribute("class") === "rr-paper-select")[0];
-  pageCheck.checked = true;
-  pageCheck.dispatchEvent({ type: "change", target: pageCheck });
-  button(h.document.body, "批量 AI 分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  const dialog = descendants(h.document.body,
-    node => node.getAttribute("role") === "dialog")[0];
-  button(dialog, "开始批量分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(button(h.document.body, "AI 分析").disabled, true);
-  assert.equal(button(h.document.body, "重新分析").disabled, true);
-  assert.equal(button(h.document.body, "模型设置").disabled, true);
-  assert.equal(button(h.document.body, "分析提示词").disabled, true);
-  assert.equal(button(dialog, "关闭").disabled, false);
-  assert.ok(textOf(h.document.body).includes("批量分析进行中"));
-  release();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.ok(textOf(h.document.body).includes("重试 1 篇失败项"));
-  assert.equal(button(h.document.body, "AI 分析").disabled, false);
-});
-
-test("existing cached batch results render without duplicate work", async () => {
-  const h = await fixture({
-    cached: true,
-    batchFactory({ items, options, setState }) {
-      const reused = {
-        id: "batch-cache",
-        status: "completed",
-        force: false,
-        entries: [{
-          itemID: items[0].itemID,
-          libraryID: 1,
-          key: "KEY2",
-          title: "Synthetic Beta",
-          status: "reused",
-        }],
-        counts: {
-          total: 1, queued: 0, running: 0, reused: 1,
-          succeeded: 0, failed: 0, cancelled: 0,
-        },
-      };
-      setState(reused);
-      options.onProgress?.(reused);
-      return reused;
-    },
-  });
-  const beta = descendants(h.document.body, node =>
-    node.localName === "button"
-    && descendants(node, child => child.textContent === "Synthetic Beta").length
-    && node.getAttribute("class") === "rr-paper-open")[0];
-  beta.click();
-  await new Promise(resolve => setImmediate(resolve));
-  const checks = descendants(h.document.body, node =>
-    node.localName === "input"
-    && node.getAttribute("class") === "rr-paper-select");
-  checks[1].checked = true;
-  checks[1].dispatchEvent({ type: "change", target: checks[1] });
-  button(h.document.body, "批量 AI 分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  const dialog = descendants(h.document.body,
-    node => node.getAttribute("role") === "dialog")[0];
-  button(dialog, "开始批量分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(h.service.calls.some(call => call.type === "analyze"),
-    false);
-  assert.ok(textOf(h.document.body).includes("复用缓存"));
-  assert.ok(textOf(h.document.body).includes("Cached overview."));
-});
-
-test("cancelled batch marks pending items and preserves persisted monitor on reopen", async () => {
-  const h = await fixture({
-    batchFactory({ items, options, setState }) {
-      const running = {
-        id: "batch-cancel",
-        status: "running",
-        force: false,
-        entries: items.map((item, index) => ({
-          itemID: item.itemID,
-          libraryID: 1,
-          key: `KEY${item.itemID}`,
-          title: index ? "Synthetic Gamma" : "Synthetic Alpha",
-          status: index ? "queued" : "running",
-        })),
-        counts: {
-          total: 2, queued: 1, running: 1, reused: 0,
-          succeeded: 0, failed: 0, cancelled: 0,
-        },
-      };
-      setState(running);
-      options.onProgress?.(running);
-      return new Promise(resolve => {
-        const cancelled = {
-          ...running,
-          status: "cancelled",
-          entries: running.entries.map(entry => ({
-            ...entry,
-            status: "cancelled",
-          })),
-          counts: {
-            total: 2, queued: 0, running: 0, reused: 0,
-            succeeded: 0, failed: 0, cancelled: 2,
-          },
-        };
-        setState(cancelled);
-        resolve(cancelled);
-      });
-    },
-  });
-  const checks = descendants(h.document.body, node =>
-    node.localName === "input"
-    && node.getAttribute("class") === "rr-paper-select");
-  for (const check of checks.slice(0, 2)) {
-    check.checked = true;
-    check.dispatchEvent({ type: "change", target: check });
-  }
-  button(h.document.body, "批量 AI 分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  const dialog = descendants(h.document.body,
-    node => node.getAttribute("role") === "dialog")[0];
-  button(dialog, "开始批量分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  button(dialog, "取消批次").click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.ok(h.service.calls.some(call => call.type === "cancelBatch"));
-  assert.ok(textOf(h.document.body).includes("批量分析已取消"));
-  const persisted = h.service.getBatchState();
-  assert.equal(persisted.counts.cancelled, 2);
-});
-
-test("reopening a room restores the latest persisted batch without starting work", async () => {
-  const first = await fixture({
-    batchFactory({ items, options, setState }) {
-      const completed = {
-        id: "batch-reopen",
-        status: "completed",
-        force: false,
-        entries: [{
-          itemID: items[0].itemID,
-          libraryID: 1,
-          key: "KEY1",
-          title: "Synthetic Alpha",
-          status: "succeeded",
-        }],
-        counts: {
-          total: 1, queued: 0, running: 0, reused: 0,
-          succeeded: 1, failed: 0, cancelled: 0,
-        },
-      };
-      setState(completed);
-      options.onProgress?.(completed);
-      return completed;
-    },
-  });
-  const check = descendants(first.document.body, node =>
-    node.localName === "input"
-    && node.getAttribute("class") === "rr-paper-select")[0];
-  check.checked = true;
-  check.dispatchEvent({ type: "change", target: check });
-  button(first.document.body, "批量 AI 分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  let dialog = descendants(first.document.body,
-    node => node.getAttribute("role") === "dialog")[0];
-  button(dialog, "开始批量分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(first.service.getBatchState().status, "completed");
-  const persisted = first.service.getBatchState();
-  assert.ok(textOf(first.document.body).includes("批量分析已完成"));
-  assert.equal(persisted.entries[0].status, "succeeded");
-});
-
-test("new room reads persisted batch state on mount without model calls", async () => {
-  const first = await fixture({
-    batchFactory({ items, options, setState }) {
-      const completed = {
-        id: "batch-persist",
-        status: "completed",
-        force: false,
-        entries: [{
-          itemID: items[0].itemID,
-          libraryID: 1,
-          key: "KEY1",
-          title: "Synthetic Alpha",
-          status: "succeeded",
-        }],
-        counts: {
-          total: 1, queued: 0, running: 0, reused: 0,
-          succeeded: 1, failed: 0, cancelled: 0,
-        },
-      };
-      setState(completed);
-      options.onProgress?.(completed);
-      return completed;
-    },
-  });
-  const check = descendants(first.document.body, node =>
-    node.localName === "input"
-    && node.getAttribute("class") === "rr-paper-select")[0];
-  check.checked = true;
-  check.dispatchEvent({ type: "change", target: check });
-  button(first.document.body, "批量 AI 分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  const dialog = descendants(first.document.body,
-    node => node.getAttribute("role") === "dialog")[0];
-  button(dialog, "开始批量分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-
-  const second = await fixture({
-    initialBatchState: first.service.getBatchState(),
-  });
-  assert.ok(textOf(second.document.body).includes("批量分析已完成"));
-  assert.equal(second.service.calls.some(call =>
-    ["analyze", "analyzeBatch"].includes(call.type)), false);
-  button(second.document.body, "批次状态").click();
-  await new Promise(resolve => setImmediate(resolve));
-  const statusDialog = descendants(second.document.body,
-    node => node.getAttribute("role") === "dialog")[0];
-  assert.ok(textOf(statusDialog).includes("Synthetic Alpha"));
-  assert.ok(textOf(statusDialog).includes("已完成"));
-});
-
-test("narrow room CSS keeps prompt and batch controls reflowable", async () => {
-  const css = await fs.readFile(
-    new URL("../addon/content/room.css", import.meta.url), "utf8",
-  );
-  assert.match(css, /@media \(max-width: 480px\)/);
-  assert.match(css, /\.rr-selection-bar \{[^}]*flex-wrap: wrap/s);
-  assert.match(css, /\.rr-batch-preview-row \{[^}]*grid-template-columns:/s);
-  assert.match(css, /\.rr-modal \{[^}]*width: min\(650px, calc\(100vw - 36px\)\)/s);
-});
-
-test("batch review cancels a running queue when the window unloads", async () => {
-  let release;
-  const h = await fixture({
-    batchFactory({ items, options, setState }) {
-      const running = {
-        id: "batch-unload",
-        status: "running",
-        force: false,
-        entries: [{
-          itemID: items[0].itemID,
-          libraryID: 1,
-          key: "KEY1",
-          title: "Synthetic Alpha",
-          status: "running",
-        }],
-        counts: {
-          total: 1, queued: 0, running: 1, reused: 0,
-          succeeded: 0, failed: 0, cancelled: 0,
-        },
-      };
-      setState(running);
-      options.onProgress?.(running);
-      return new Promise(resolve => {
-        release = () => resolve(running);
-      });
-    },
-  });
-  const check = descendants(h.document.body, node =>
-    node.localName === "input"
-    && node.getAttribute("class") === "rr-paper-select")[0];
-  check.checked = true;
-  check.dispatchEvent({ type: "change", target: check });
-  button(h.document.body, "批量 AI 分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  const dialog = descendants(h.document.body,
-    node => node.getAttribute("role") === "dialog")[0];
-  button(dialog, "开始批量分析").click();
-  await new Promise(resolve => setImmediate(resolve));
-  for (const listener of h.windowListeners.get("unload") || []) listener();
-  assert.ok(h.service.calls.some(call => call.type === "cancelBatch"));
-  release();
-  await new Promise(resolve => setImmediate(resolve));
 });
 
 test("embedded layout hides its PDF workspace and shows paper chat without model calls on open", async () => {
@@ -1572,9 +916,10 @@ test("chat cancellation is scoped to the owned paper and preserves old history",
   await new Promise(resolve => setImmediate(resolve));
   button(h.document.body, "取消对话").click();
   await new Promise(resolve => setImmediate(resolve));
-  const cancelled = h.service.calls.find(call => call.type === "cancelChat");
-  assert.ok(cancelled);
-  assert.equal(cancelled.item.id, 2);
+  const request = h.service.calls.find(call => call.type === "askPaper");
+  assert.equal(request.item.id, 2);
+  assert.equal(request.options.signal.aborted, true);
+  assert.equal(h.service.calls.some(call => call.type === "cancelChat"), false);
   assert.ok(textOf(h.document.body).includes("此前保存的问答仍保留"));
   release();
   await new Promise(resolve => setImmediate(resolve));
@@ -1613,19 +958,6 @@ test("idle view disposal leaves another view's chat request untouched", async ()
   assert.equal(h.service.calls.some(call => call.type === "cancelChat"), false);
 });
 
-test("native catalog selection opens the requested native reader rather than replacing this tab's paper", async () => {
-  const h = await fixture();
-  const shown = [];
-  h.context.Zotero.ReadingRoom = { async show(options) { shown.push(options); } };
-  const target = descendants(h.document.body, node => node.localName === "button"
-    && descendants(node, child => child.textContent === "Synthetic Gamma").length)[0];
-  target.click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(shown.length, 1);
-  assert.equal(shown[0].itemID, 3);
-  assert.equal(h.service.calls.filter(call => call.type === "describe").length, 1);
-});
-
 test("source uses safe DOM APIs and has no extractive mode entry", () => {
   assert.equal(source.includes("innerHTML"), false);
   assert.equal(source.includes("doc.createElement("), false);
@@ -1636,6 +968,346 @@ test("source uses safe DOM APIs and has no extractive mode entry", () => {
   assert.match(source, /consentProvider/);
   assert.match(source, /listConfiguredModels/);
   assert.match(source, /getPromptConfig/);
-  assert.match(source, /analyzeBatch/);
-  assert.match(source, /getBatchState/);
+  for (const removed of ["listLibraries", "listCollections", "listPapers", "loadCatalog",
+    "analyzeBatch", "getBatchState", "fallbackReaderForContext", "beginAttachmentSwitch",
+    "attachmentSelect", "batchUnavailable"]) assert.equal(source.includes(removed), false, removed);
+});
+
+const tick = () => new Promise(resolve => setImmediate(resolve));
+function notesInput(h) {
+  return descendants(h.document.body, node => node.localName === "textarea"
+    && node.getAttribute("aria-label") !== "询问当前论文")[0];
+}
+function questionInput(h) {
+  return descendants(h.document.body, node => node.localName === "textarea"
+    && node.getAttribute("aria-label") === "询问当前论文")[0];
+}
+function gammaContext(h) {
+  h.readers.set("reader-tab-3", { itemID: 301, async navigate() {} });
+  return { ...h.nativeContext, itemID: 3, parentItemID: 3,
+    attachmentID: 301, attachmentKey: "ATTACH03", tabID: "reader-tab-3" };
+}
+function secondPDFContext(h) {
+  h.readers.set("reader-tab-2", { itemID: 102, async navigate() {} });
+  return { ...h.nativeContext, attachmentID: 102, attachmentKey: "ATTACH02" };
+}
+function assertNoCatalog(h) {
+  assert.equal(h.service.calls.some(call => ["listLibraries", "listCollections",
+    "listPapers", "loadCatalog", "setFocused", "analyzeBatch", "getBatchState"].includes(call.type)), false);
+}
+
+test("mount reuses only the current PDF cache and renders no catalog or attachment chooser", async () => {
+  const h = await fixture({ cached: true });
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("Synthetic Beta"));
+  assert.ok(text.includes("Synthetic PDF"));
+  assert.ok(text.includes("Cached overview."));
+  assert.equal(text.includes("Second PDF cached overview."), false);
+  assert.equal(text.includes("Synthetic Alpha"), false);
+  assert.equal(descendants(h.document.body, node => node.localName === "select"
+    || node.localName === "nav" || node.localName === "input" && node.getAttribute("type") === "search"
+    || /rr-(?:navigation|catalog|collections|focused|batch|search)/.test(node.getAttribute("class") || "")).length, 0);
+  assert.equal(/关注此论文|批量分析|搜索文献|选择用于原文/.test(text), false);
+  assert.equal(h.service.calls.some(call => ["analyze", "askPaper", "listModels", "listConfiguredModels"].includes(call.type)), false);
+  assertNoCatalog(h);
+});
+
+test("status, notes, checklist, explicit notes, analysis and chat stay scoped without catalog enumeration", async () => {
+  const h = await fixture({ cached: true });
+  button(h.document.body, "已读").click();
+  await tick();
+  const notes = notesInput(h);
+  notes.value = "current-parent notes";
+  notes.dispatchEvent({ type: "input" });
+  const checklist = descendants(h.document.body, node => node.localName === "input"
+    && node.getAttribute("type") === "checkbox")[0];
+  checklist.checked = true;
+  checklist.dispatchEvent({ type: "change" });
+  button(h.document.body, "保存为新的 Zotero 分析笔记").click();
+  button(h.document.body, "同步阅读记录到个人库笔记").click();
+  button(h.document.body, "AI 分析").click();
+  await tick();
+  questionInput(h).value = "What is current?";
+  button(h.document.body, "发送").click();
+  await tick();
+  await h.switchContext(gammaContext(h));
+  assert.ok(h.service.calls.some(call => call.type === "setState"
+    && call.item.id === 2 && call.patch.notes === "current-parent notes" && call.patch.checklist.problem === true));
+  for (const type of ["saveAnalysisNote", "syncStateNote", "analyze", "askPaper"]) {
+    assert.equal(h.service.calls.find(call => call.type === type)?.item.id, 2, type);
+  }
+  assertNoCatalog(h);
+});
+
+test("the complete five-field context binds exactly the second PDF and its cached analysis", async () => {
+  const h = await fixture({ cached: true });
+  await h.switchContext(secondPDFContext(h));
+  await tick();
+  assert.ok(textOf(h.document.body).includes("Synthetic second PDF"));
+  assert.ok(textOf(h.document.body).includes("Second PDF cached overview."));
+  assert.equal(textOf(h.document.body).includes("Cached overview."), false);
+  const readerCall = h.service.calls.filter(call => call.type === "getReaderAttachment").at(-1);
+  assert.equal(readerCall.options.attachmentID, 102);
+  assert.equal(readerCall.options.attachmentKey, "ATTACH02");
+  button(h.document.body, "AI 分析").click();
+  await tick();
+  questionInput(h).value = "Second PDF question";
+  button(h.document.body, "发送").click();
+  await tick();
+  for (const type of ["analyze", "askPaper", "getConversation"]) {
+    assert.equal(h.service.calls.filter(call => call.type === type).at(-1).options.attachmentID, 102, type);
+  }
+  assertNoCatalog(h);
+});
+
+for (const field of ["itemID", "parentItemID", "attachmentID", "attachmentKey", "tabID"]) {
+  test(`a missing ${field} refuses analysis and chat without falling back to the first PDF`, async () => {
+    const h = await fixture({ contextOverrides: { [field]: undefined } });
+    assert.equal(button(h.document.body, "AI 分析").disabled, true);
+    assert.equal(button(h.document.body, "发送").disabled, true);
+    button(h.document.body, "AI 分析").click();
+    questionInput(h).value = "must refuse";
+    button(h.document.body, "发送").click();
+    await tick();
+    assert.equal(h.service.calls.some(call => ["analyze", "askPaper", "getConversation", "getReaderAttachment"].includes(call.type)), false);
+    assert.ok(textOf(h.document.body).includes("不可用") || textOf(h.document.body).includes("未匹配"));
+    assertNoCatalog(h);
+  });
+}
+
+for (const [name, contextOverrides] of [
+  ["attachment key", { attachmentKey: "WRONGKEY" }],
+  ["attachment ID", { attachmentID: 102 }],
+  ["parent item", { parentItemID: 3 }],
+  ["unknown tab", { tabID: "old-tab" }],
+  ["numeric field type", { attachmentID: "101" }],
+]) {
+  test(`an incorrect ${name} refuses analysis and chat without a Reader fallback`, async () => {
+    const h = await fixture({ contextOverrides });
+    assert.equal(button(h.document.body, "AI 分析").disabled, true);
+    assert.equal(button(h.document.body, "发送").disabled, true);
+    button(h.document.body, "AI 分析").click();
+    questionInput(h).value = "must refuse";
+    button(h.document.body, "发送").click();
+    await tick();
+    assert.equal(h.service.calls.some(call => ["analyze", "askPaper", "getConversation", "getReaderAttachment"].includes(call.type)), false);
+    assertNoCatalog(h);
+  });
+}
+
+for (const [name, patch] of [
+  ["library", { libraryID: 7 }],
+  ["parent", { parentID: 3 }],
+  ["key", { key: "WRONGKEY" }],
+  ["ID", { id: 999 }],
+  ["content type", { attachmentContentType: "text/html" }],
+  ["deleted attachment", { deleted: true }],
+]) {
+  test(`the attachment's ${name} must match the current parent and context`, async () => {
+    const h = await fixture();
+    Object.assign(h.attachments.get(102), patch);
+    await h.switchContext(secondPDFContext(h));
+    assert.equal(button(h.document.body, "AI 分析").disabled, true);
+    assert.equal(button(h.document.body, "发送").disabled, true);
+    assert.equal(h.service.calls.filter(call => call.type === "getReaderAttachment").length, 1);
+  });
+}
+
+test("a Reader identity change is revalidated when analysis, chat and source navigation are clicked", async () => {
+  const h = await fixture();
+  questionInput(h).value = "get sources";
+  button(h.document.body, "发送").click();
+  await tick();
+  const before = h.service.calls.length;
+  let navigations = 0;
+  h.readers.set("reader-tab-2", { itemID: 102, async navigate() { navigations++; } });
+  button(h.document.body, "AI 分析").click();
+  questionInput(h).value = "must refuse after reader change";
+  button(h.document.body, "发送").click();
+  button(h.document.body, "“Synthetic source quote”").click();
+  await tick();
+  assert.equal(h.service.calls.slice(before).some(call => ["analyze", "askPaper"].includes(call.type)), false);
+  assert.equal(navigations, 0);
+});
+
+test("an unchanged context and host selection preserve unsaved notes without rereading", async () => {
+  const h = await fixture({ cached: true });
+  const notes = notesInput(h);
+  notes.value = "still dirty";
+  notes.dispatchEvent({ type: "input" });
+  await h.switchContext({ ...h.nativeContext, hostWindow: {} });
+  await h.win.ReadingRoomWindow.selectItem(h.parents.get(2));
+  assert.equal(notes.value, "still dirty");
+  assert.equal(h.service.calls.filter(call => call.type === "describe").length, 1);
+  assert.equal(h.service.calls.filter(call => call.type === "setState").length, 0);
+});
+
+test("switching current Zotero context flushes dirty notes before reading the new parent", async () => {
+  const h = await fixture();
+  const notes = notesInput(h);
+  notes.value = "changed synthetic notes";
+  notes.dispatchEvent({ type: "input" });
+  await h.switchContext(gammaContext(h));
+  const saveIndex = h.service.calls.findIndex(call => call.type === "setState"
+    && call.item.id === 2 && call.patch.notes === "changed synthetic notes");
+  const describeIndex = h.service.calls.findIndex(call => call.type === "describe" && call.item.id === 3);
+  assert.ok(saveIndex >= 0 && saveIndex < describeIndex);
+  assert.equal(notes.value, "Unsaved synthetic note");
+  await h.switchContext(h.nativeContext);
+  assert.equal(notes.value, "changed synthetic notes");
+  assertNoCatalog(h);
+});
+
+test("switching PDFs of the same parent shares notes and checklist while keeping attachment caches separate", async () => {
+  const h = await fixture({ cached: true });
+  const notes = notesInput(h);
+  notes.value = "shared parent notes";
+  notes.dispatchEvent({ type: "input" });
+  const checklist = descendants(h.document.body, node => node.localName === "input"
+    && node.getAttribute("type") === "checkbox")[0];
+  checklist.checked = true;
+  checklist.dispatchEvent({ type: "change" });
+  await h.switchContext(secondPDFContext(h));
+  assert.equal(notes.value, "shared parent notes");
+  assert.ok(textOf(h.document.body).includes("Second PDF cached overview."));
+  assert.equal(h.readings.get(2).checklist.problem, true);
+  h.readers.set("reader-tab-2", { itemID: 101, async navigate() {} });
+  await h.switchContext(h.nativeContext);
+  assert.equal(notes.value, "shared parent notes");
+  assert.ok(textOf(h.document.body).includes("Cached overview."));
+  assert.equal(textOf(h.document.body).includes("Second PDF cached overview."), false);
+});
+
+test("a failed context switch retains dirty notes and retries the save on the next host update", async () => {
+  const h = await fixture();
+  const notes = notesInput(h);
+  notes.value = "keep this after a disk failure";
+  notes.dispatchEvent({ type: "input" });
+  const next = gammaContext(h);
+  const original = h.service.setState;
+  h.service.setState = async () => { throw new Error("synthetic disk failure"); };
+  await h.switchContext(next);
+  assert.equal(notes.value, "keep this after a disk failure");
+  assert.equal(h.service.calls.filter(call => call.type === "describe").length, 1);
+  assert.ok(textOf(h.document.body).includes("synthetic disk failure"));
+  h.service.setState = original;
+  await h.switchContext(next);
+  assert.equal(h.readings.get(2).notes, "keep this after a disk failure");
+  assert.equal(h.service.calls.filter(call => call.type === "describe").at(-1).item.id, 3);
+});
+
+test("changing context cancels only this view's owned signals and ignores late analysis and chat results", async () => {
+  const h = await fixture({ cached: true });
+  let finishAnalysis;
+  let finishChat;
+  let oldProgress;
+  h.service.analyze = (item, options) => new Promise(resolve => {
+    h.service.calls.push({ type: "analyze", item, options });
+    oldProgress = options.onProgress;
+    finishAnalysis = resolve;
+  });
+  h.service.askPaper = (item, question, options) => new Promise(resolve => {
+    h.service.calls.push({ type: "askPaper", item, options });
+    finishChat = resolve;
+  });
+  // A pending chat can coexist with an explicitly requested analysis.
+  questionInput(h).value = "pending old question";
+  button(h.document.body, "发送").click();
+  button(h.document.body, "AI 分析").click();
+  const oldAnalysis = h.service.calls.find(call => call.type === "analyze");
+  const oldChat = h.service.calls.find(call => call.type === "askPaper");
+  assert.ok(oldAnalysis && oldChat);
+  await h.switchContext(secondPDFContext(h));
+  assert.equal(oldAnalysis.options.signal.aborted, true);
+  assert.equal(oldChat.options.signal.aborted, true);
+  assert.equal(h.service.calls.some(call => ["cancelChat", "cancelAnalysis"].includes(call.type)), false);
+  oldProgress({ status: "error", detail: "STALE PROGRESS" });
+  finishAnalysis({ mode: "model", overview: "STALE ANALYSIS", dimensions: [] });
+  finishChat({ messages: [{ role: "assistant", content: "STALE CHAT" }] });
+  await tick();
+  assert.equal(/STALE/.test(textOf(h.document.body)), false);
+  assert.ok(textOf(h.document.body).includes("Second PDF cached overview."));
+  assert.equal(button(h.document.body, "AI 分析").disabled, false);
+});
+
+test("newer context wins over an older delayed describe response", async () => {
+  const h = await fixture();
+  const original = h.service.describe;
+  let release;
+  let entered;
+  const pending = new Promise(resolve => { entered = resolve; });
+  h.service.describe = async item => {
+    if (item.id === 3) {
+      entered();
+      await new Promise(resolve => { release = resolve; });
+    }
+    return original(item);
+  };
+  const old = h.switchContext(gammaContext(h));
+  await pending;
+  const latest = h.switchContext(h.nativeContext);
+  release();
+  await Promise.all([old, latest]);
+  assert.ok(textOf(h.document.body).includes("Synthetic Beta"));
+  assert.equal(textOf(h.document.body).includes("Synthetic Gamma"), false);
+  assert.equal(button(h.document.body, "发送").disabled, false);
+});
+
+test("disposal aborts only owned analysis signals and prevents late errors from touching the disposed view", async () => {
+  const h = await fixture();
+  let rejectAnalysis;
+  h.service.analyze = (item, options) => new Promise((resolve, reject) => {
+    h.service.calls.push({ type: "analyze", item, options });
+    rejectAnalysis = reject;
+  });
+  button(h.document.body, "AI 分析").click();
+  await h.win.ReadingRoomWindow.dispose();
+  const request = h.service.calls.find(call => call.type === "analyze");
+  assert.equal(request.options.signal.aborted, true);
+  rejectAnalysis(new Error("late disposed failure"));
+  await tick();
+  assert.equal(textOf(h.document.body).includes("late disposed failure"), false);
+  assert.equal(h.service.calls.some(call => call.type === "cancelAnalysis"), false);
+});
+
+
+test("two iframe runtimes sharing a service never cancel each other's same-parent chat", async () => {
+  const first = await fixture();
+  let release;
+  first.service.askPaper = (item, question, options) => new Promise(resolve => {
+    first.service.calls.push({ type: "askPaper", item, question, options });
+    release = () => resolve({ messages: [] });
+  });
+  questionInput(first).value = "keep first view running";
+  button(first.document.body, "发送").click();
+  const request = first.service.calls.find(call => call.type === "askPaper");
+  const second = await fixture({ sharedService: first.service });
+  await second.switchContext(gammaContext(second));
+  await second.win.ReadingRoomWindow.dispose();
+  assert.equal(request.options.signal.aborted, false);
+  assert.equal(button(first.document.body, "取消对话").disabled, false);
+  await first.win.ReadingRoomWindow.dispose();
+  assert.equal(request.options.signal.aborted, true);
+  release();
+  await tick();
+  assert.equal(first.service.calls.some(call => ["cancelChat", "cancelAnalysis"].includes(call.type)), false);
+});
+
+test("a late status save from the previous parent cannot replace the current parent's state", async () => {
+  const h = await fixture();
+  let complete;
+  h.service.setState = (item, patch) => new Promise(resolve => {
+    h.service.calls.push({ type: "setState", item, patch });
+    complete = () => resolve({ status: "read", notes: "old notes", checklist: {},
+      tagSync: { status: "synced", tag: "阅读室/已读" } });
+  });
+  button(h.document.body, "已读").click();
+  await h.switchContext(gammaContext(h));
+  complete();
+  await tick();
+  assert.equal(notesInput(h).value, "Unsaved synthetic note");
+  const active = descendants(h.document.body, node => node.getAttribute("data-status") === "unread"
+    && node.classList.contains("active"))[0];
+  assert.ok(active);
+  assert.equal(textOf(h.document.body).includes("阅读状态已保存，并同步为原生标签"), false);
 });

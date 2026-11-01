@@ -3,7 +3,6 @@
   "use strict";
 
   const XHTML_NS = "http://www.w3.org/1999/xhtml";
-  const PAGE_SIZE = 80;
   const STATUS_LABELS = Object.freeze({
     unread: "未读",
     to_read: "待读",
@@ -27,15 +26,6 @@
   const MODEL_DISCOVERY_DELAY = 700;
   const PROMPT_SYSTEM_LIMIT = 40000;
   const PROMPT_SYNTHESIS_LIMIT = 4000;
-  const MAX_BATCH_TARGETS = 1000;
-  const BATCH_STATUS_LABELS = Object.freeze({
-    queued: "等待",
-    running: "分析中",
-    reused: "复用缓存",
-    succeeded: "已完成",
-    failed: "失败",
-    cancelled: "已取消",
-  });
   const FALLBACK_API_PROVIDERS = Object.freeze([
     { id: "openai", label: "OpenAI 兼容 API", defaultEndpoint: OPENAI_LEGACY_ENDPOINT, endpointHint: "可填写 base URL，或旧的完整 chat completions 地址。" },
     { id: "anthropic", label: "Anthropic Messages API", defaultEndpoint: "https://api.anthropic.com/v1", endpointHint: "填写 Anthropic API base URL。" },
@@ -45,21 +35,18 @@
 
   let state = null;
   let activeJob = null;
-  let activeBatch = null;
+  let analysisController = null;
+  let contextGeneration = 0;
+  let contextUpdate = Promise.resolve();
   let noteTimer = null;
   let checklistTimer = null;
   let notesDirty = false;
   let checklistDirty = false;
-  let searchTimer = null;
   let aiConfigSession = null;
   let dialogSequence = 0;
   let loadGeneration = 0;
-  let catalogGeneration = 0;
-  let collectionsGeneration = 0;
-  let selectionGeneration = 0;
   let started = false;
   let choiceSequence = 0;
-  let pdfResizeTimer = null;
   let chatController = null;
   let chatGeneration = 0;
   let ownsShutdown = false;
@@ -390,207 +377,23 @@
     return Number.isFinite(number)
       ? Math.max(0, Math.min(100, Math.round(number * 100))) : 0;
   }
-  function batchIsRunning() {
-    return !!activeBatch
-      || !!(state && state.batchState
-        && state.batchState.status === "running");
-  }
-  function paperSelectionKey(paper) {
-    if (!paper) return "";
-    const libraryID = Number(paper.libraryID);
-    const key = String(paper.key || "");
-    if (Number.isSafeInteger(libraryID) && libraryID > 0 && key) {
-      return `${libraryID}:${key}`;
-    }
-    const id = Number(paper.id);
-    return Number.isSafeInteger(id) && id > 0 ? `id:${id}` : "";
-  }
-  function selectedPapers() {
-    return state && state.selectedPapers
-      ? [...state.selectedPapers.values()] : [];
-  }
-  function selectedPaper(paper) {
-    return state && state.selectedPapers
-      ? state.selectedPapers.get(paperSelectionKey(paper)) || null : null;
-  }
-  function rememberSelectedPaper(paper) {
-    if (!state || !state.selectedPapers || !paper) return false;
-    const key = paperSelectionKey(paper);
-    const itemID = Number(paper.id);
-    if (!key || !Number.isSafeInteger(itemID) || itemID < 1) return false;
-    if (state.selectedPapers.has(key)) return false;
-    if (state.selectedPapers.size >= MAX_BATCH_TARGETS) return false;
-    state.selectedPapers.set(key, {
-      id: itemID,
-      itemID,
-      libraryID: Number(paper.libraryID),
-      key: String(paper.key || ""),
-      title: String(paper.title || "未命名文献"),
-    });
-    return true;
-  }
-  function forgetSelectedPaper(paper) {
-    if (!state || !state.selectedPapers) return false;
-    return state.selectedPapers.delete(paperSelectionKey(paper));
-  }
-  function updateSelectionControls() {
-    if (!state || !state.selectionCount) return;
-    const count = state.selectedPapers.size;
-    state.selectionCount.textContent = `已选 ${count} 篇`;
-    setBooleanAttribute(state.batchButton, "disabled",
-      count < 1 || batchIsRunning());
-    setBooleanAttribute(state.selectPageButton, "disabled",
-      batchIsRunning() || state.catalogLoading
-      || !state.catalog.items.length);
-    setBooleanAttribute(state.clearSelectionButton, "disabled",
-      batchIsRunning() || count < 1);
-    setBooleanAttribute(state.addFilteredButton, "disabled",
-      batchIsRunning() || state.catalogLoading || state.selectionLoading);
-    state.addFilteredButton.textContent = state.selectionLoading
-      ? "正在收集…" : "加入当前筛选全部";
-  }
-  function selectionStatus(message, kind) {
-    if (state) setStatus(state.selectionStatus, message, kind);
-  }
   function syncActionLocks() {
     if (!state) return;
-    const locked = !!state.analyzing || batchIsRunning();
-    setBooleanAttribute(state.aiButton, "disabled",
-      locked || !state.currentItem);
-    setBooleanAttribute(state.reanalyzeButton, "disabled",
-      locked || !state.currentItem);
+    const locked = !!state.analyzing || !!state.contextSwitching;
+    const bound = !!currentNativeBinding();
     setBooleanAttribute(state.modelButton, "disabled", locked);
     setBooleanAttribute(state.promptButton, "disabled", locked);
     setBooleanAttribute(state.chatSendButton, "disabled",
-      locked || !!state.chatLoading || !state.currentItem);
+      locked || !!state.chatLoading || !state.currentItem
+      || !state.currentAttachmentID || !bound);
+    setBooleanAttribute(state.aiButton, "disabled",
+      locked || !state.currentItem || !state.currentAttachmentID || !bound);
+    setBooleanAttribute(state.reanalyzeButton, "disabled",
+      locked || !state.currentItem || !state.currentAttachmentID || !bound);
     setBooleanAttribute(state.chatCancelButton, "disabled",
       !state.chatLoading);
     setBooleanAttribute(state.chatInput, "disabled",
-      locked || !!state.chatLoading);
-    updateSelectionControls();
-  }
-  function batchCountsText(batch) {
-    const counts = batch && batch.counts || {};
-    return [
-      `共 ${Number(counts.total) || 0}`,
-      `等待 ${Number(counts.queued) || 0}`,
-      `运行 ${Number(counts.running) || 0}`,
-      `复用 ${Number(counts.reused) || 0}`,
-      `完成 ${Number(counts.succeeded) || 0}`,
-      `失败 ${Number(counts.failed) || 0}`,
-      `取消 ${Number(counts.cancelled) || 0}`,
-    ].join(" · ");
-  }
-  function batchEntryIdentity(entry) {
-    if (!entry) return "";
-    return `${Number(entry.libraryID) || 0}:${String(entry.key || entry.itemID || "")}`;
-  }
-  function refreshCatalogAnalysis(itemID) {
-    if (!state) return;
-    const id = Number(itemID);
-    for (const paper of state.catalog.items) {
-      if (Number(paper.id) === id) paper.hasAnalysis = true;
-    }
-    renderCatalog();
-  }
-  function refreshCurrentAnalysis(itemID) {
-    if (!state || !state.currentItem
-        || Number(state.currentItem.id) !== Number(itemID)) return;
-    try {
-      const reading = state.service.getState(state.currentItem);
-      if (state.description) state.description.state = reading;
-      renderAnalysis(reading.analysis);
-      setBooleanAttribute(state.noteButton, "disabled",
-        !reading.analysis || reading.analysis.mode !== "model");
-    }
-    catch (error) {
-      logError("refresh batch analysis for current paper", error);
-    }
-  }
-  function applyBatchState(next) {
-    if (!state || !next || typeof next !== "object") return;
-    const previous = state.batchState || { entries: [] };
-    const previousEntries = new Map(
-      (previous.entries || []).map(entry => [batchEntryIdentity(entry), entry]),
-    );
-    const sameRun = previous.id && previous.id === next.id;
-    state.batchState = next;
-    for (const entry of next.entries || []) {
-      if (!["reused", "succeeded"].includes(entry.status)) continue;
-      const prior = previousEntries.get(batchEntryIdentity(entry));
-      if (sameRun && prior
-          && ["reused", "succeeded"].includes(prior.status)) continue;
-      refreshCatalogAnalysis(entry.itemID);
-      refreshCurrentAnalysis(entry.itemID);
-    }
-    renderBatchMonitor();
-    syncActionLocks();
-    if (state.batchDialog && typeof state.batchDialog.render === "function") {
-      state.batchDialog.render();
-    }
-  }
-  function handleBatchProgress(next) {
-    applyBatchState(next);
-    if (!state) return;
-    if (state.batchState.status === "completed") {
-      setStatus(state.globalStatus,
-        "批量分析已完成；每篇成功结果均已自动保存。", "success");
-    }
-    else if (state.batchState.status === "cancelled") {
-      setStatus(state.globalStatus,
-        "批量分析已取消；已完成的结果已保留。", "warning");
-    }
-  }
-  function renderBatchMonitor() {
-    if (!state || !state.batchMonitor) return;
-    const monitor = state.batchMonitor;
-    monitor.replaceChildren();
-    const batch = state.batchState;
-    if (!batch || !Array.isArray(batch.entries) || !batch.entries.length
-        || batch.status === "idle") {
-      setHidden(monitor, true);
-      return;
-    }
-    setHidden(monitor, false);
-    const copy = make("div", "rr-batch-monitor-copy");
-    copy.append(
-      make("strong", null,
-        batch.status === "running" ? "批量分析进行中"
-          : batch.status === "cancelled" ? "批量分析已取消" : "批量分析已完成"),
-      make("span", null, batchCountsText(batch)),
-    );
-    const actions = make("div", "rr-batch-monitor-actions");
-    if (batch.status === "running") {
-      actions.append(makeApiButton("取消批次", "rr-danger", () => {
-        try {
-          const cancelled = state.service.cancelBatch();
-          setStatus(state.globalStatus,
-            cancelled ? "正在取消当前批次…" : "当前没有可取消的批次。",
-            cancelled ? "pending" : "warning");
-        }
-        catch (error) {
-          setStatus(state.globalStatus, safeError(error).message, "error");
-        }
-      }));
-    }
-    const failed = (batch.entries || []).filter(entry =>
-      entry.status === "failed");
-    if (failed.length && !batchIsRunning()) {
-      actions.append(makeApiButton(`重试 ${failed.length} 篇失败项`,
-        "rr-secondary", () => void openBatchReview({
-          targets: failed.map(entry => ({
-            id: entry.itemID,
-            itemID: entry.itemID,
-            libraryID: entry.libraryID,
-            key: entry.key,
-            title: entry.title,
-          })),
-          title: "重试失败论文",
-        })));
-    }
-    actions.append(makeApiButton("查看队列", "rr-link-button",
-      () => void openBatchReview({ targets: [], title: "批量分析状态" })));
-    monitor.append(copy, actions);
+      locked || !!state.chatLoading || !state.currentAttachmentID || !bound);
   }
   function checkedCount(checklist) {
     return CHECKLIST.reduce(
@@ -715,26 +518,6 @@
     };
     attach();
   }
-  function selectedPaneItem(window) {
-    try {
-      const tabID = window.Zotero_Tabs && window.Zotero_Tabs.selectedID;
-      const reader = tabID && Zotero.Reader && Zotero.Reader.getByTabID(tabID);
-      if (reader && reader.itemID) return Zotero.Items.get(reader.itemID);
-      return window.ZoteroPane && window.ZoteroPane.getSelectedItems()[0] || null;
-    }
-    catch (_) {
-      return null;
-    }
-  }
-  function refreshLibraries() {
-    try {
-      Zotero.ItemTreeManager && Zotero.ItemTreeManager.refreshColumns
-        && Zotero.ItemTreeManager.refreshColumns();
-    }
-    catch (error) {
-      logError("refresh columns", error);
-    }
-  }
   function startup(options) {
     if (started) return;
     state = {
@@ -817,350 +600,6 @@
       grid.append(row);
     }
     return grid;
-  }
-  function renderCatalog() {
-    if (!state) return;
-    const list = state.paperList;
-    list.replaceChildren();
-    renderCatalogScope();
-    if (state.catalogLoading) {
-      list.append(make("div", "rr-catalog-empty", "正在读取当前范围…"));
-      return;
-    }
-    if (!state.catalog.items.length) {
-      list.append(make("div", "rr-catalog-empty",
-        state.catalog.query ? "没有匹配的论文。" : "当前范围没有论文。"));
-      return;
-    }
-    for (const paper of state.catalog.items) {
-      const row = make("article",
-        "rr-paper-row" + (paper.focused ? " focused" : "")
-          + (selectedPaper(paper) ? " selected" : ""));
-      const select = currentDocument().createElementNS(
-        XHTML_NS, "input",
-      );
-      select.setAttribute("type", "checkbox");
-      select.setAttribute("class", "rr-paper-select");
-      select.setAttribute("aria-label", `选择 ${paper.title || "未命名文献"} 批量分析`);
-      setBooleanAttribute(select, "disabled", batchIsRunning());
-      setChecked(select, !!selectedPaper(paper));
-      select.addEventListener("change", () => {
-        if (getChecked(select)) {
-          if (!rememberSelectedPaper(paper)) {
-            setChecked(select, false);
-            selectionStatus(state.selectedPapers.size >= MAX_BATCH_TARGETS
-              ? `批量选择最多 ${MAX_BATCH_TARGETS} 篇。`
-              : "无法记录此论文的稳定标识。", "error");
-          }
-        }
-        else forgetSelectedPaper(paper);
-        setClass(row, "rr-paper-row"
-          + (paper.focused ? " focused" : "")
-          + (selectedPaper(paper) ? " selected" : ""));
-        updateSelectionControls();
-      });
-      const open = make("button", "rr-paper-open");
-      open.setAttribute("type", "button");
-      open.append(
-        make("strong", null, paper.title || "未命名文献"),
-        make("span", "rr-paper-meta",
-          [paper.year, (paper.creators || []).slice(0, 2).join("、"),
-            paper.venue].filter(Boolean).join(" · ") || "元数据尚未完整"),
-      );
-      const badges = make("span", "rr-paper-badges");
-      badges.append(statusPill(paper.status));
-      if (paper.hasAnalysis) {
-        badges.append(make("span", "rr-cache-badge", "AI 已存"));
-      }
-      const batchEntry = state.batchState
-        && Array.isArray(state.batchState.entries)
-        ? state.batchState.entries.find(entry =>
-          Number(entry.itemID) === Number(paper.id)) : null;
-      if (batchEntry && BATCH_STATUS_LABELS[batchEntry.status]) {
-        badges.append(make("span",
-          "rr-batch-badge rr-batch-" + batchEntry.status,
-          BATCH_STATUS_LABELS[batchEntry.status]));
-      }
-      open.append(badges);
-      open.addEventListener("click", () => void selectPaper(paper));
-      const focus = makeApiButton(paper.focused ? "★" : "☆",
-        "rr-focus-button" + (paper.focused ? " active" : ""),
-        () => void toggleFocused(paper),
-        paper.focused ? "取消关注" : "关注此论文");
-      focus.setAttribute("aria-pressed", String(paper.focused));
-      focus.setAttribute("aria-label",
-        paper.focused ? "取消关注" : "关注此论文");
-      row.append(select, open, focus);
-      list.append(row);
-    }
-    updateSelectionControls();
-  }
-  function renderFocusedChips() {
-    if (!state) return;
-    const container = state.focusedChips;
-    container.replaceChildren();
-    if (!state.focusedPapers.length) {
-      container.append(make("span", "rr-chip-empty",
-        "关注论文后会显示在这里，便于切换对比。"));
-      return;
-    }
-    for (const paper of state.focusedPapers) {
-      const chip = make("button",
-        "rr-focus-chip" + (state.currentPaper
-          && state.currentPaper.id === paper.id
-          && state.currentPaper.libraryID === paper.libraryID
-          ? " active" : ""),
-        paper.title || "未命名文献");
-      chip.setAttribute("type", "button");
-      chip.addEventListener("click", () => void selectPaper(paper));
-      container.append(chip);
-    }
-  }
-  function catalogScope() {
-    const libraryValue = getValue(state.librarySelect);
-    const collectionValue = getValue(state.collectionSelect);
-    return {
-      libraryID: libraryValue ? Number(libraryValue) : null,
-      collectionID: collectionValue ? Number(collectionValue) : null,
-    };
-  }
-  function renderCatalogScope() {
-    if (!state) return;
-    const libraryID = getValue(state.librarySelect)
-      ? Number(getValue(state.librarySelect)) : null;
-    const collectionID = getValue(state.collectionSelect)
-      ? Number(getValue(state.collectionSelect)) : null;
-    const library = state.libraries.find(entry => entry.id === libraryID);
-    const collection = state.collections.find(entry =>
-      entry.id === collectionID && entry.libraryID === libraryID);
-    let path = "全部可访问文库";
-    if (collection) {
-      const names = [];
-      const seen = new Set();
-      let current = collection;
-      while (current && !seen.has(current.id)) {
-        seen.add(current.id);
-        names.unshift(current.name || "未命名收藏夹");
-        current = state.collections.find(entry =>
-          entry.id === current.parentID
-          && entry.libraryID === current.libraryID);
-      }
-      path = `${library ? library.name : "文库"} / ${names.join(" / ")}`;
-    }
-    else if (library) {
-      path = `${library.name} / 全部论文`;
-    }
-    state.catalogScope.textContent = path;
-    state.catalogScope.setAttribute("title", path);
-  }
-  function compareCollectionNames(left, right) {
-    return String(left.name || "").localeCompare(
-      String(right.name || ""), undefined,
-      { numeric: true, sensitivity: "base" },
-    ) || Number(left.id) - Number(right.id);
-  }
-  function renderCollectionTree() {
-    if (!state) return;
-    const tree = state.collectionTree;
-    tree.replaceChildren();
-    const byParent = new Map();
-    const collectionIDs = new Set(state.collections.map(entry => entry.id));
-    for (const collection of state.collections) {
-      const parent = collection.parentID != null
-        && collectionIDs.has(collection.parentID)
-        && collection.parentID !== collection.id
-        ? collection.parentID : null;
-      const rows = byParent.get(parent) || [];
-      rows.push(collection);
-      byParent.set(parent, rows);
-    }
-    for (const rows of byParent.values()) rows.sort(compareCollectionNames);
-    const selectedID = getValue(state.collectionSelect)
-      ? Number(getValue(state.collectionSelect)) : null;
-    const selectedLibraryID = getValue(state.librarySelect)
-      ? Number(getValue(state.librarySelect)) : null;
-    let selectedButton = null;
-    const visibleLibraries = state.libraries;
-    if (!visibleLibraries.length && !state.collectionsLoading) {
-      tree.append(make("p", "rr-tree-empty", "没有可访问的文库。"));
-    }
-    const addCollectionRows = (library, parentID, container, ancestors) => {
-      const children = (byParent.get(parentID) || []).filter(
-        collection => collection.libraryID === library.id);
-      for (const collection of children) {
-        if (ancestors.has(collection.id)) continue;
-        const nextAncestors = new Set(ancestors);
-        nextAncestors.add(collection.id);
-        const childrenOfCollection = byParent.get(collection.id) || [];
-        const row = make("div", "rr-tree-row");
-        const expanded = state.expandedCollections.has(collection.id);
-        const toggle = make("button", "rr-tree-toggle",
-          childrenOfCollection.length ? (expanded ? "▾" : "▸") : "·");
-        toggle.setAttribute("type", "button");
-        toggle.setAttribute("aria-label",
-          `${expanded ? "收起" : "展开"} ${collection.name || "未命名收藏夹"}`);
-        toggle.setAttribute("aria-expanded",
-          String(childrenOfCollection.length ? expanded : false));
-        setBooleanAttribute(toggle, "disabled", !childrenOfCollection.length);
-        if (childrenOfCollection.length) {
-          toggle.addEventListener("click", () => {
-            if (state.expandedCollections.has(collection.id)) {
-              state.expandedCollections.delete(collection.id);
-            }
-            else state.expandedCollections.add(collection.id);
-            renderCollectionTree();
-          });
-        }
-        const button = make("button",
-          "rr-tree-item" + (selectedID === collection.id ? " active" : ""),
-          collection.name || "未命名收藏夹");
-        button.setAttribute("type", "button");
-        button.setAttribute("aria-current",
-          selectedID === collection.id ? "true" : "false");
-        if (selectedID === collection.id) selectedButton = button;
-        button.addEventListener("click", () => {
-          void selectCollection(collection);
-        });
-        row.append(toggle, button);
-        container.append(row);
-        if (childrenOfCollection.length && expanded) {
-          const nested = make("div", "rr-tree-children");
-          nested.setAttribute("role", "group");
-          addCollectionRows(library, collection.id, nested, nextAncestors);
-          container.append(nested);
-        }
-      }
-    };
-    for (const library of visibleLibraries) {
-      const libraryCollections = state.collections.filter(
-        entry => entry.libraryID === library.id,
-      );
-      const root = make("div", "rr-tree-library");
-      const rootButton = make("button",
-        "rr-tree-root" + (!selectedID
-          && selectedLibraryID === library.id
-          ? " active" : ""),
-        library.name || "未命名文库");
-      rootButton.setAttribute("type", "button");
-      rootButton.setAttribute("aria-current",
-        !selectedID && selectedLibraryID === library.id
-          ? "true" : "false");
-      if (!selectedID && selectedLibraryID === library.id) selectedButton = rootButton;
-      rootButton.addEventListener("click", () => void selectLibrary(library));
-      root.append(rootButton);
-      if (libraryCollections.length) {
-        const nested = make("div", "rr-tree-children");
-        nested.setAttribute("role", "group");
-        addCollectionRows(library, null, nested, new Set());
-        root.append(nested);
-      }
-      else if (!state.collectionsLoading) {
-        root.append(make("span", "rr-tree-empty", "无收藏夹"));
-      }
-      tree.append(root);
-    }
-    const selectionKey = `${selectedLibraryID || "all"}:${selectedID || "root"}`;
-    if (state.treeSelectionKey !== selectionKey && selectedButton?.scrollIntoView) {
-      state.treeSelectionKey = selectionKey;
-      selectedButton.scrollIntoView({ block: "nearest", inline: "nearest" });
-    }
-    if (state.collectionsLoading) {
-      tree.append(make("p", "rr-tree-empty", "正在读取收藏夹…"));
-    }
-    else if (state.collectionsError) {
-      tree.append(make("p", "rr-tree-empty",
-        `收藏夹读取失败：${state.collectionsError}`));
-    }
-  }
-  async function loadCatalog({ preserveFocus = true } = {}) {
-    if (!state) return;
-    const generation = ++catalogGeneration;
-    state.catalogLoading = true;
-    renderCatalog();
-    try {
-      const { libraryID, collectionID } = catalogScope();
-      const result = await state.service.listPapers({
-        libraryID,
-        collectionID,
-        query: getValue(state.searchInput).trim(),
-        focusOnly: state.catalog.focusOnly,
-        offset: state.catalog.offset,
-        limit: PAGE_SIZE,
-      });
-      if (!state || generation !== catalogGeneration) return;
-      state.catalog = {
-        items: Array.isArray(result.items) ? result.items : [],
-        total: Number(result.total) || 0,
-        offset: Number(result.offset) || 0,
-        limit: Number(result.limit) || PAGE_SIZE,
-        query: getValue(state.searchInput).trim(),
-        focusOnly: state.catalog.focusOnly,
-      };
-      if (!preserveFocus) state.focusedPapers = [];
-      renderCatalog();
-      const total = state.catalog.total;
-      state.catalogCount.textContent = total
-        ? `${state.catalog.offset + 1}–${Math.min(state.catalog.offset + state.catalog.items.length, total)} / ${total}`
-        : "0 篇";
-      setBooleanAttribute(state.prevButton, "disabled",
-        state.catalog.offset <= 0);
-      setBooleanAttribute(state.nextButton, "disabled",
-        state.catalog.offset + state.catalog.limit >= total);
-      await loadFocusedPapers(generation);
-    }
-    catch (error) {
-      if (state && generation === catalogGeneration) {
-        state.catalog.items = [];
-        state.catalog.total = 0;
-        renderCatalog();
-        setStatus(state.globalStatus,
-          `论文目录读取失败：${safeError(error).message}`, "error");
-      }
-    }
-    finally {
-      if (state && generation === catalogGeneration) {
-        state.catalogLoading = false;
-        renderCatalog();
-      }
-    }
-  }
-  async function loadFocusedPapers(generation = catalogGeneration) {
-    if (!state) return;
-    try {
-      const result = await state.service.listPapers({
-        libraryID: null,
-        collectionID: null,
-        query: "", focusOnly: true, offset: 0, limit: 80,
-      });
-      if (!state || generation !== catalogGeneration) return;
-      state.focusedPapers = Array.isArray(result.items) ? result.items : [];
-      renderFocusedChips();
-    }
-    catch (error) {
-      logError("load focused papers", error);
-    }
-  }
-  async function toggleFocused(paper) {
-    if (!state) return;
-    try {
-      const item = Zotero.Items.get(Number(paper.id));
-      if (!item) throw new Error("无法读取该论文条目。");
-      await state.service.setFocused(item, !paper.focused);
-      paper.focused = !paper.focused;
-      if (state.catalog.focusOnly && !paper.focused) {
-        state.catalog.items = state.catalog.items.filter(
-          entry => entry !== paper,
-        );
-        state.catalog.total = Math.max(0, state.catalog.total - 1);
-      }
-      renderCatalog();
-      await loadFocusedPapers();
-      setStatus(state.globalStatus,
-        paper.focused ? "已关注此论文。" : "已取消关注。", "success");
-    }
-    catch (error) {
-      setStatus(state.globalStatus, safeError(error).message, "error");
-    }
   }
   function dimensionCard(dimension) {
     const card = make("section", "rr-dimension");
@@ -1304,6 +743,13 @@
     }
     const item = state.currentItem;
     const attachmentID = state.currentAttachmentID;
+    if (!attachmentID || !currentNativeBinding()) {
+      renderChat(null);
+      setStatus(state.chatStatus,
+        "当前原生标签页的 PDF 与这篇论文未匹配；对话已停用。",
+        "warning");
+      return;
+    }
     try {
       const conversation = typeof state.service.getConversation === "function"
         ? await state.service.getConversation(item, { attachmentID })
@@ -1320,24 +766,32 @@
     }
   }
   function cancelOwnedChat() {
-    if (!state || !state.currentItem || !state.chatLoading) return false;
-    const item = state.currentItem;
+    if (!state || !state.chatLoading || !chatController) return false;
     try {
-      const cancelled = typeof state.service.cancelChat === "function"
-        ? state.service.cancelChat(item) : false;
-      try { chatController?.abort(); } catch (_) {}
-      setStatus(state.chatStatus,
-        cancelled ? "正在取消此篇论文的对话…" : "当前没有正在运行的对话。",
-        cancelled ? "pending" : "warning");
-      return cancelled;
+      chatController.abort();
+      setStatus(state.chatStatus, "正在取消此篇论文的对话…", "pending");
+      return true;
     }
     catch (error) {
       setStatus(state.chatStatus, safeError(error).message, "error");
       return false;
     }
   }
+  function cancelOwnedRequests() {
+    try { chatController?.abort(); } catch (_) {}
+    try { analysisController?.abort(); } catch (_) {}
+    chatController = analysisController = null;
+    activeJob = null;
+    if (state) state.chatLoading = state.analyzing = false;
+  }
   async function sendChat() {
     if (!state || !state.currentItem || state.chatLoading || !isEmbedded()) return;
+    if (state.contextSwitching || !state.currentAttachmentID || !currentNativeBinding()) {
+      setStatus(state.chatStatus,
+        "当前原生标签页没有匹配这篇论文的本地 PDF；不能向模型提交原文。",
+        "warning");
+      return;
+    }
     const question = getValue(state.chatInput).trim();
     if (!question) {
       setStatus(state.chatStatus, "请输入问题。", "error");
@@ -1357,6 +811,7 @@
     const item = state.currentItem;
     const attachmentID = state.currentAttachmentID;
     const generation = ++chatGeneration;
+    const documentGeneration = loadGeneration;
     const Controller = state.window.AbortController || scope.AbortController;
     chatController = Controller ? new Controller() : null;
     state.chatLoading = true;
@@ -1368,13 +823,13 @@
         attachmentID,
         signal: chatController && chatController.signal,
         onProgress(progress) {
-          if (!state || generation !== chatGeneration || state.currentItem !== item) return;
+          if (!state || generation !== chatGeneration || documentGeneration !== loadGeneration || state.currentItem !== item) return;
           setStatus(state.chatStatus,
             String(progress && progress.detail || "正在生成回答…"),
             "pending");
         },
       });
-      if (!state || generation !== chatGeneration || state.currentItem !== item) return;
+      if (!state || generation !== chatGeneration || documentGeneration !== loadGeneration || state.currentItem !== item) return;
       renderChat(result);
       setStatus(state.chatStatus,
         result && result.reply && result.reply.grounded
@@ -1383,7 +838,7 @@
         result && result.reply && result.reply.grounded ? "success" : "warning");
     }
     catch (error) {
-      if (!state || generation !== chatGeneration || state.currentItem !== item) return;
+      if (!state || generation !== chatGeneration || documentGeneration !== loadGeneration || state.currentItem !== item) return;
       const safe = safeError(error);
       setStatus(state.chatStatus,
         safe.code === "CANCELLED"
@@ -1409,10 +864,13 @@
         "此引文没有可验证的页码；请从文献附件入口核对。", "warning");
       return;
     }
+    const view = state;
+    const generation = loadGeneration;
     try {
       const adapter = state.nativePDFAdapter;
       if (!adapter) throw new Error("当前原生 PDF 阅读标签页尚未就绪。");
       await adapter.navigate(entry.pageIndex);
+      if (state !== view || generation !== loadGeneration) return;
       setStatus(state.aiStatus,
         entry.pageIndex == null
           ? "页码未确认；未执行跳转。"
@@ -1420,6 +878,7 @@
         "success");
     }
     catch (error) {
+      if (state !== view || generation !== loadGeneration) return;
       setStatus(state.aiStatus, safeError(error).message, "error");
     }
   }
@@ -1635,10 +1094,14 @@
   async function changeStatus(status) {
     if (!state || !state.currentItem || state.saving) return;
     state.saving = true;
+    const view = state;
+    const item = view.currentItem;
+    const generation = loadGeneration;
     try {
-      const reading = await state.service.setState(
-        state.currentItem, { status },
+      const reading = await view.service.setState(
+        item, { status },
       );
+      if (state !== view || generation !== loadGeneration || state.currentItem !== item) return;
       state.description.state = reading;
       updateStatusPills(state.statusChoices, reading.status);
       state.updated.textContent =
@@ -1659,14 +1122,13 @@
           `本地阅读状态已保存为“${STATUS_LABELS[status]}”；未收到原生标签同步结果。`,
           "warning");
       }
-      refreshLibraries();
-      void loadCatalog();
     }
     catch (error) {
+      if (state !== view || generation !== loadGeneration) return;
       setStatus(state.globalStatus, safeError(error).message, "error");
     }
     finally {
-      state.saving = false;
+      if (state === view && generation === loadGeneration) state.saving = false;
     }
   }
   function scheduleNotesSave() {
@@ -1675,13 +1137,14 @@
     setStatus(state.notesStatus, "正在等待自动保存…", "pending");
     if (noteTimer) clearTimeout(noteTimer);
     const item = state.currentItem;
+    const generation = loadGeneration;
     const text = getValue(state.notesInput);
     noteTimer = setTimeout(async () => {
       noteTimer = null;
-      if (!state || state.currentItem !== item) return;
+      if (!state || generation !== loadGeneration || state.currentItem !== item) return;
       try {
         const reading = await state.service.setState(item, { notes: text });
-        if (!state || state.currentItem !== item) return;
+        if (!state || generation !== loadGeneration || state.currentItem !== item) return;
         if (getValue(state.notesInput) === text) notesDirty = false;
         state.description.state = reading;
         state.updated.textContent =
@@ -1690,6 +1153,7 @@
           "笔记已保存到本地插件存储。", "success");
       }
       catch (error) {
+        if (!state || generation !== loadGeneration || state.currentItem !== item) return;
         setStatus(state.notesStatus, safeError(error).message, "error");
       }
     }, 700);
@@ -1700,12 +1164,13 @@
     setStatus(state.checklistStatus, "正在保存清单…", "pending");
     if (checklistTimer) clearTimeout(checklistTimer);
     const item = state.currentItem;
+    const generation = loadGeneration;
     checklistTimer = setTimeout(async () => {
       checklistTimer = null;
-      if (!state || state.currentItem !== item) return;
+      if (!state || generation !== loadGeneration || state.currentItem !== item) return;
       try {
         const reading = await state.service.setState(item, { checklist });
-        if (!state || state.currentItem !== item) return;
+        if (!state || generation !== loadGeneration || state.currentItem !== item) return;
         if (JSON.stringify(state.description.state.checklist || {}) === JSON.stringify(checklist)) checklistDirty = false;
         state.description.state = reading;
         setStatus(state.checklistStatus,
@@ -1713,6 +1178,7 @@
           "success");
       }
       catch (error) {
+        if (!state || generation !== loadGeneration || state.currentItem !== item) return;
         setStatus(state.checklistStatus,
           safeError(error).message, "error");
       }
@@ -1802,17 +1268,23 @@
     }
   }
   async function openModelSettings() {
-    if (batchIsRunning()) {
-      setStatus(state.globalStatus,
-        "批量分析运行期间不能修改模型设置；请先取消当前批次。",
-        "warning");
-      return null;
-    }
     return openAIConfig(state && state.currentItem);
   }
   async function runAnalysis({ force = false } = {}) {
     if (!state || !state.currentItem || state.analyzing) return;
+    if (state.contextSwitching || !state.currentAttachmentID || !currentNativeBinding()) {
+      showJob({
+        status: "error",
+        detail: "当前原生标签页没有匹配这篇论文的本地 PDF；不能启动分析。",
+      });
+      return;
+    }
     const targetItem = state.currentItem;
+    const attachmentID = state.currentAttachmentID;
+    const generation = loadGeneration;
+    const Controller = state.window.AbortController || scope.AbortController;
+    const controller = Controller ? new Controller() : null;
+    analysisController = controller;
     activeJob = {
       status: "preparing",
       detail: force
@@ -1821,14 +1293,20 @@
     showJob(activeJob);
     try {
       const result = await state.service.analyze(targetItem, {
-        attachmentID: state.currentAttachmentID,
+        attachmentID,
+        signal: controller && controller.signal,
         force: force === true,
         onProgress(job) {
+          if (!state || generation !== loadGeneration
+              || state.currentItem !== targetItem
+              || state.currentAttachmentID !== attachmentID) return;
           activeJob = job;
-          if (state && state.currentItem === targetItem) showJob(job);
+          showJob(job);
         },
       });
-      if (!state || state.currentItem !== targetItem) return;
+      if (!state || generation !== loadGeneration
+          || state.currentItem !== targetItem
+          || state.currentAttachmentID !== attachmentID) return;
       state.description.state.analysis = result;
       renderAnalysis(result);
       setBusy(false);
@@ -1838,9 +1316,11 @@
           ? "新的 AI 解读已保存到本地。"
           : "已载入此论文保存的 AI 解读。",
       });
-      void loadCatalog();
     }
     catch (error) {
+      if (!state || generation !== loadGeneration
+          || state.currentItem !== targetItem
+          || state.currentAttachmentID !== attachmentID) return;
       const safe = safeError(error);
       if (safe.code === "AI_CONFIG_REQUIRED"
           || safe.code === "AI_NOT_CONFIGURED") {
@@ -1857,13 +1337,17 @@
       }
     }
     finally {
-      activeJob = null;
+      if (analysisController === controller) {
+        analysisController = null;
+        activeJob = null;
+      }
     }
   }
   function cancelAnalysis() {
-    if (!state || !state.currentItem) return;
+    if (!state) return;
     try {
-      const cancelled = state.service.cancelAnalysis(state.currentItem);
+      const cancelled = !!analysisController;
+      analysisController?.abort();
       setStatus(state.aiStatus,
         cancelled ? "正在取消…" : "当前没有可取消的分析任务。",
         cancelled ? "pending" : "warning");
@@ -1936,12 +1420,6 @@
   }
   async function openPromptSettings() {
     if (!state) return null;
-    if (batchIsRunning()) {
-      setStatus(state.globalStatus,
-        "批量分析运行期间不能修改分析提示词；请先取消当前批次。",
-        "warning");
-      return null;
-    }
     const shell = dialogShell("分析提示词", () => {});
     const { modal } = shell;
     const status = make("div", "rr-message");
@@ -2114,352 +1592,6 @@
       setStatus(status, safeError(error).message, "error");
     }
     return shell;
-  }
-  function batchTargetsForUI(targets) {
-    const result = [];
-    const seen = new Set();
-    for (const target of targets || []) {
-      const itemID = Number(target && (target.itemID ?? target.id));
-      if (!Number.isSafeInteger(itemID) || itemID < 1) continue;
-      if (seen.has(itemID)) continue;
-      seen.add(itemID);
-      const normalized = {
-        id: itemID,
-        itemID,
-        libraryID: Number(target.libraryID) || null,
-        key: String(target.key || ""),
-        title: String(target.title || `文献 ${itemID}`),
-      };
-      if (target.attachmentID != null) {
-        normalized.attachmentID = Number(target.attachmentID);
-      }
-      if (result.length >= MAX_BATCH_TARGETS) break;
-      result.push(normalized);
-    }
-    return result;
-  }
-  async function openBatchReview({
-    targets = selectedPapers(),
-    title = "批量 AI 分析",
-  } = {}) {
-    if (!state) return null;
-    if (batchIsRunning()) {
-      title = "批量分析状态";
-      targets = [];
-    }
-    const frozenTargets = batchTargetsForUI(targets);
-    if (!frozenTargets.length && state.batchState?.status === "idle") {
-      setStatus(state.globalStatus,
-        "请先勾选至少一篇论文，再打开批量分析。", "warning");
-      return null;
-    }
-    const shell = dialogShell(title, () => {
-      if (state && state.batchDialog?.shell === shell) {
-        state.batchDialog = null;
-      }
-    });
-    const { modal } = shell;
-    const status = make("div", "rr-message");
-    setHidden(status, true);
-    const configBox = make("div", "rr-batch-config");
-    configBox.append(make("span", "rr-muted", "正在读取已保存的模型目标…"));
-    const preview = make("section", "rr-batch-preview");
-    const previewHead = make("div", "rr-batch-preview-head");
-    const previewCount = make("strong", null,
-      frozenTargets.length ? `已明确选择 ${frozenTargets.length} 篇` : "当前批次");
-    const previewList = make("div", "rr-batch-preview-list");
-    previewHead.append(previewCount);
-    preview.append(previewHead, previewList);
-    const forceInput = currentDocument().createElementNS(
-      XHTML_NS, "input",
-    );
-    forceInput.setAttribute("type", "checkbox");
-    const forceRow = make("label", "rr-check rr-batch-force");
-    forceRow.append(
-      forceInput,
-      make("span", null,
-        "重新分析已有结果（默认复用缓存；只影响本次明确目标）"),
-    );
-    const notice = make("div", "rr-callout rr-warning");
-    notice.textContent = "点击“开始批量分析”后才会顺序调用模型。每个成功结果自动保存到既有本地分析存储；阅读状态不变。关闭窗口会取消仍在运行的批次，已保存结果保留。";
-    const queue = make("div", "rr-batch-queue");
-    queue.setAttribute("role", "status");
-    queue.setAttribute("aria-live", "polite");
-    const actions = make("div", "rr-modal-actions");
-    const close = makeApiButton("关闭", "rr-secondary", () => shell.close());
-    const cancelRun = makeApiButton("取消批次", "rr-danger", () => {
-      try {
-        const cancelled = state.service.cancelBatch();
-        setStatus(status,
-          cancelled ? "正在取消批次…" : "当前没有正在运行的批次。",
-          cancelled ? "pending" : "warning");
-      }
-      catch (error) {
-        setStatus(status, safeError(error).message, "error");
-      }
-    });
-    const start = makeApiButton("开始批量分析", "rr-button-primary",
-      () => void begin());
-    setHidden(forceRow, !frozenTargets.length);
-    actions.append(close, cancelRun, start);
-    modal.append(
-      preview, configBox, forceRow, notice, queue, status, actions,
-    );
-    let running = false;
-    const renderTargets = () => {
-      previewList.replaceChildren();
-      const entries = frozenTargets.length
-        ? frozenTargets
-        : (state.batchState?.entries || []);
-      if (!entries.length) {
-        previewList.append(make("p", "rr-muted", "没有待分析论文。"));
-      }
-      for (const entry of entries.slice(0, MAX_BATCH_TARGETS)) {
-        const row = make("div", "rr-batch-preview-row");
-        row.append(
-          make("span", "rr-batch-preview-title",
-            entry.title || `文献 ${entry.itemID}`),
-          make("span", "rr-batch-preview-id",
-            entry.libraryID
-              ? `${entry.libraryID}/${entry.key || entry.itemID}`
-              : String(entry.itemID)),
-        );
-        if (BATCH_STATUS_LABELS[entry.status]) {
-          row.append(make("span",
-            "rr-batch-status rr-batch-" + entry.status,
-            BATCH_STATUS_LABELS[entry.status]));
-        }
-        previewList.append(row);
-      }
-    };
-    const renderQueue = () => {
-      const batch = state.batchState;
-      queue.replaceChildren();
-      if (!batch || !Array.isArray(batch.entries)
-          || !batch.entries.length || batch.status === "idle") {
-        queue.append(make("span", "rr-muted",
-          "尚未启动；打开此窗口不会发起任何模型请求。"));
-        return;
-      }
-      const head = make("div", "rr-batch-queue-head");
-      head.append(
-        make("strong", null,
-          batch.status === "running" ? "正在顺序执行"
-            : batch.status === "cancelled" ? "批次已取消"
-              : "批次已完成"),
-        make("span", null, batchCountsText(batch)),
-      );
-      queue.append(head);
-      const list = make("div", "rr-batch-queue-list");
-      for (const entry of batch.entries) {
-        const row = make("div", "rr-batch-queue-row");
-        const identity = make("div", "rr-batch-queue-copy");
-        identity.append(
-          make("strong", null, entry.title || `文献 ${entry.itemID}`),
-          make("span", null,
-            [entry.stage, entry.error?.message].filter(Boolean).join(" · ")
-              || "等待处理"),
-        );
-        row.append(
-          identity,
-          make("span", "rr-batch-status rr-batch-" + entry.status,
-            BATCH_STATUS_LABELS[entry.status] || entry.status),
-        );
-        list.append(row);
-      }
-      queue.append(list);
-      const failed = batch.entries.filter(entry => entry.status === "failed");
-      if (failed.length && batch.status !== "running") {
-        const retryTargets = failed.map(entry => ({
-          id: entry.itemID,
-          itemID: entry.itemID,
-          libraryID: entry.libraryID,
-          key: entry.key,
-          title: entry.title,
-        }));
-        const retry = makeApiButton(`重试 ${failed.length} 篇失败项`,
-          "rr-secondary", () => {
-            shell.close();
-            void openBatchReview({
-              targets: retryTargets,
-              title: "重试失败论文",
-            });
-          });
-        queue.append(retry);
-      }
-    };
-    const setRunning = value => {
-      running = value;
-      setHidden(start, !frozenTargets.length);
-      setBooleanAttribute(start, "disabled", value || !frozenTargets.length);
-      setBooleanAttribute(forceInput, "disabled", value);
-      setBooleanAttribute(cancelRun, "disabled", !value);
-    };
-    const render = () => {
-      const active = batchIsRunning();
-      setRunning(active);
-      renderTargets();
-      renderQueue();
-    };
-    state.batchDialog = { shell, render };
-    render();
-    if (frozenTargets.length) {
-      try {
-        const config = await state.service.getAIConfig();
-        const context = endpointContext(config.endpoint);
-        configBox.replaceChildren(
-          make("strong", null,
-            `${config.provider || "未记录"} · ${config.model || "未设置模型"}`),
-          make("span", null,
-            context.ok ? `端点 origin：${context.origin}` : "端点 origin 无法识别"),
-        );
-      }
-      catch (error) {
-        configBox.replaceChildren(make("span", "rr-unverified",
-          `模型目标读取失败：${safeError(error).message}`));
-      }
-    }
-    else {
-      configBox.replaceChildren(make("span", "rr-muted",
-        "此视图展示当前批次状态；已保存结果可从论文目录和当前论文读取。"));
-    }
-    async function begin() {
-      if (running || batchIsRunning() || !frozenTargets.length) return;
-      const sessionState = state;
-      const targetsAtClick = frozenTargets.map(target => ({
-        itemID: target.itemID,
-        ...(target.attachmentID == null
-          ? {} : { attachmentID: target.attachmentID }),
-      }));
-      const force = getChecked(forceInput);
-      setRunning(true);
-      setStatus(status,
-        `正在启动 ${targetsAtClick.length} 篇论文的顺序队列…`,
-        "pending");
-      activeBatch = { startedAt: new Date().toISOString() };
-      try {
-        const finalState = await sessionState.service.analyzeBatch(
-          targetsAtClick,
-          {
-            force,
-            onProgress: handleBatchProgress,
-          },
-        );
-        if (!state || state !== sessionState) return;
-        applyBatchState(finalState);
-        setStatus(status,
-          finalState.status === "cancelled"
-            ? "批次已取消；已完成的结果已保留。"
-            : "批次已完成；每篇成功结果均已自动保存。",
-          finalState.status === "cancelled" ? "warning" : "success");
-      }
-      catch (error) {
-        const safe = safeError(error);
-        if (!state || state !== sessionState) return;
-        if (safe.code !== "BATCH_RUNNING") {
-          applyBatchState(sessionState.service.getBatchState());
-        }
-        setStatus(status, safe.message, "error");
-      }
-      finally {
-        activeBatch = null;
-        if (state === sessionState) {
-          render();
-          syncActionLocks();
-        }
-      }
-    }
-    return shell;
-  }
-  async function selectCurrentPage() {
-    if (!state || batchIsRunning()) return;
-    let added = 0;
-    let capped = false;
-    for (const paper of state.catalog.items || []) {
-      if (state.selectedPapers.size >= MAX_BATCH_TARGETS) {
-        capped = true;
-        break;
-      }
-      if (rememberSelectedPaper(paper)) added++;
-    }
-    renderCatalog();
-    updateSelectionControls();
-    selectionStatus(
-      capped
-        ? `已达到 ${MAX_BATCH_TARGETS} 篇上限；当前页其余论文未加入。`
-        : `当前页新增 ${added} 篇，已选 ${state.selectedPapers.size} 篇。`,
-      capped ? "warning" : "success",
-    );
-  }
-  async function addFilteredSelection() {
-    if (!state || state.selectionLoading || batchIsRunning()) return;
-    const generation = ++selectionGeneration;
-    const scope = catalogScope();
-    const query = getValue(state.searchInput).trim();
-    const focusOnly = state.catalog.focusOnly === true;
-    state.selectionLoading = true;
-    updateSelectionControls();
-    selectionStatus("正在按当前筛选逐页收集目标…", "pending");
-    let offset = 0;
-    let total = null;
-    let added = 0;
-    try {
-      while (generation === selectionGeneration) {
-        const limit = Math.min(200, MAX_BATCH_TARGETS
-          - state.selectedPapers.size + 1);
-        if (limit < 1) break;
-        const result = await state.service.listPapers({
-          libraryID: scope.libraryID,
-          collectionID: scope.collectionID,
-          query,
-          focusOnly,
-          offset,
-          limit,
-        });
-        if (!state || generation !== selectionGeneration) return;
-        const items = Array.isArray(result.items) ? result.items : [];
-        total = Number(result.total) || 0;
-        for (const paper of items) {
-          if (state.selectedPapers.size >= MAX_BATCH_TARGETS) break;
-          if (rememberSelectedPaper(paper)) added++;
-        }
-        offset += items.length;
-        if (!items.length || offset >= total
-            || state.selectedPapers.size >= MAX_BATCH_TARGETS) break;
-      }
-      renderCatalog();
-      const remaining = Math.max(
-        0, Number(total || 0) - offset,
-      );
-      selectionStatus(
-        `当前筛选新增 ${added} 篇，已选 ${state.selectedPapers.size} 篇。`
-          + (state.selectedPapers.size >= MAX_BATCH_TARGETS && remaining
-            ? ` 已达到 ${MAX_BATCH_TARGETS} 篇上限，剩余 ${remaining} 篇未加入。`
-            : ""),
-        state.selectedPapers.size >= MAX_BATCH_TARGETS && remaining
-          ? "warning" : "success",
-      );
-    }
-    catch (error) {
-      if (state && generation === selectionGeneration) {
-        selectionStatus(
-          `筛选范围收集未完成：${safeError(error).message}`, "error",
-        );
-      }
-    }
-    finally {
-      if (state && generation === selectionGeneration) {
-        state.selectionLoading = false;
-        updateSelectionControls();
-      }
-    }
-  }
-  function clearBatchSelection() {
-    if (!state || batchIsRunning()) return;
-    state.selectedPapers.clear();
-    renderCatalog();
-    updateSelectionControls();
-    selectionStatus("已清空明确勾选的论文。", "");
   }
   function openAIConfig(item = state && state.currentItem) {
     return new Promise(resolve => {
@@ -3017,6 +2149,8 @@
   async function saveAnalysisNote() {
     if (!state || !state.currentItem
         || !state.description.state.analysis) return;
+    const view = state;
+    const generation = loadGeneration;
     setBooleanAttribute(state.noteButton, "disabled", true);
     setStatus(state.noteStatus,
       "正在创建插件分析笔记…", "pending");
@@ -3024,6 +2158,7 @@
       const result = await state.service.saveAnalysisNote(
         state.currentItem,
       );
+      if (state !== view || generation !== loadGeneration) return;
       setStatus(state.noteStatus,
         result.created
           ? "已显式创建新的 Zotero 分析笔记。"
@@ -3031,14 +2166,20 @@
         "success");
     }
     catch (error) {
+      if (state !== view || generation !== loadGeneration) return;
       setStatus(state.noteStatus, safeError(error).message, "error");
     }
     finally {
-      if (state) setBusy(false);
+      if (state === view && generation === loadGeneration) {
+        setBooleanAttribute(view.noteButton, "disabled",
+          view.description?.state.analysis?.mode !== "model");
+      }
     }
   }
   async function syncStateNote() {
     if (!state || !state.currentItem) return;
+    const view = state;
+    const generation = loadGeneration;
     setBooleanAttribute(state.syncButton, "disabled", true);
     setStatus(state.noteStatus,
       "正在同步阅读记录到个人库笔记…", "pending");
@@ -3046,6 +2187,7 @@
       const result = await state.service.syncStateNote(
         state.currentItem,
       );
+      if (state !== view || generation !== loadGeneration) return;
       const text = result.changed
         ? (result.created
           ? "已显式创建阅读记录笔记。"
@@ -3054,10 +2196,13 @@
       setStatus(state.noteStatus, text, "success");
     }
     catch (error) {
+      if (state !== view || generation !== loadGeneration) return;
       setStatus(state.noteStatus, safeError(error).message, "error");
     }
     finally {
-      if (state) setBooleanAttribute(state.syncButton, "disabled", false);
+      if (state === view && generation === loadGeneration) {
+        setBooleanAttribute(view.syncButton, "disabled", !!view.analyzing);
+      }
     }
   }
   function markdownFor(description) {
@@ -3164,15 +2309,78 @@
         `导出失败：${safeError(error).message}`, "error");
     }
   }
-  function nativeReaderForContext() {
-    const tabID = state.nativeContext && state.nativeContext.tabID;
+  function contextIdentity(context) {
+    return JSON.stringify([context?.embedded === true, context?.itemID,
+      context?.parentItemID, context?.attachmentID,
+      context?.attachmentKey, context?.tabID]);
+  }
+  function currentNativeBinding(parent = state && state.currentItem, description = state && state.description) {
+    const context = state && state.nativeContext;
+    if (!context || context.embedded !== true || !parent
+        || !Number.isSafeInteger(context.itemID) || context.itemID <= 0
+        || !Number.isSafeInteger(context.parentItemID)
+        || context.parentItemID !== context.itemID
+        || !Number.isSafeInteger(context.attachmentID) || context.attachmentID <= 0
+        || typeof context.attachmentKey !== "string" || !context.attachmentKey.trim()
+        || typeof context.tabID !== "string" || !context.tabID.trim()
+        || Number(parent.id) !== context.parentItemID) return null;
     try {
-      return tabID && Zotero.Reader && typeof Zotero.Reader.getByTabID === "function"
-        ? Zotero.Reader.getByTabID(String(tabID)) : null;
+      const reader = Zotero.Reader?.getByTabID?.(context.tabID);
+      const attachment = Zotero.Items.get(context.attachmentID);
+      if (!reader || Number(reader.itemID) !== context.attachmentID
+          || !attachment || Number(attachment.id) !== context.attachmentID
+          || attachment.key !== context.attachmentKey || attachment.deleted
+          || attachment.isAttachment?.() !== true
+          || attachment.attachmentContentType !== "application/pdf"
+          || Number(attachment.parentID) !== context.parentItemID
+          || Number(attachment.libraryID) !== Number(parent.libraryID)) return null;
+      if (description && (Number(description.item.id) !== context.parentItemID
+          || Number(description.item.libraryID) !== Number(parent.libraryID)
+          || description.item.key !== parent.key
+          || !description.attachments.some(value => Number(value.id) === context.attachmentID
+            && value.key === context.attachmentKey
+            && value.contentType === "application/pdf"))) return null;
+      return { reader, attachment };
     }
-    catch (_) {
-      return null;
-    }
+    catch (_) { return null; }
+  }
+  function nativeReaderForContext() {
+    return currentNativeBinding()?.reader || null;
+  }
+  function updateContext(next, force = false) {
+    if (!state || !next) return Promise.resolve();
+    const view = state;
+    const requested = { ...next };
+    if (!force && !view.contextRefreshFailed && contextIdentity(requested)
+        === contextIdentity(view.pendingNativeContext || view.nativeContext)) return contextUpdate;
+    const revision = ++contextGeneration;
+    loadGeneration++;
+    chatGeneration++;
+    cancelOwnedRequests();
+    view.pendingNativeContext = requested;
+    view.contextSwitching = true;
+    syncActionLocks();
+    contextUpdate = contextUpdate.catch(() => {}).then(async () => {
+      if (state !== view || revision !== contextGeneration) return;
+      await flushPendingEdits();
+      if (state !== view || revision !== contextGeneration) return;
+      view.nativeContext = requested;
+      view.pendingNativeContext = null;
+      view.contextRefreshFailed = false;
+      const item = Number.isSafeInteger(requested.itemID)
+        ? Zotero.Items.get(requested.itemID) : null;
+      await selectItem(item);
+    }).catch(error => {
+      if (state !== view || revision !== contextGeneration) return;
+      view.pendingNativeContext = null;
+      view.contextRefreshFailed = true;
+      setStatus(view.globalStatus, safeError(error).message, "error");
+    }).finally(() => {
+      if (state !== view || revision !== contextGeneration) return;
+      view.contextSwitching = false;
+      syncActionLocks();
+    });
+    return contextUpdate;
   }
   async function destroyPdf() {
     if (!state) return;
@@ -3183,6 +2391,10 @@
     }
   }
   function setNativePDFAdapter(attachment, generation) {
+    if (!attachment) {
+      state.nativePDFAdapter = null;
+      return null;
+    }
     state.nativePDFAdapter = {
       attachment,
       async navigate(pageIndex) {
@@ -3207,6 +2419,10 @@
         }
         if (!state || generation !== loadGeneration
             || state.nativePDFAdapter !== this) throw new Error("论文已切换。");
+        if (!currentNativeBinding()
+            || Number(state.currentAttachmentID) !== Number(attachment.id)) {
+          throw new Error("当前原生 PDF 阅读上下文未匹配。");
+        }
         if (!attachment || !attachment.available || !attachment.path) {
           throw new Error("此 PDF 在本机不可用。");
         }
@@ -3251,37 +2467,15 @@
     };
     return state.nativePDFAdapter;
   }
-  async function selectPaper(paper) {
-    if (!state || !paper) return;
-    try {
-      await flushPendingEdits();
-    }
-    catch (error) {
-      setStatus(
-        state.globalStatus,
-        `切换已取消：当前笔记保存失败（${safeError(error).message}）。`,
-        "error",
-      );
-      return;
-    }
-    const item = Zotero.Items.get(Number(paper.id));
-    if (!item) {
-      setStatus(state.globalStatus, "无法读取所选论文条目。", "error");
-      return;
-    }
-    if (isEmbedded() && Zotero.ReadingRoom?.show) {
-      await Zotero.ReadingRoom.show({ itemID: item.id });
-      return;
-    }
-    await selectItem(item);
-  }
   async function selectHostItem(item) {
     if (!state || !item) return;
     const parent = state.service.normalizeItem(item);
-    const reader = isEmbedded() ? nativeReaderForContext() : null;
-    if (state.currentItem && parent
-        && Number(state.currentItem.id) === Number(parent.id)
-        && (!reader || Number(reader.itemID) === Number(state.currentAttachmentID))) return;
+    if (isEmbedded()) {
+      // Host selection is a refresh signal; only its complete Reader context owns identity.
+      if (!parent || Number(parent.id) !== state.nativeContext.parentItemID) return;
+      return contextUpdate;
+    }
+    if (state.currentItem && parent && Number(state.currentItem.id) === Number(parent.id)) return;
     await flushPendingEdits();
     await selectItem(item);
   }
@@ -3293,39 +2487,30 @@
       || (saved.analysis?.source?.attachmentKey === attachment.key ? saved.analysis : null);
   }
   async function selectItem(item) {
-    if (!state || !item) return;
+    if (!state) return;
     const generation = ++loadGeneration;
-    const priorItem = state.currentItem;
-    const priorAttachment = state.currentAttachmentID;
-    const nextParent = state.service.normalizeItem(item);
-    if (priorItem && (Number(priorItem.id) !== Number(nextParent && nextParent.id)
-        || Number(priorItem.libraryID) !== Number(nextParent && nextParent.libraryID))) {
-      chatGeneration++;
-      if (chatController) {
-        try { chatController.abort(); } catch (_) {}
-        chatController = null;
-      }
-      if (state.chatLoading && typeof state.service.cancelChat === "function") {
-        try { state.service.cancelChat(priorItem); } catch (_) {}
-      }
-    }
+    const nextParent = item && state.service.normalizeItem(item);
     state.chatLoading = false;
     renderChat(null);
     await destroyPdf();
+    if (!state || generation !== loadGeneration) return;
+    state.nativePDFAdapter = null;
     state.currentItem = null;
     state.currentPaper = null;
     state.currentAttachmentID = null;
     state.description = null;
+    state.saving = false;
+    state.attachmentName.textContent = "当前 PDF 不可用：原生阅读上下文未匹配。";
+    syncActionLocks();
     setStatus(state.globalStatus, "正在读取文献…", "pending");
     state.title.textContent = "正在加载…";
     state.subtitle.textContent = "";
     state.aiResults.replaceChildren(make(
       "div", "rr-empty", "正在读取当前文献…",
     ));
-    renderFocusedChips();
     try {
       const parent = nextParent;
-      if (!parent) throw new Error("请选择一篇论文条目。");
+      if (!parent) throw new Error("当前 Zotero PDF 的父论文上下文不可用。");
       const description = await state.service.describe(parent);
       if (generation !== loadGeneration || !state) return;
       state.currentItem = parent;
@@ -3340,12 +2525,11 @@
       const pdfs = description.attachments.filter(
         attachment => attachment.contentType === "application/pdf",
       );
-      const boundReader = isEmbedded() ? nativeReaderForContext() : null;
-      const available = pdfs.find(attachment => attachment.available
-        && Number(attachment.id) === Number(boundReader?.itemID))
-        || pdfs.find(attachment => attachment.available);
-      state.currentAttachmentID = available
-        ? available.id : pdfs[0] ? pdfs[0].id : null;
+      const binding = currentNativeBinding(parent, description);
+      const available = binding && pdfs.find(attachment => attachment.available
+        && Number(attachment.id) === state.nativeContext.attachmentID
+        && attachment.key === state.nativeContext.attachmentKey);
+      state.currentAttachmentID = available ? available.id : null;
       description.state.analysis = analysisForAttachment(description, state.currentAttachmentID);
       state.title.textContent =
         description.item.title || "未命名文献";
@@ -3355,39 +2539,9 @@
         (description.item.creators || []).join("；"),
       ].filter(Boolean).join(" · ") || "元数据尚未完整";
       state.metadata.replaceChildren(metadataRows(description));
-      state.attachmentSelect.replaceChildren();
-      state.attachmentSelect.value = "";
-      state.attachmentSelect.removeAttribute("value");
-      if (!pdfs.length) {
-        const option = currentDocument().createElementNS(
-          XHTML_NS, "option",
-        );
-        setValue(option, "");
-        option.textContent = "未找到 PDF 附件";
-        state.attachmentSelect.append(option);
-      }
-      else {
-        for (const attachment of pdfs) {
-          const option = currentDocument().createElementNS(
-            XHTML_NS, "option",
-          );
-          setValue(option, String(attachment.id));
-          option.textContent = `${attachment.title || "PDF"}${attachment.available ? "" : "（本地不可用）"}`;
-          setBooleanAttribute(option, "disabled", !attachment.available);
-          setBooleanAttribute(option, "selected",
-            attachment.id === state.currentAttachmentID);
-          state.attachmentSelect.append(option);
-        }
-        setValue(
-          state.attachmentSelect, String(state.currentAttachmentID),
-        );
-      }
-      setBooleanAttribute(
-        state.attachmentSelect,
-        "disabled",
-        !pdfs.some(attachment => attachment.available),
-      );
-      choiceBindings.get(state.attachmentSelect)?.syncOptions();
+      state.attachmentName.textContent = available
+        ? available.title || "当前 PDF"
+        : "当前 PDF 不可用：原生阅读上下文或本地附件未匹配。";
       updateStatusPills(
         state.statusChoices, description.state.status,
       );
@@ -3407,20 +2561,12 @@
       );
       setBooleanAttribute(state.syncButton, "disabled", false);
       syncActionLocks();
-      if (priorItem && priorAttachment !== state.currentAttachmentID) {
-        if (chatController) {
-          try { chatController.abort(); } catch (_) {}
-          chatController = null;
-        }
-        if (state.chatLoading && typeof state.service.cancelChat === "function") {
-          try { state.service.cancelChat(priorItem); } catch (_) {}
-        }
-      }
       let attachment = null;
       if (state.currentAttachmentID) {
         try {
           attachment = await state.service.getReaderAttachment(
-            parent, { attachmentID: state.currentAttachmentID },
+            parent, { attachmentID: state.currentAttachmentID,
+              attachmentKey: state.nativeContext.attachmentKey },
           );
         }
         catch (error) {
@@ -3428,19 +2574,27 @@
         }
       }
       if (generation !== loadGeneration || !state) return;
+      if (!currentNativeBinding(parent, description)
+          || !attachment || attachment.id !== state.currentAttachmentID
+          || attachment.key !== state.nativeContext.attachmentKey
+          || Number(attachment.libraryID) !== Number(parent.libraryID)
+          || attachment.contentType !== "application/pdf" || !attachment.available) {
+        attachment = null;
+        state.currentAttachmentID = null;
+        state.attachmentName.textContent = "当前 PDF 不可用：原生阅读上下文或本地附件未匹配。";
+      }
+      syncActionLocks();
       setNativePDFAdapter(attachment, generation);
       state.openZoteroButton.disabled = !attachment;
       if (generation !== loadGeneration || !state) return;
       setStatus(
         state.globalStatus,
         attachment && attachment.available
-          ? "Zotero 原生 PDF 位于左侧；切换论文不会自动调用模型。"
-          : "PDF 不在本机；元数据、笔记和已保存的 AI 解读仍可使用。",
+          ? "Zotero 原生阅读器显示当前 PDF；切换论文不会自动调用模型。"
+          : "当前原生 PDF 不可用或身份未匹配；分析与对话已停用。",
         attachment && attachment.available ? "success" : "warning",
       );
       void loadConversation(generation);
-      renderFocusedChips();
-      void loadCatalog();
     }
     catch (error) {
       if (generation !== loadGeneration || !state) return;
@@ -3529,7 +2683,7 @@
     identity.lastElementChild.append(
       make("strong", null, "Reading Room"),
       make("span", null, embedded
-        ? "论文阅读室 · Zotero 右侧栏"
+        ? "论文阅读室 · 当前论文助手"
         : "论文阅读室 · 原文与 AI 对照"),
     );
     const headerActions = make("div", "rr-header-actions");
@@ -3553,139 +2707,12 @@
     const globalStatus = make("div", "rr-message");
     setHidden(globalStatus, true);
     app.append(globalStatus);
-    const batchMonitor = make("div", "rr-batch-monitor");
-    setHidden(batchMonitor, true);
-    app.append(batchMonitor);
-
-    const workspace = make("div", embedded
-      ? "rr-workspace rr-workspace-embedded" : "rr-workspace");
-    const navigation = make("aside", "rr-navigation");
-    const navigationHead = make("div", "rr-navigation-head");
-    const navigationTitle = make("h2", null, "论文目录");
-    navigationHead.append(navigationTitle);
-    const setNavigationCollapsed = collapsed => {
-      state.navigationCollapsed = collapsed;
-      setClass(workspace, (embedded ? "rr-workspace rr-workspace-embedded" : "rr-workspace")
-        + (collapsed ? " navigation-collapsed" : ""));
-      setClass(navigation, "rr-navigation"
-        + (collapsed ? " collapsed" : ""));
-      setHidden(navigationTitle, collapsed);
-      collapse.textContent = collapsed ? "展开" : "收起";
-      collapse.setAttribute("aria-expanded", String(!collapsed));
-      collapse.setAttribute("aria-label", collapsed ? "展开论文目录" : "收起论文目录");
-      if (!collapsed) navigationTitle.focus?.();
-    };
-    const collapse = makeApiButton("收起", "rr-icon-button",
-      () => setNavigationCollapsed(!state.navigationCollapsed));
-    collapse.setAttribute("aria-expanded", "true");
-    navigationHead.append(collapse);
-    navigation.append(navigationHead);
-    const navigationBody = make("div", "rr-navigation-body");
-    const search = currentDocument().createElementNS(
-      XHTML_NS, "input",
-    );
-    search.setAttribute("type", "search");
-    search.setAttribute("placeholder",
-      "搜索标题、作者、年份、DOI…");
-    search.setAttribute("aria-label", "搜索文库论文");
-    const librarySelect = currentDocument().createElementNS(
-      XHTML_NS, "select",
-    );
-    librarySelect.setAttribute("aria-label", "选择文库");
-    const libraryChoice = makeChoice(librarySelect, {
-      label: "选择文库", className: "rr-library-choice",
-    });
-    const collectionSelect = currentDocument().createElementNS(
-      XHTML_NS, "select",
-    );
-    collectionSelect.setAttribute("aria-label", "当前收藏夹");
-    const collectionChoice = makeChoice(collectionSelect, {
-      label: "当前收藏夹", className: "rr-collection-choice",
-    });
-    const collectionTree = make("div", "rr-collection-tree");
-    collectionTree.setAttribute("role", "tree");
-    collectionTree.setAttribute("aria-label", "Zotero 文库与收藏夹");
-    const catalogScope = make("div", "rr-catalog-scope", "全部可访问文库");
-    const filters = make("div", "rr-catalog-filters");
-    const allFilter = makeApiButton(
-      "全部", "rr-filter active", () => setCatalogFilter(false),
-    );
-    const focusFilter = makeApiButton(
-      "★ 关注", "rr-filter", () => setCatalogFilter(true),
-    );
-    filters.append(allFilter, focusFilter);
-    const focusedChips = make("div", "rr-focus-chips");
-    focusedChips.append(make("span", "rr-chip-empty",
-      "关注论文后会显示在这里。"));
-    const selectionBar = make("div", "rr-selection-bar");
-    const selectionCount = make("strong", null, "已选 0 篇");
-    const selectPageButton = makeApiButton(
-      "选择当前页", "rr-link-button", () => void selectCurrentPage(),
-    );
-    const addFilteredButton = makeApiButton(
-      "加入当前筛选全部", "rr-link-button",
-      () => void addFilteredSelection(),
-    );
-    const clearSelectionButton = makeApiButton(
-      "清空选择", "rr-link-button", clearBatchSelection,
-    );
-    const batchButton = makeApiButton(
-      "批量 AI 分析", "rr-button-primary",
-      () => void openBatchReview(),
-      "先核对明确选择的目标，再启动分析",
-    );
-    const batchStateButton = makeApiButton(
-      "批次状态", "rr-link-button",
-      () => void openBatchReview({ targets: [], title: "批量分析状态" }),
-      "查看上次批次的逐篇结果",
-    );
-    selectionBar.append(
-      selectionCount,
-      selectPageButton,
-      addFilteredButton,
-      clearSelectionButton,
-      batchButton,
-      batchStateButton,
-    );
-    const selectionStatus = make("div",
-      "rr-message rr-selection-status");
-    setHidden(selectionStatus, true);
-    const paperList = make("div", "rr-paper-list");
-    const pager = make("div", "rr-pager");
-    const prevButton = makeApiButton("上一页", "rr-secondary", () => {
-      state.catalog.offset = Math.max(
-        0, state.catalog.offset - PAGE_SIZE,
-      );
-      void loadCatalog();
-    });
-    const catalogCount = make("span", "rr-muted", "0 篇");
-    const nextButton = makeApiButton("下一页", "rr-secondary", () => {
-      state.catalog.offset += PAGE_SIZE;
-      void loadCatalog();
-    });
-    pager.append(prevButton, catalogCount, nextButton);
-    navigationBody.append(
-      search,
-      libraryChoice.root,
-      collectionChoice.root,
-      collectionTree,
-      catalogScope,
-      filters,
-      make("h3", "rr-nav-label", "快速切换"),
-      focusedChips,
-      selectionBar,
-      selectionStatus,
-      paperList,
-      pager,
-    );
-    navigation.append(navigationBody);
-
     const reading = make("section", "rr-reading-workspace");
     const paperHead = make("header", "rr-paper-head");
     const titleBlock = make("div", "rr-title-block");
     const title = make("h1", null, "选择一篇论文");
     const subtitle = make("p", null,
-      "从左侧文库目录选择，或使用 Zotero 条目菜单打开。");
+      "正在绑定 Zotero 原生阅读标签页中的当前论文。");
     titleBlock.append(title, subtitle);
     const counts = make("span", "rr-count-badge", "");
     paperHead.append(titleBlock, counts);
@@ -3744,7 +2771,7 @@
     pdfHost.append(make(
       "div",
       "rr-reader-placeholder",
-      "从左侧选择论文以载入 PDF。",
+      "当前论文由 Zotero 原生阅读标签页绑定。",
     ));
     sourcePane.append(sourceHead, pdfHost);
 
@@ -3820,21 +2847,10 @@
     const updated = make("span", "rr-muted", "尚未保存");
     notesHead.append(updated);
     const statusChoices = make("div", "rr-status-choices");
-    const attachmentField = make(
-      "label", "rr-field rr-attachment-field",
-    );
-    attachmentField.append(make(
-      "span", "rr-field-label", "用于原文与分析的本地 PDF",
-    ));
-    const attachmentSelect = currentDocument().createElementNS(
-      XHTML_NS, "select",
-    );
-    setValue(attachmentSelect, "");
-    const attachmentChoice = makeChoice(attachmentSelect, {
-      label: "选择用于原文与分析的本地 PDF",
-      className: "rr-attachment-choice",
-    });
-    attachmentField.append(attachmentChoice.root);
+    const attachmentField = make("div", "rr-field rr-attachment-field");
+    attachmentField.append(make("span", "rr-field-label", "当前 Zotero PDF"));
+    const attachmentName = make("span", "rr-current-pdf", "等待当前 PDF…");
+    attachmentField.append(attachmentName);
     const notesLabel = make("label", "rr-field rr-notes-field");
     notesLabel.append(make(
       "span", "rr-field-label", "阅读笔记 · 切换论文前自动保存",
@@ -3909,53 +2925,20 @@
       readingGrid.append(sourcePane, splitter, insightPane);
     }
     reading.append(readingGrid);
-    workspace.append(navigation, reading);
-    app.append(workspace);
+    app.append(reading);
     body.replaceChildren(app);
 
     state = Object.assign(state, {
       chatMessages,
-      navigation,
-      navigationBody,
-      searchInput: search,
-      workspace,
-      navigationCollapsed: false,
-      librarySelect,
-      libraryChoice: libraryChoice.binding,
-      collectionSelect,
-      collectionChoice: collectionChoice.binding,
-      collectionTree,
-      catalogScope,
-      selectionBar,
-      selectionCount,
-      selectionStatus,
-      selectPageButton,
-      addFilteredButton,
-      clearSelectionButton,
-      batchButton,
-      batchStateButton,
-      batchMonitor,
       modelButton,
       promptButton,
-      libraries: [],
-      collections: [],
-      expandedCollections: new Set(),
-      collectionsLoading: false,
-      collectionsError: "",
       splitPercent: 52,
-      allFilter,
-      focusFilter,
-      focusedChips,
-      paperList,
-      prevButton,
-      nextButton,
-      catalogCount,
       title,
       subtitle,
       counts,
       metadata,
       statusChoices,
-      attachmentSelect,
+      attachmentName,
       notesInput,
       notesStatus,
       checklist,
@@ -3992,117 +2975,11 @@
       nativePreview: null,
       analyzing: false,
       saving: false,
-      navigationCollapsed: false,
-      catalog: {
-        items: [], total: 0, offset: 0, limit: PAGE_SIZE,
-        query: "", focusOnly: false,
-      },
-      focusedPapers: [],
-      selectedPapers: new Map(),
-      selectionLoading: false,
-      batchState: { id: null, status: "idle", entries: [] },
-      batchDialog: null,
-      catalogLoading: false,
       window: targetWindow,
       document: targetDocument,
     });
-    try {
-      if (typeof state.service.getBatchState === "function") {
-        state.batchState = state.service.getBatchState();
-        renderBatchMonitor();
-      }
-    }
-    catch (error) {
-      logError("load persisted batch state", error);
-    }
     renderChat(null);
-    if (embedded) setNavigationCollapsed(true);
-
-    search.addEventListener("input", () => {
-      if (searchTimer) clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => {
-        searchTimer = null;
-        state.catalog.offset = 0;
-        void loadCatalog();
-      }, 280);
-    });
-    librarySelect.addEventListener("change", () => {
-      const libraryValue = getValue(librarySelect);
-      const library = state.libraries.find(entry =>
-        String(entry.id) === libraryValue);
-      setValue(collectionSelect, "");
-      collectionChoice.binding.syncSelection("");
-      state.libraryChoice.syncSelection(libraryValue);
-      void (async () => {
-        await loadCollections(library ? library.id : null);
-        resetCatalogScope();
-      })();
-    });
-    collectionSelect.addEventListener("change", () => {
-      const collectionID = getValue(collectionSelect);
-      const collection = state.collections.find(entry =>
-        String(entry.id) === collectionID);
-      if (collection) {
-        setValue(librarySelect, String(collection.libraryID));
-        libraryChoice.binding.syncSelection(getValue(librarySelect));
-      }
-      collectionChoice.binding.syncSelection(collectionID);
-      resetCatalogScope();
-    });
     notesInput.addEventListener("input", scheduleNotesSave);
-    attachmentSelect.addEventListener("change", () => {
-      const id = Number(getValue(attachmentSelect));
-      state.currentAttachmentID =
-        Number.isInteger(id) && id > 0 ? id : null;
-      if (state.description) {
-        if (typeof state.service.getState === "function") {
-          state.description.state = state.service.getState(state.currentItem);
-        }
-        state.description.state.analysis = analysisForAttachment(state.description, state.currentAttachmentID);
-        renderAnalysis(state.description.state.analysis);
-      }
-      chatGeneration++;
-      if (chatController) {
-        try { chatController.abort(); } catch (_) {}
-        chatController = null;
-      }
-      if (state.chatLoading && state.currentItem && typeof state.service.cancelChat === "function") {
-        try { state.service.cancelChat(state.currentItem); } catch (_) {}
-      }
-      state.chatLoading = false;
-      renderChat(null);
-      if (state.currentItem) {
-        void (async () => {
-          await destroyPdf();
-          const generation = loadGeneration;
-          try {
-            const attachment = await state.service.getReaderAttachment(
-              state.currentItem,
-              { attachmentID: state.currentAttachmentID },
-            );
-            if (generation !== loadGeneration || !state) return;
-            setNativePDFAdapter(attachment, generation);
-            state.openZoteroButton.disabled = !attachment;
-            await loadConversation(generation);
-            syncActionLocks();
-          }
-          catch (error) {
-            state.pdfHost.replaceChildren(make(
-              "div", "rr-reader-empty", safeError(error).message,
-            ));
-            setStatus(state.chatStatus,
-              safeError(error).message, "error");
-          }
-        })();
-      }
-      setStatus(
-        state.aiStatus,
-        state.currentAttachmentID
-          ? "已切换阅读附件；已有分析不会被删除。"
-          : "没有可用的本地 PDF。",
-        state.currentAttachmentID ? "" : "warning",
-      );
-    });
     splitter.addEventListener("keydown", event => {
       if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
       event.preventDefault();
@@ -4140,63 +3017,7 @@
     splitter.addEventListener("pointerup", finishSplitDrag);
     splitter.addEventListener("pointercancel", finishSplitDrag);
     bindChoiceOutsideDismiss();
-    renderCollectionTree();
-    renderCatalogScope();
     setBusy(false);
-  }
-  function setCatalogFilter(focusOnly) {
-    if (!state) return;
-    if (batchIsRunning()) {
-      selectionStatus(
-        "批量分析运行期间可以浏览目录，但不能切换选择范围。",
-        "warning",
-      );
-      return;
-    }
-    state.catalog.focusOnly = focusOnly === true;
-    state.catalog.offset = 0;
-    setClass(state.allFilter,
-      "rr-filter" + (!focusOnly ? " active" : ""));
-    setClass(state.focusFilter,
-      "rr-filter" + (focusOnly ? " active" : ""));
-    void loadCatalog();
-  }
-  function resetCatalogScope() {
-    state.catalog.offset = 0;
-    state.catalog.items = [];
-    state.catalog.total = 0;
-    state.catalog.query = getValue(state.searchInput).trim();
-    renderCatalogScope();
-    renderCollectionTree();
-    void loadCatalog();
-  }
-  async function selectLibrary(library) {
-    if (!state || !library) return;
-    setValue(state.librarySelect, String(library.id));
-    setValue(state.collectionSelect, "");
-    state.libraryChoice.syncSelection(getValue(state.librarySelect));
-    state.collectionChoice.syncSelection("");
-    await loadCollections(library.id);
-    resetCatalogScope();
-  }
-  async function selectCollection(collection) {
-    if (!state || !collection) return;
-    try {
-      await flushPendingEdits();
-    }
-    catch (error) {
-      setStatus(
-        state.globalStatus,
-        `切换已取消：当前笔记保存失败（${safeError(error).message}）。`,
-        "error",
-      );
-      return;
-    }
-    setValue(state.librarySelect, String(collection.libraryID));
-    setValue(state.collectionSelect, String(collection.id));
-    state.libraryChoice.syncSelection(getValue(state.librarySelect));
-    state.collectionChoice.syncSelection(getValue(state.collectionSelect));
-    resetCatalogScope();
   }
   function setSplitPercent(value) {
     if (!state) return;
@@ -4207,173 +3028,6 @@
       "style",
       `grid-template-columns: minmax(0, ${width}fr) 6px minmax(0, ${100 - width}fr);`,
     );
-    if (pdfResizeTimer != null) clearTimeout(pdfResizeTimer);
-    pdfResizeTimer = setTimeout(() => {
-      pdfResizeTimer = null;
-    }, 120);
-  }
-  function selectedHostScope() {
-    try {
-      const win = Zotero.getMainWindow();
-      const pane = win && win.ZoteroPane;
-      if (!pane) return null;
-      const libraryID = typeof pane.getSelectedLibraryIDs === "function"
-        ? Number(pane.getSelectedLibraryIDs()[0])
-        : typeof pane.getSelectedLibraryID === "function" ? Number(pane.getSelectedLibraryID()) : null;
-      const collection = typeof pane.getSelectedCollections === "function"
-        ? pane.getSelectedCollections()[0]
-        : typeof pane.getSelectedCollection === "function" ? pane.getSelectedCollection() : null;
-      if (collection && Number.isSafeInteger(Number(collection.id))) {
-        return {
-          libraryID: Number(collection.libraryID),
-          collectionID: Number(collection.id),
-        };
-      }
-      return Number.isSafeInteger(libraryID) && libraryID > 0
-        ? { libraryID, collectionID: null } : null;
-    }
-    catch (error) {
-      logError("read host collection scope", error);
-      return null;
-    }
-  }
-  async function loadLibraries() {
-    if (!state) return;
-    try {
-      const libraries = await state.service.listLibraries();
-      state.libraries = Array.isArray(libraries) ? libraries : [];
-      state.librarySelect.replaceChildren();
-      state.libraryChoice.close(false);
-      const all = currentDocument().createElementNS(
-        XHTML_NS, "option",
-      );
-      setValue(all, "");
-      all.textContent = "全部可访问文库";
-      state.librarySelect.append(all);
-      for (const library of state.libraries) {
-        const option = currentDocument().createElementNS(
-          XHTML_NS, "option",
-        );
-        setValue(option, String(library.id));
-        option.textContent = `${library.name || "未命名文库"}${library.type === "group" ? " · 群组" : ""}`;
-        state.librarySelect.append(option);
-      }
-      setValue(state.librarySelect, "");
-      state.libraryChoice.syncOptions();
-      const hostScope = selectedHostScope();
-      if (hostScope && state.libraries.some(
-        library => Number(library.id) === hostScope.libraryID,
-      )) {
-        setValue(state.librarySelect, String(hostScope.libraryID));
-        state.libraryChoice.syncSelection(getValue(state.librarySelect));
-        await loadCollections(hostScope.libraryID);
-        if (hostScope.collectionID
-            && state.collections.some(entry =>
-              Number(entry.id) === hostScope.collectionID)) {
-          setValue(state.collectionSelect, String(hostScope.collectionID));
-          state.collectionChoice.syncSelection(
-            getValue(state.collectionSelect),
-          );
-          const selected = state.collections.find(entry => entry.id === hostScope.collectionID);
-          let parent = state.collections.find(entry => entry.id === selected?.parentID);
-          const seen = new Set();
-          while (parent && !seen.has(parent.id)) {
-            seen.add(parent.id);
-            state.expandedCollections.add(parent.id);
-            parent = state.collections.find(entry => entry.id === parent.parentID);
-          }
-        }
-      }
-      else await loadCollections(null);
-      renderCollectionTree();
-      renderCatalogScope();
-    }
-    catch (error) {
-      state.librarySelect.replaceChildren(
-        make("option", null, "文库读取失败"),
-      );
-      state.libraryChoice.syncOptions();
-      setStatus(state.globalStatus, safeError(error).message, "error");
-    }
-  }
-  async function loadCollections(libraryID) {
-    if (!state) return;
-    const generation = ++collectionsGeneration;
-    state.collectionsLoading = true;
-    state.collectionsError = "";
-    renderCollectionTree();
-    try {
-      if (typeof state.service.listCollections !== "function") {
-        throw Object.assign(new Error("当前服务版本不支持收藏夹目录。"), {
-          code: "COLLECTIONS_UNAVAILABLE",
-        });
-      }
-      const rows = await state.service.listCollections({
-        libraryID: null,
-      });
-      if (!state || generation !== collectionsGeneration) return;
-      state.collections = Array.isArray(rows) ? rows.filter(row =>
-        row && Number.isSafeInteger(Number(row.id))
-        && Number.isSafeInteger(Number(row.libraryID))) : [];
-      state.collectionSelect.replaceChildren();
-      state.collectionChoice.close(false);
-      const root = currentDocument().createElementNS(
-        XHTML_NS, "option",
-      );
-      setValue(root, "");
-      root.textContent = "当前文库全部论文";
-      state.collectionSelect.append(root);
-      const visible = state.collections;
-      for (const collection of visible) {
-        const option = currentDocument().createElementNS(
-          XHTML_NS, "option",
-        );
-        setValue(option, String(collection.id));
-        const names = [];
-        const seen = new Set();
-        let current = collection;
-        while (current && !seen.has(current.id)) {
-          seen.add(current.id);
-          names.unshift(current.name || "未命名收藏夹");
-          current = state.collections.find(row => row.id === current.parentID
-            && row.libraryID === collection.libraryID);
-        }
-        const library = state.libraries.find(row => row.id === collection.libraryID);
-        option.textContent = [library?.name || "文库", ...names].join(" / ");
-        state.collectionSelect.append(option);
-      }
-      state.collectionChoice.syncOptions();
-      const selected = getValue(state.collectionSelect);
-      if (selected && !visible.some(entry =>
-        String(entry.id) === selected)) {
-        setValue(state.collectionSelect, "");
-        state.collectionChoice.syncSelection("");
-      }
-    }
-    catch (error) {
-      if (!state || generation !== collectionsGeneration) return;
-      const safe = safeError(error);
-      state.collections = [];
-      state.collectionsError = safe.message;
-      state.collectionSelect.replaceChildren();
-      const root = currentDocument().createElementNS(
-        XHTML_NS, "option",
-      );
-      setValue(root, "");
-      root.textContent = "当前文库全部论文";
-      state.collectionSelect.append(root);
-      state.collectionChoice.syncOptions();
-      if (!["COLLECTIONS_UNAVAILABLE"].includes(safe.code)) {
-        setStatus(state.globalStatus, safe.message, "error");
-      }
-    }
-    finally {
-      if (state && generation === collectionsGeneration) {
-        state.collectionsLoading = false;
-        renderCollectionTree();
-        renderCatalogScope();
-      }
-    }
   }
   function runtimeContext(targetWindow) {
     try {
@@ -4388,6 +3042,9 @@
       return {
         embedded: search.get("embedded") === "1",
         itemID: Number(search.get("itemID")) || null,
+        parentItemID: Number(search.get("parentItemID")) || null,
+        attachmentID: Number(search.get("attachmentID")) || null,
+        attachmentKey: search.get("attachmentKey") || null,
         tabID: search.get("tabID") || null,
       };
     }
@@ -4399,32 +3056,14 @@
     const view = state;
     if (!view) return;
     loadGeneration++;
-    catalogGeneration++;
-    collectionsGeneration++;
-    selectionGeneration++;
     chatGeneration++;
+    contextGeneration++;
     closeOpenChoices();
     disposeChoices(view.document && view.document.documentElement);
     if (noteTimer) clearTimeout(noteTimer);
     if (checklistTimer) clearTimeout(checklistTimer);
-    if (searchTimer) clearTimeout(searchTimer);
-    if (pdfResizeTimer != null) clearTimeout(pdfResizeTimer);
-    noteTimer = checklistTimer = searchTimer = null;
-    pdfResizeTimer = null;
-    if (chatController) {
-      try { chatController.abort(); } catch (_) {}
-      chatController = null;
-    }
-    if (view.chatLoading && view.currentItem && view.service && typeof view.service.cancelChat === "function") {
-      try { view.service.cancelChat(view.currentItem); } catch (_) {}
-    }
-    if (activeJob && view.currentItem && view.service) {
-      try { view.service.cancelAnalysis(view.currentItem); } catch (_) {}
-    }
-    if (activeBatch && view.service) {
-      try { view.service.cancelBatch(); } catch (_) {}
-    }
-    activeJob = activeBatch = null;
+    noteTimer = checklistTimer = null;
+    cancelOwnedRequests();
     if (aiConfigSession) {
       const session = aiConfigSession;
       session.finished = true;
@@ -4459,11 +3098,6 @@
     const context = options.nativeContext || runtimeContext(targetWindow);
     if (targetWindow.ReadingRoomWindow
         && targetWindow.ReadingRoomWindow._started) {
-      if (options.itemID) {
-        targetWindow.ReadingRoomWindow.selectItem(
-          Zotero.Items.get(Number(options.itemID)),
-        );
-      }
       if (targetWindow.ReadingRoomWindow.updateContext && context) {
         targetWindow.ReadingRoomWindow.updateContext(context);
       }
@@ -4476,26 +3110,9 @@
       selectItem: item => selectHostItem(item),
       show,
       dispose: disposeRuntime,
-      updateContext(next) {
-        if (!state || !next) return;
-        state.nativeContext = { ...state.nativeContext, ...next };
-      },
+      updateContext,
     };
-    void (async () => {
-      await loadLibraries();
-      await loadCatalog();
-      let selected = null;
-      try {
-        const win = Zotero.getMainWindow();
-        selected = options.itemID || context.itemID
-          ? Zotero.Items.get(Number(options.itemID || context.itemID))
-          : selectedPaneItem(win);
-      }
-      catch (error) {
-        logError("initial selection", error);
-      }
-      if (selected) await selectItem(selected);
-    })();
+    void updateContext(context, true);
     targetWindow.addEventListener("unload", disposeRuntime, { once: true });
   }
   scope.ReadingRoomUI = Object.freeze({

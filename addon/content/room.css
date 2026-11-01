@@ -2354,6 +2354,11 @@ html[data-embedded="true"] .rr-reading-grid-embedded .rr-insight-body {
   overflow: visible;
 }
 
+html[data-embedded="true"] .rr-reading-grid-embedded {
+  display: block;
+  width: 100%;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     scroll-behavior: auto !important;

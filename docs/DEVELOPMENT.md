@@ -8,9 +8,10 @@
 | --- | --- |
 | `addon/manifest.json`、`bootstrap.js` | Zotero 插件标识、兼容范围、启停生命周期 |
 | `addon/content/core.js` | 无文件/网络访问的状态、分页、AI 输出与证据校验、提供商和端点规范化；不生成抽取式预读 |
-| `addon/content/service.js` | 文库搜索/关注、配置和 OSKeyStore 凭据、AI 缓存与多协议请求、PDF worker、专用笔记 |
+| `addon/content/service.js` | 当前论文状态/笔记、配置和 OSKeyStore 凭据、AI 缓存/对话与多协议请求、PDF worker；旧目录/批量 API 仅兼容保留 |
 | `addon/content/reader.js` | 捆绑 PDF.js iframe、本机 PDF 字节、页码/查找、串行原页 PNG 和生命周期清理 |
 | `addon/content/room.*`、`addon/locale/` | 阅读室与宿主入口、样式、语言资源 |
+| `addon/content/sidebar.js` | 正常 PDF Reader section、所属标签及附件校验、单篇打开入口和宿主生命周期；不注册文献树状态列 |
 | `tests/core.test.mjs`、`tests/service.test.mjs`、`tests/fixtures/` | 虚构文库、PDF 提取结果、存储与 HTTP 测试适配器 |
 | `tests/package.test.mjs` | 独立读取 ZIP 结构、检查标准 CRC 向量、复现性、源文件边界与发布校验 |
 | `scripts/` | 检查与确定性 ZIP32 打包 |
@@ -20,6 +21,8 @@
 日常开发默认只 commit/push，正式版本号、tag 和 Release 需要事先明确批准，见 [AGENTS.md](../AGENTS.md) 和[发布说明](RELEASING.md)。未发布构建可能与同版本号的既有 Release 代码不同，不能覆盖已发布资产。
 
 开始编辑代码前，先检索本项目和相关上游的类似实现，记录固定提交与原始源码位置；更改源文件后刷新项目索引。具体查询示例、许可证和宿主版本边界见[参考代码工作流](REFERENCE-CODE.md)。检索配置不会改变插件版本或打包内容。
+
+本轮当前论文适配的编辑前证据：本项目基线 `2703a49bc6a1bea35c3833d60e056657f47eea34`，XERJ 查询 `viewContext mountWindow registerSection` 命中 `addon/content/sidebar.js:210`、`:409`；Zotero 固定提交 `212a7d6a585d1209bc4e698a904490205f139500` 的 `chrome/content/zotero/xpcom/reader.js:2898` 定义按标签获取 Reader，`:65` 将 Reader 关联到附件；Template 固定提交 `306d4e2a0959a7b2f5e44bb38169fb25f841dbaf` 的 `src/modules/examples.ts:292` 展示 section 通过 `setEnabled` 与 `tabType` 控制可用性。已用 XERJ 检索并读取周边源码，仅据接口行为独立实现，不复制 AGPL 代码；这些上游提交不能代替实际 Zotero 10.0.7 的验证。
 
 ## 命令
 
@@ -43,6 +46,12 @@ node scripts/check.mjs --tag v0.2.0
 插件 ID 为 `zotero-reading-room@wuxinxin27.github.io`，不要在更新中更换。版本由 `package.json` 与 manifest 一起更新。首版只声明 Zotero 10，初始实机目标为 10.0.7；不要未经验证扩大范围。
 
 `ReadingRoomCore` 是纯逻辑接口，`ReadingRoomService` 持有存储、分析与笔记方法，`ReadingRoomUI` 管理宿主入口。提供商元数据由 `Core.API_PROVIDERS` 提供；模型发现接口为 `service.listModels({ provider, endpoint, apiKey, allowRemote, signal, item })`，返回规范化端点和 `{ id, name }` 模型项。开始分析时在 options 中传 `provider`。这些接口的真实行为以源码为准，详细路由和返回格式见 [API 提供商说明](API-PROVIDERS.md)。
+
+当前产品只辅助当前论文：Zotero 负责文库、收藏夹、查找及切换。插件启动、挂载和切换不调用全库枚举、目录、关注或批量 API；这些旧服务接口及侧文件关注字段仅兼容保留，没有界面入口或后台触发，不做迁移和清理。手动状态标签仍保留，主文献树自定义阅读状态列已移除。
+
+`sidebar.viewContext` 仅接受 `props.tabType === "reader"`，从所属 `item-details.tabID` 调用 `Zotero.Reader.getByTabID(tabID)`，核对 Reader 的 PDF 附件、有效父论文、同库关系及 section 条目归属。传给 iframe 的身份字段为 `tabID`、`itemID`（兼容字段，值为父论文 ID）、`parentItemID`、`attachmentID`、`attachmentKey`，`mountWindow` 与 `updateContext` 保持同一契约。不能按父论文寻找第一个 PDF，也不能使用缓存的 tabID 代替缺失的宿主标签。缺失/不匹配时禁用并移除该视图；Reader 稍后就绪后允许 `onRender` 重试。工具菜单和所选条目右键仍可显式打开单篇正常 PDF，库列表不挂载阅读室，也不新建顶层阅读室窗口。
+
+保留每标签独立 iframe、属性式 Fluent、load 后重挂载、单独折叠/展开、热更新按钮重绑及停用清理。针对性合成宿主检查为 `node --test tests/sidebar-lifecycle.test.mjs`；它只证明契约与生命周期逻辑，不代替 [TESTING.md](TESTING.md) 中本轮待执行的原生验收。
 
 模型发现只在用户主动打开 AI 设置后触发，地址、协议或密钥变化约 700ms 后发起。UI 必须取消旧请求并通过代际检查忽略迟到结果；关闭弹窗、切换文献或卸载时清理计时器和请求。远程发现与远程正文许可分开，更改端点 origin 时撤销许可并清除保留密钥。不得在 UI 中硬编码模型名作为可用列表。
 

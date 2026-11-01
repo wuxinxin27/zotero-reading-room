@@ -4,17 +4,9 @@
 
   const PLUGIN_ID = "zotero-reading-room@wuxinxin27.github.io";
   const PANE_ID = "reading-room-item-pane";
-  const COLUMN_KEY = "reading-room-status";
   const MENU_TOOLS = "reading-room-tools-open";
   const MENU_ITEM = "reading-room-item-open";
   const ROOM_URL = "chrome://reading-room/content/room.xhtml?embedded=1";
-  const STATUS_LABELS = Object.freeze({
-    unread: "未读",
-    to_read: "待读",
-    reading: "在读",
-    read: "已读",
-    parked: "搁置",
-  });
 
   function delay(window, milliseconds) {
     return new Promise(resolve => {
@@ -45,6 +37,11 @@
     return doc && (doc.defaultView || doc.ownerDocument?.defaultView) || null;
   }
 
+  function frameURL(context) {
+    return ROOM_URL + ["tabID", "itemID", "parentItemID", "attachmentID", "attachmentKey"]
+      .map(key => `&${key}=${encodeURIComponent(context[key])}`).join("");
+  }
+
   class ReadingRoomNativeSidebar {
     constructor(options = {}) {
       this.service = options.service;
@@ -58,7 +55,6 @@
       this.cssURL = String(options.cssURL || "");
       this.started = false;
       this.paneID = null;
-      this.columnKey = null;
       this.views = new WeakMap();
       this.liveViews = new Set();
       this.frameOwners = new WeakMap();
@@ -70,7 +66,6 @@
       this.started = true;
       this.registerMenus();
       this.registerSection();
-      this.registerColumn();
       if (Zotero.Reader && typeof Zotero.Reader.registerEventListener === "function") {
         this.toolbarListener = event => this.renderToolbar(event);
         Zotero.Reader.registerEventListener("renderToolbar", this.toolbarListener, PLUGIN_ID);
@@ -156,40 +151,16 @@
       if (registered) this.paneID = String(registered);
     }
 
-    registerColumn() {
-      if (!Zotero.ItemTreeManager || typeof Zotero.ItemTreeManager.registerColumn !== "function") return;
-      this.columnKey = Zotero.ItemTreeManager.registerColumn({
-        dataKey: COLUMN_KEY,
-        label: "阅读状态",
-        pluginID: PLUGIN_ID,
-        enabledTreeIDs: ["main"],
-        width: "86",
-        minWidth: 68,
-        showInColumnPicker: true,
-        zoteroPersist: ["width", "hidden", "sortDirection"],
-        dataProvider: item => {
-          try {
-            const parent = this.service.normalizeItem(item);
-            const state = parent && this.service.getState(parent);
-            return state ? STATUS_LABELS[state.status] || "未读" : "";
-          }
-          catch (_) {
-            return "";
-          }
-        },
-        renderCell(_index, data, column, _isFirstColumn, doc) {
-          const cell = doc.createElementNS("http://www.w3.org/1999/xhtml", "span");
-          cell.setAttribute("class", `cell ${column.className} rr-status-cell rr-status-${data || "unread"}`);
-          cell.textContent = data || "未读";
-          return cell;
-        },
-      }) || null;
-    }
-
     ensureView(props) {
       const body = props && props.body;
       if (!body) return null;
       let view = this.views.get(body);
+      const context = this.viewContext(view || { body, doc: props.doc }, props);
+      props.setEnabled?.(!!context);
+      if (!context) {
+        this.disposeView(props);
+        return null;
+      }
       if (view) return view;
       view = {
         body,
@@ -208,20 +179,36 @@
     }
 
     viewContext(view, props = {}) {
-      const item = props.item || null;
-      let parent = item;
-      try {
-        parent = item ? this.service.normalizeItem(item) : null;
-      }
-      catch (_) {}
+      if (!view || props.tabType !== "reader" || !props.item || props.item.deleted) return null;
       const details = closestDetails(props.body || view.body);
-      const tabID = detailsTabID(details) || view.tabID || null;
+      const tabID = detailsTabID(details);
+      if (!tabID) return null;
+      let attachment;
+      let parent;
+      try {
+        const reader = Zotero.Reader?.getByTabID(tabID);
+        if (!reader || String(reader.tabID) !== tabID) return null;
+        attachment = Zotero.Items.get(reader.itemID);
+        if (!attachment || attachment.deleted || attachment.attachmentContentType !== "application/pdf"
+            || attachment.id !== Number(reader.itemID) || !attachment.parentItemID
+            || typeof attachment.key !== "string" || !attachment.key
+            || (typeof attachment.isAttachment === "function" && !attachment.isAttachment())) return null;
+        parent = Zotero.Items.get(attachment.parentItemID);
+        if (!parent || parent.id !== Number(attachment.parentItemID) || parent.deleted || parent.parentItemID
+            || (typeof parent.isRegularItem === "function" && !parent.isRegularItem())
+            || parent.libraryID !== attachment.libraryID) return null;
+        if (Number(props.item.id) !== Number(parent.id) && Number(props.item.id) !== Number(attachment.id)) return null;
+      }
+      catch (_) { return null; }
       const hostWindow = documentWindow(props.doc || view.doc) || Zotero.getMainWindow?.() || null;
       return {
         pluginID: PLUGIN_ID,
-        itemID: parent && parent.id || null,
+        itemID: parent.id,
+        parentItemID: parent.id,
+        attachmentID: attachment.id,
+        attachmentKey: attachment.key,
         tabID,
-        tabType: props.tabType || view.tabType || null,
+        tabType: "reader",
         embedded: true,
         hostWindow,
         rootURI: this.rootURI,
@@ -233,8 +220,13 @@
 
     renderView(props) {
       const view = this.ensureView(props);
-      if (!view || !props || !props.doc || !props.body) return;
+      if (!view || view.suspended || !props || !props.doc || !props.body) return;
       view.lastProps = props;
+      const context = this.viewContext(view, props);
+      if (!context) return;
+      view.context = context;
+      view.itemID = context.itemID;
+      view.tabID = context.tabID;
       if (!view.frame) {
         const doc = props.doc;
         const frame = doc.createElementNS("http://www.w3.org/1999/xhtml", "iframe");
@@ -257,10 +249,7 @@
         view.frameWindow = frame.contentWindow || null;
         this.frameOwners.set(frame, view);
       }
-      const context = this.viewContext(view, props);
-      view.itemID = context.itemID;
-      view.tabID = context.tabID;
-      const nextURL = `${ROOM_URL}&tabID=${encodeURIComponent(context.tabID || "")}&itemID=${encodeURIComponent(context.itemID || "")}`;
+      const nextURL = frameURL(context);
       if (view.frame.getAttribute("src") !== nextURL) {
         view.navigationGeneration = (view.navigationGeneration || 0) + 1;
         view.started = null;
@@ -278,7 +267,7 @@
 
     async mountView(props) {
       const view = this.ensureView(props);
-      if (!view) return null;
+      if (!view || view.suspended) return null;
       this.renderView(props);
       if (!view.frame) return null;
       if (view.started) return view.started;
@@ -293,10 +282,15 @@
               && (!frameWindow.document.documentURI || frameWindow.document.documentURI === view.frame.getAttribute("src"))
               && ["interactive", "complete"].includes(frameWindow.document.readyState)) {
             try {
+              const context = this.viewContext(view, props);
+              if (!context) {
+                this.disposeView(props);
+                props.setEnabled?.(false);
+                return null;
+              }
               this.prepareFrameRuntime(view, frameWindow, props);
               if (frameWindow.ReadingRoomWindow
                   && typeof frameWindow.ReadingRoomWindow.start === "function") {
-                const context = this.viewContext(view, props);
                 frameWindow.ReadingRoomWindow.start({
                   window: frameWindow,
                   document: frameWindow.document,
@@ -304,7 +298,7 @@
                   nativeContext: context,
                 });
                 view.mountedDocument = frameWindow.document;
-                if (props.item) this.selectViewItem(view, props.item);
+                this.selectViewItem(view);
                 return frameWindow;
               }
             }
@@ -321,6 +315,7 @@
 
     prepareFrameRuntime(view, frameWindow, props) {
       const context = this.viewContext(view, props);
+      if (!context) throw new Error("当前 PDF 阅读上下文尚未就绪。");
       frameWindow.Zotero = frameWindow.Zotero || Zotero;
       frameWindow.ReadingRoomNativeContext = Object.freeze({ ...context });
       if (this.core) frameWindow.ReadingRoomCore = this.core;
@@ -353,14 +348,16 @@
       });
     }
 
-    selectViewItem(view, item) {
-      if (!view || !view.frame || !item) return;
+    selectViewItem(view) {
+      if (!view || view.disposed || !view.frame) return;
+      const context = this.viewContext(view, view.lastProps);
+      if (!context) return;
       const frameWindow = view.frame.contentWindow;
       const windowAPI = frameWindow && frameWindow.ReadingRoomWindow;
       if (windowAPI && typeof windowAPI.selectItem === "function") {
         try {
-          const parent = this.service.normalizeItem(item) || item;
-          windowAPI.selectItem(parent);
+          const parent = Zotero.Items.get(context.parentItemID);
+          if (parent) windowAPI.selectItem(parent);
         }
         catch (_) {}
       }
@@ -369,20 +366,9 @@
     updateView(props) {
       const view = this.ensureView(props);
       if (!view) return;
-      const context = this.viewContext(view, props);
-      view.itemID = context.itemID;
-      view.tabID = context.tabID;
-      view.tabType = context.tabType;
-      if (view.frame && view.frame.contentWindow) {
-        try {
-          view.frame.contentWindow.ReadingRoomNativeContext = Object.freeze({ ...context });
-        }
-        catch (_) {}
-      }
-      if (props.item) {
-        if (view.started) void view.started.then(() => this.selectViewItem(view, props.item));
-        else void this.mountView(props);
-      }
+      this.renderView(props);
+      if (view.started) void view.started.then(() => this.selectViewItem(view));
+      else void this.mountView(props);
     }
 
     disposeView(props) {
@@ -415,70 +401,63 @@
         view = frame && this.frameOwners.get(frame);
       }
       catch (_) {}
-      if (view) {
-        const next = { ...(context || {}), embedded: true };
-        const nextURL = `${ROOM_URL}&tabID=${encodeURIComponent(next.tabID || view.tabID || "")}&itemID=${encodeURIComponent(itemID || next.itemID || view.itemID || "")}`;
-        win.ReadingRoomNativeContext = Object.freeze(next);
-        view.itemID = itemID || next.itemID || view.itemID;
-        view.tabID = next.tabID || view.tabID;
-        if (view.frame.getAttribute("src") !== nextURL) {
-          view.frame.setAttribute("src", nextURL);
-          view.started = null;
-        }
-        if (win.ReadingRoomUI && win.ReadingRoomWindow
-            && typeof win.ReadingRoomWindow.start === "function") {
-          const frameContext = {
-            ...next,
-            itemID: itemID || next.itemID || view.itemID,
-            tabID: next.tabID || view.tabID,
-          };
-          if (!win.ReadingRoomWindow._started) {
-            win.ReadingRoomWindow.start({
-              window: win,
-              document: win.document,
-              itemID: frameContext.itemID,
-              nativeContext: frameContext,
-            });
-          }
-        }
-        return true;
+      if (!view) view = [...this.liveViews].find(candidate => candidate.frame?.contentWindow === win);
+      if (!view || view.disposed || view.suspended || view.frame?.contentWindow !== win) return false;
+      const resolved = this.viewContext(view, view.lastProps);
+      if (!resolved || (itemID != null && Number(itemID) !== resolved.itemID)) return false;
+      for (const key of ["tabID", "itemID", "parentItemID", "attachmentID", "attachmentKey"]) {
+        if (context?.[key] != null && String(context[key]) !== String(resolved[key])) return false;
       }
-      const tabID = context && context.tabID;
-      for (const candidate of this.liveViews) {
-        if (tabID && String(candidate.tabID) !== String(tabID)) continue;
-        const frameWindow = candidate.frame && candidate.frame.contentWindow;
-        if (frameWindow === win) {
-          try {
-            win.ReadingRoomNativeContext = Object.freeze({
-              ...(context || {}), embedded: true,
-              itemID: itemID || context?.itemID || candidate.itemID,
-              tabID: tabID || candidate.tabID,
-            });
-          }
-          catch (_) {}
-          return true;
-        }
+      const next = { ...(context || {}), ...resolved };
+      view.context = next;
+      view.itemID = next.itemID;
+      view.tabID = next.tabID;
+      win.ReadingRoomNativeContext = Object.freeze(next);
+      const nextURL = frameURL(next);
+      if (view.frame.getAttribute("src") !== nextURL) {
+        view.navigationGeneration = (view.navigationGeneration || 0) + 1;
+        view.frame.setAttribute("src", nextURL);
+        view.started = null;
       }
-      return false;
+      if (win.ReadingRoomUI && win.ReadingRoomWindow
+          && typeof win.ReadingRoomWindow.start === "function" && !win.ReadingRoomWindow._started) {
+        win.ReadingRoomWindow.start({
+          window: win,
+          document: win.document,
+          itemID: next.itemID,
+          nativeContext: next,
+        });
+      }
+      return true;
     }
 
     async show(options = {}) {
+      let reader = options.reader || null;
+      if (!reader && !options.itemID) {
+        const tabID = Zotero.getMainWindow()?.Zotero_Tabs?.selectedID;
+        try { reader = tabID && Zotero.Reader?.getByTabID(tabID) || null; }
+        catch (_) {}
+      }
       let item = null;
+      let selected = null;
       try {
-        item = options.reader
-          ? Zotero.Items.get(options.reader.itemID)
+        selected = reader
+          ? Zotero.Items.get(reader.itemID)
           : Zotero.Items.get(Number(options.itemID));
-        item = item && (this.service.normalizeItem(item) || item);
+        item = selected && this.service.normalizeItem(selected);
       }
       catch (_) {}
-      if (!item) item = this.selectedPaneItem(options.reader && options.reader._window || Zotero.getMainWindow());
+      if (!item && !options.itemID && !reader) {
+        selected = this.selectedPaneItem(Zotero.getMainWindow());
+        item = selected && this.service.normalizeItem(selected);
+      }
       if (!item) return false;
 
-      let reader = options.reader || null;
       let hostWindow = reader && (reader._window || reader._iframeWindow?.top) || null;
       if (!reader) {
         try {
-          const attachment = await this.service.getReaderAttachment(item);
+          const attachment = await this.service.getReaderAttachment(item,
+            selected?.attachmentContentType === "application/pdf" ? { attachmentID: selected.id } : {});
           if (attachment && attachment.id) {
             reader = await Zotero.Reader.open(attachment.id, null, {
               openInWindow: false,
@@ -490,25 +469,27 @@
           this.log(`open PDF [${error && error.code || "ERROR"}]: ${error && error.message || error}`);
         }
       }
+      if (!reader || !reader.tabID) return false;
       hostWindow = reader && (reader._window || reader._iframeWindow?.top) || hostWindow || Zotero.getMainWindow();
       return this.focusSection(item, reader, hostWindow);
     }
 
     updateContext(reader) {
-      if (!reader) return;
-      const hostWindow = reader._window || reader._iframeWindow?.top || Zotero.getMainWindow?.();
-      const tabID = reader.tabID || null;
-      for (const view of this.liveViews) {
-        if (tabID && String(view.tabID) !== String(tabID)) continue;
+      if (!reader || !reader.tabID) return;
+      const tabID = String(reader.tabID);
+      for (const view of [...this.liveViews]) {
+        if (String(view.tabID) !== tabID) continue;
+        const context = this.viewContext(view, view.lastProps);
+        if (!context) {
+          view.lastProps?.setEnabled?.(false);
+          this.disposeView({ body: view.body });
+          continue;
+        }
+        view.context = context;
         if (view.frame && view.frame.contentWindow) {
           try {
-            view.frame.contentWindow.ReadingRoomNativeContext = Object.freeze({
-              ...(view.frame.contentWindow.ReadingRoomNativeContext || {}),
-              embedded: true,
-              itemID: reader.itemID || null,
-              tabID: tabID || view.tabID || null,
-              hostWindow,
-            });
+            view.frame.contentWindow.ReadingRoomNativeContext = Object.freeze({ ...context });
+            view.frame.contentWindow.ReadingRoomWindow?.updateContext?.(context);
           }
           catch (_) {}
         }
@@ -520,7 +501,7 @@
         const tabID = window && window.Zotero_Tabs && window.Zotero_Tabs.selectedID;
         const reader = tabID && Zotero.Reader && Zotero.Reader.getByTabID(tabID);
         const itemID = reader && reader.itemID;
-        return itemID && (this.service.normalizeItem(Zotero.Items.get(itemID)) || Zotero.Items.get(itemID))
+        return itemID && Zotero.Items.get(itemID)
           || window && window.ZoteroPane && window.ZoteroPane.getSelectedItems?.()[0] || null;
       }
       catch (_) {
@@ -531,12 +512,9 @@
     async focusSection(item, reader, hostWindow) {
       hostWindow = hostWindow || Zotero.getMainWindow();
       const targetTabID = reader && reader.tabID ? String(reader.tabID) : null;
+      if (!targetTabID) return false;
       if (targetTabID && hostWindow && hostWindow.Zotero_Tabs && typeof hostWindow.Zotero_Tabs.select === "function") {
         try { hostWindow.Zotero_Tabs.select(targetTabID, true); }
-        catch (_) {}
-      }
-      if (!reader && hostWindow && hostWindow.ZoteroPane && item) {
-        try { await hostWindow.ZoteroPane.selectItem(item.id); }
         catch (_) {}
       }
       try {
@@ -556,7 +534,7 @@
           catch (_) {}
           const details = detailsTabID(container) ? container
             : container.querySelector?.("item-details") || container;
-          if (!targetTabID || detailsTabID(details) === targetTabID) {
+          if (detailsTabID(details) === targetTabID) {
             try {
               const pane = details && typeof details.getEnabledPane === "function"
                 ? details.getEnabledPane(this.paneID) : null;
@@ -623,10 +601,6 @@
       }
       catch (_) {}
       try {
-        if (this.columnKey && Zotero.ItemTreeManager) Zotero.ItemTreeManager.unregisterColumn(this.columnKey);
-      }
-      catch (_) {}
-      try {
         if (Zotero.MenuManager) {
           Zotero.MenuManager.unregisterMenu(MENU_TOOLS);
           Zotero.MenuManager.unregisterMenu(MENU_ITEM);
@@ -634,7 +608,6 @@
       }
       catch (_) {}
       this.paneID = null;
-      this.columnKey = null;
       this.toolbarListener = null;
     }
 
