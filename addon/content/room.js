@@ -49,9 +49,14 @@
   let dialogSequence = 0;
   let loadGeneration = 0;
   let catalogGeneration = 0;
+  let collectionsGeneration = 0;
   let itemPaneID = null;
   let columnKey = null;
   let started = false;
+  let choiceSequence = 0;
+  let pdfResizeTimer = null;
+  const choiceBindings = new WeakMap();
+  const choiceInstances = new Set();
   const mainWindow = scope.window;
   const mainDocument = scope.document;
 
@@ -72,11 +77,17 @@
     if (value) element.setAttribute(name, name);
     else element.removeAttribute(name);
     if (typeof element[name] === "boolean") element[name] = !!value;
+    if (name === "disabled") {
+      const binding = choiceBindings.get(element);
+      if (binding) binding.syncDisabled(!!value);
+    }
   }
   function setValue(element, value) {
     const text = String(value == null ? "" : value);
     element.setAttribute("value", text);
     if (typeof element.value === "string") element.value = text;
+    const binding = choiceBindings.get(element);
+    if (binding) binding.syncSelection(text);
   }
   function getValue(element) {
     return typeof element.value === "string"
@@ -88,6 +99,249 @@
   function getChecked(element) {
     return typeof element.checked === "boolean"
       ? element.checked : element.hasAttribute("checked");
+  }
+  function optionEntries(element) {
+    return Array.from(element.children || []).filter(
+      child => child && child.localName === "option",
+    );
+  }
+  function dispatchChange(element) {
+    const EventClass = element.ownerDocument?.defaultView?.Event
+      || state?.window?.Event;
+    if (typeof EventClass === "function") {
+      element.dispatchEvent(new EventClass("change", { bubbles: true }));
+      return;
+    }
+    const event = {
+      type: "change",
+      target: element,
+      currentTarget: element,
+      preventDefault() {},
+      stopPropagation() {},
+    };
+    if (typeof element.dispatchEvent === "function") {
+      element.dispatchEvent(event);
+    }
+    else if (typeof element.onchange === "function") {
+      element.onchange(event);
+    }
+  }
+  function syncChoiceOptions(binding) {
+    const { select, trigger, label, menu } = binding;
+    const entries = optionEntries(select);
+    if (!entries.some(entry => getValue(entry) === getValue(select))
+        && entries.length) {
+      const firstEnabled = entries.find(entry =>
+        !entry.hasAttribute("disabled"));
+      if (firstEnabled) setValue(select, getValue(firstEnabled));
+    }
+    let selectedLabel = "";
+    menu.replaceChildren();
+   binding.items = [];
+    for (const option of entries) {
+      const value = getValue(option);
+      const disabled = option.hasAttribute("disabled");
+      const item = make("button", "rr-choice-option", option.textContent);
+      item.setAttribute("type", "button");
+      item.setAttribute("role", "option");
+      item.setAttribute("tabindex", "-1");
+      item.setAttribute("aria-selected", String(value === getValue(select)));
+      setBooleanAttribute(item, "disabled", disabled);
+      if (value === getValue(select)) selectedLabel = option.textContent;
+      item.addEventListener("click", () => {
+        if (disabled || binding.closed) return;
+        selectChoice(binding, value, true);
+      });
+      menu.append(item);
+     binding.items.push({ item, value, disabled });
+    }
+    label.textContent = selectedLabel || "请选择";
+    binding.open = false;
+    setClass(binding.root, binding.baseClass);
+    trigger.setAttribute("aria-expanded", "false");
+    setHidden(menu, true);
+    binding.activeIndex = Math.max(
+      0, binding.items.findIndex(entry =>
+        !entry.disabled && entry.value === getValue(select)),
+    );
+  }
+  function openChoice(binding) {
+    if (binding.disabled || binding.open) return;
+    binding.open = true;
+    setClass(binding.root, binding.baseClass + " open");
+    binding.trigger.setAttribute("aria-expanded", "true");
+    setHidden(binding.menu, false);
+    binding.activeIndex = Math.max(
+      0, binding.items.findIndex(entry =>
+        !entry.disabled && entry.value === getValue(binding.select)),
+    );
+    setActiveChoice(binding, binding.activeIndex);
+   binding.items[binding.activeIndex]?.item.focus();
+  }
+  function closeChoice(binding, restoreFocus = false) {
+    if (!binding.open) return;
+    binding.open = false;
+    setClass(binding.root, binding.baseClass);
+    binding.trigger.setAttribute("aria-expanded", "false");
+    setHidden(binding.menu, true);
+   binding.items.forEach(entry =>
+     entry.item.setAttribute("aria-selected",
+       String(entry.value === getValue(binding.select))));
+   if (restoreFocus) binding.trigger.focus();
+ }
+  function setActiveChoice(binding, index) {
+    if (!binding.items.length) return;
+    let next = Math.max(0, Math.min(binding.items.length - 1, index));
+    const direction = next >= binding.activeIndex ? 1 : -1;
+    for (let attempts = 0;
+      attempts < binding.items.length
+      && binding.items[next].disabled;
+      attempts++) {
+      next += direction;
+      if (next < 0) next = binding.items.length - 1;
+      if (next >= binding.items.length) next = 0;
+    }
+    binding.activeIndex = next;
+    binding.items.forEach((entry, itemIndex) => {
+      entry.item.setAttribute("tabindex", itemIndex === next ? "0" : "-1");
+    });
+    binding.items[next].item.focus?.();
+  }
+  function selectChoice(binding, value, announce = false) {
+    const option = binding.items.find(entry =>
+      !entry.disabled && entry.value === String(value));
+    if (!option) return;
+    setValue(binding.select, option.value);
+    closeChoice(binding, true);
+    if (announce) dispatchChange(binding.select);
+  }
+  function makeChoice(select, { label = "选择", className = "" } = {}) {
+    const id = `rr-choice-${++choiceSequence}`;
+    const root = make("div", "rr-choice " + className);
+    const trigger = make("button", "rr-choice-trigger");
+    trigger.setAttribute("type", "button");
+    trigger.setAttribute("aria-haspopup", "listbox");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.setAttribute("aria-controls", `${id}-menu`);
+    trigger.setAttribute("aria-label", label);
+    const selectedLabel = make("span", "rr-choice-label");
+    trigger.append(selectedLabel, make("span", "rr-choice-caret", "⌄"));
+    const menu = make("div", "rr-choice-menu");
+    menu.setAttribute("id", `${id}-menu`);
+    menu.setAttribute("role", "listbox");
+    setHidden(menu, true);
+    root.append(trigger, menu);
+    select.setAttribute("hidden", "hidden");
+    setClass(select, "rr-choice-native");
+    root.append(select);
+    const binding = {
+      baseClass: "rr-choice " + className,
+      id, root, trigger, menu, select, label: selectedLabel,
+      items: [], open: false, disabled: false, activeIndex: 0,
+      syncSelection(value) {
+        const entries = optionEntries(select);
+        let matched = entries.find(entry => getValue(entry) === String(value));
+        if (!matched && entries.length) {
+          matched = entries.find(entry => !entry.hasAttribute("disabled"));
+          if (matched) {
+            select.setAttribute("value", getValue(matched));
+            if (typeof select.value === "string") {
+              select.value = getValue(matched);
+            }
+          }
+        }
+        selectedLabel.textContent = matched ? matched.textContent : "请选择";
+        for (const entry of binding.items) {
+          entry.item.setAttribute("aria-selected",
+            String(entry.value === getValue(select)));
+        }
+      },
+      syncDisabled(value) {
+        binding.disabled = value;
+        trigger.disabled = value;
+        if (value) closeChoice(binding);
+      },
+      syncOptions() { syncChoiceOptions(binding); },
+      close(restoreFocus = false) { closeChoice(binding, restoreFocus); },
+      contains(node) { return root.contains?.(node) || false; },
+    };
+    choiceBindings.set(select, binding);
+    choiceInstances.add(binding);
+    trigger.addEventListener("click", () => {
+      closeOpenChoices(binding);
+      if (binding.open) closeChoice(binding, true);
+      else openChoice(binding);
+    });
+    trigger.addEventListener("keydown", event => {
+      if (["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+        event.preventDefault();
+        openChoice(binding);
+      }
+    });
+    menu.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeChoice(binding, true);
+      }
+      else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        setActiveChoice(
+          binding,
+          binding.activeIndex + (event.key === "ArrowDown" ? 1 : -1),
+        );
+      }
+      else if (event.key === "Home" || event.key === "End") {
+        event.preventDefault();
+        setActiveChoice(
+          binding, event.key === "Home" ? 0 : binding.items.length - 1,
+        );
+      }
+      else if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        const entry = binding.items[binding.activeIndex];
+        if (entry && !entry.disabled) selectChoice(binding, entry.value, true);
+      }
+      else if (event.key === "Tab") closeChoice(binding);
+    });
+    select.addEventListener("change", () => {
+      binding.syncSelection(getValue(select));
+    });
+    binding.syncSelection(getValue(select));
+    binding.syncOptions();
+    binding.syncSelection(getValue(select));
+    binding.syncDisabled(select.hasAttribute("disabled"));
+    return { root, trigger, menu, select, binding };
+  }
+   function closeOpenChoices(except = null) {
+    for (const binding of choiceInstances) {
+      if (binding !== except && binding.open) binding.close(false);
+    }
+  }
+  function disposeChoices(container) {
+    for (const binding of [...choiceInstances]) {
+      if (container && !container.contains?.(binding.root)) continue;
+      binding.close(false);
+      binding.closed = true;
+      choiceInstances.delete(binding);
+      choiceBindings.delete(binding.select);
+    }
+  }
+  function bindChoiceOutsideDismiss() {
+    const doc = currentDocument();
+    if (!doc || typeof doc.addEventListener !== "function"
+        || doc.__readingRoomChoiceOutsideBound) return;
+    doc.__readingRoomChoiceOutsideBound = true;
+    doc.addEventListener("click", event => {
+      const target = event && event.target;
+      for (const binding of choiceInstances) {
+        if (!binding.open) continue;
+        const inside = target === binding.root
+          || (target && typeof binding.root.contains === "function"
+            && binding.root.contains(target));
+        if (!inside) binding.close(false);
+      }
+    });
   }
   function make(tag, className, text) {
     const element = currentDocument().createElementNS(XHTML_NS, tag);
@@ -524,6 +778,10 @@
     if (win) {
       try { win.close(); } catch (_) {}
     }
+    closeOpenChoices();
+    choiceInstances.clear();
+    if (pdfResizeTimer != null) clearTimeout(pdfResizeTimer);
+    pdfResizeTimer = null;
     state = null;
   }
   function makeApiButton(label, className, action, title) {
@@ -574,8 +832,9 @@
     if (!state) return;
     const list = state.paperList;
     list.replaceChildren();
+    renderCatalogScope();
     if (state.catalogLoading) {
-      list.append(make("div", "rr-catalog-empty", "正在读取文库…"));
+      list.append(make("div", "rr-catalog-empty", "正在读取当前范围…"));
       return;
     }
     if (!state.catalog.items.length) {
@@ -633,16 +892,172 @@
       container.append(chip);
     }
   }
+  function catalogScope() {
+    const libraryValue = getValue(state.librarySelect);
+    const collectionValue = getValue(state.collectionSelect);
+    return {
+      libraryID: libraryValue ? Number(libraryValue) : null,
+      collectionID: collectionValue ? Number(collectionValue) : null,
+    };
+  }
+  function renderCatalogScope() {
+    if (!state) return;
+    const libraryID = getValue(state.librarySelect)
+      ? Number(getValue(state.librarySelect)) : null;
+    const collectionID = getValue(state.collectionSelect)
+      ? Number(getValue(state.collectionSelect)) : null;
+    const library = state.libraries.find(entry => entry.id === libraryID);
+    const collection = state.collections.find(entry =>
+      entry.id === collectionID && entry.libraryID === libraryID);
+    let path = "全部可访问文库";
+    if (collection) {
+      const names = [];
+      const seen = new Set();
+      let current = collection;
+      while (current && !seen.has(current.id)) {
+        seen.add(current.id);
+        names.unshift(current.name || "未命名收藏夹");
+        current = state.collections.find(entry =>
+          entry.id === current.parentID
+          && entry.libraryID === current.libraryID);
+      }
+      path = `${library ? library.name : "文库"} / ${names.join(" / ")}`;
+    }
+    else if (library) {
+      path = `${library.name} / 全部论文`;
+    }
+    state.catalogScope.textContent = path;
+    state.catalogScope.setAttribute("title", path);
+  }
+  function compareCollectionNames(left, right) {
+    return String(left.name || "").localeCompare(
+      String(right.name || ""), undefined,
+      { numeric: true, sensitivity: "base" },
+    ) || Number(left.id) - Number(right.id);
+  }
+  function renderCollectionTree() {
+    if (!state) return;
+    const tree = state.collectionTree;
+    tree.replaceChildren();
+    const byParent = new Map();
+    const collectionIDs = new Set(state.collections.map(entry => entry.id));
+    for (const collection of state.collections) {
+      const parent = collection.parentID != null
+        && collectionIDs.has(collection.parentID)
+        && collection.parentID !== collection.id
+        ? collection.parentID : null;
+      const rows = byParent.get(parent) || [];
+      rows.push(collection);
+      byParent.set(parent, rows);
+    }
+    for (const rows of byParent.values()) rows.sort(compareCollectionNames);
+    const selectedID = getValue(state.collectionSelect)
+      ? Number(getValue(state.collectionSelect)) : null;
+    const selectedLibraryID = getValue(state.librarySelect)
+      ? Number(getValue(state.librarySelect)) : null;
+    let selectedButton = null;
+    const visibleLibraries = state.libraries;
+    if (!visibleLibraries.length && !state.collectionsLoading) {
+      tree.append(make("p", "rr-tree-empty", "没有可访问的文库。"));
+    }
+    const addCollectionRows = (library, parentID, container, ancestors) => {
+      const children = (byParent.get(parentID) || []).filter(
+        collection => collection.libraryID === library.id);
+      for (const collection of children) {
+        if (ancestors.has(collection.id)) continue;
+        const nextAncestors = new Set(ancestors);
+        nextAncestors.add(collection.id);
+        const childrenOfCollection = byParent.get(collection.id) || [];
+        const row = make("div", "rr-tree-row");
+        const expanded = state.expandedCollections.has(collection.id);
+        const toggle = make("button", "rr-tree-toggle",
+          childrenOfCollection.length ? (expanded ? "▾" : "▸") : "·");
+        toggle.setAttribute("type", "button");
+        toggle.setAttribute("aria-label",
+          `${expanded ? "收起" : "展开"} ${collection.name || "未命名收藏夹"}`);
+        toggle.setAttribute("aria-expanded",
+          String(childrenOfCollection.length ? expanded : false));
+        setBooleanAttribute(toggle, "disabled", !childrenOfCollection.length);
+        if (childrenOfCollection.length) {
+          toggle.addEventListener("click", () => {
+            if (state.expandedCollections.has(collection.id)) {
+              state.expandedCollections.delete(collection.id);
+            }
+            else state.expandedCollections.add(collection.id);
+            renderCollectionTree();
+          });
+        }
+        const button = make("button",
+          "rr-tree-item" + (selectedID === collection.id ? " active" : ""),
+          collection.name || "未命名收藏夹");
+        button.setAttribute("type", "button");
+        button.setAttribute("aria-current",
+          selectedID === collection.id ? "true" : "false");
+        if (selectedID === collection.id) selectedButton = button;
+        button.addEventListener("click", () => {
+          void selectCollection(collection);
+        });
+        row.append(toggle, button);
+        container.append(row);
+        if (childrenOfCollection.length && expanded) {
+          const nested = make("div", "rr-tree-children");
+          nested.setAttribute("role", "group");
+          addCollectionRows(library, collection.id, nested, nextAncestors);
+          container.append(nested);
+        }
+      }
+    };
+    for (const library of visibleLibraries) {
+      const libraryCollections = state.collections.filter(
+        entry => entry.libraryID === library.id,
+      );
+      const root = make("div", "rr-tree-library");
+      const rootButton = make("button",
+        "rr-tree-root" + (!selectedID
+          && selectedLibraryID === library.id
+          ? " active" : ""),
+        library.name || "未命名文库");
+      rootButton.setAttribute("type", "button");
+      rootButton.setAttribute("aria-current",
+        !selectedID && selectedLibraryID === library.id
+          ? "true" : "false");
+      if (!selectedID && selectedLibraryID === library.id) selectedButton = rootButton;
+      rootButton.addEventListener("click", () => void selectLibrary(library));
+      root.append(rootButton);
+      if (libraryCollections.length) {
+        const nested = make("div", "rr-tree-children");
+        nested.setAttribute("role", "group");
+        addCollectionRows(library, null, nested, new Set());
+        root.append(nested);
+      }
+      else if (!state.collectionsLoading) {
+        root.append(make("span", "rr-tree-empty", "无收藏夹"));
+      }
+      tree.append(root);
+    }
+    const selectionKey = `${selectedLibraryID || "all"}:${selectedID || "root"}`;
+    if (state.treeSelectionKey !== selectionKey && selectedButton?.scrollIntoView) {
+      state.treeSelectionKey = selectionKey;
+      selectedButton.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+    if (state.collectionsLoading) {
+      tree.append(make("p", "rr-tree-empty", "正在读取收藏夹…"));
+    }
+    else if (state.collectionsError) {
+      tree.append(make("p", "rr-tree-empty",
+        `收藏夹读取失败：${state.collectionsError}`));
+    }
+  }
   async function loadCatalog({ preserveFocus = true } = {}) {
-    if (!state || state.catalogLoading) return;
+    if (!state) return;
     const generation = ++catalogGeneration;
     state.catalogLoading = true;
     renderCatalog();
     try {
-      const libraryID = getValue(state.librarySelect)
-        ? Number(getValue(state.librarySelect)) : null;
+      const { libraryID, collectionID } = catalogScope();
       const result = await state.service.listPapers({
         libraryID,
+        collectionID,
         query: getValue(state.searchInput).trim(),
         focusOnly: state.catalog.focusOnly,
         offset: state.catalog.offset,
@@ -689,8 +1104,8 @@
     if (!state) return;
     try {
       const result = await state.service.listPapers({
-        libraryID: getValue(state.librarySelect)
-          ? Number(getValue(state.librarySelect)) : null,
+        libraryID: null,
+        collectionID: null,
         query: "", focusOnly: true, offset: 0, limit: 80,
       });
       if (!state || generation !== catalogGeneration) return;
@@ -1262,16 +1677,25 @@
     modal.append(heading);
     overlay.append(modal);
     const onKeyDown = event => {
-      if (event.key === "Escape") {
+      if (event.key !== "Escape") return;
+      const openChoice = [...choiceInstances].find(binding =>
+        binding.open && binding.root.contains
+        && binding.root.contains(event.target));
+      if (openChoice) {
         event.preventDefault();
-        closeDialog();
+        event.stopPropagation();
+        openChoice.close(true);
+        return;
       }
+      event.preventDefault();
+      closeDialog();
     };
     const closeDialog = () => {
       if (closed) return;
       closed = true;
+      disposeChoices(modal);
       overlay.removeEventListener("click", onOverlayClick);
-      overlay.removeEventListener("keydown", onKeyDown);
+      overlay.removeEventListener("keydown", onKeyDown, true);
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
       if (typeof onClose === "function") onClose();
     };
@@ -1279,7 +1703,7 @@
       if (event.target === overlay) closeDialog();
     };
     overlay.addEventListener("click", onOverlayClick);
-    overlay.addEventListener("keydown", onKeyDown);
+    overlay.addEventListener("keydown", onKeyDown, true);
     body.append(overlay);
     return { overlay, modal, close: closeDialog };
   }
@@ -1352,6 +1776,11 @@
         provider.append(option);
       }
       setValue(provider, defaultProvider.id);
+      const providerChoice = makeChoice(provider, {
+        label: "AI 协议", className: "rr-provider-choice",
+      });
+      providerChoice.binding.syncOptions();
+      providerChoice.binding.syncSelection(defaultProvider.id);
       const providerHint = make("p", "rr-field-help");
       const endpoint = doc.createElementNS(XHTML_NS, "input");
       endpoint.setAttribute("type", "url");
@@ -1445,7 +1874,7 @@
         "模型（可搜索或手工输入）", model,
       );
       modelField.append(modelOptions, discoveryStatus, refresh);
-      const providerField = makeField("AI 协议", provider);
+      const providerField = makeField("AI 协议", providerChoice.root);
       providerField.append(providerHint);
       const keyField = makeField("API 密钥", apiKey);
       keyField.append(keyHint, rememberRow, clearRow);
@@ -1767,6 +2196,8 @@
           setStatus(modalStatus, safeError(error).message, "error");
         }
       };
+      providerChoice.binding.syncOptions();
+      providerChoice.binding.syncSelection(getValue(provider));
       provider.addEventListener("change", providerChanged);
       endpoint.addEventListener("input", endpointChanged);
       endpoint.addEventListener("change", endpointChanged);
@@ -2143,6 +2574,7 @@
         "disabled",
         !pdfs.some(attachment => attachment.available),
       );
+      choiceBindings.get(state.attachmentSelect)?.syncOptions();
       updateStatusPills(
         state.statusChoices, description.state.status,
       );
@@ -2285,17 +2717,22 @@
     const workspace = make("div", "rr-workspace");
     const navigation = make("aside", "rr-navigation");
     const navigationHead = make("div", "rr-navigation-head");
-    navigationHead.append(make("h2", null, "论文目录"));
-    const collapse = makeApiButton("收起", "rr-icon-button", () => {
-      state.navigationCollapsed = !state.navigationCollapsed;
+    const navigationTitle = make("h2", null, "论文目录");
+    navigationHead.append(navigationTitle);
+    const setNavigationCollapsed = collapsed => {
+      state.navigationCollapsed = collapsed;
+      setClass(workspace, "rr-workspace"
+        + (collapsed ? " navigation-collapsed" : ""));
       setClass(navigation, "rr-navigation"
-        + (state.navigationCollapsed ? " collapsed" : ""));
-      collapse.textContent =
-        state.navigationCollapsed ? "展开" : "收起";
-      collapse.setAttribute(
-        "aria-expanded", String(!state.navigationCollapsed),
-      );
-    });
+        + (collapsed ? " collapsed" : ""));
+      setHidden(navigationTitle, collapsed);
+      collapse.textContent = collapsed ? "展开" : "收起";
+      collapse.setAttribute("aria-expanded", String(!collapsed));
+      collapse.setAttribute("aria-label", collapsed ? "展开论文目录" : "收起论文目录");
+      if (!collapsed) navigationTitle.focus?.();
+    };
+    const collapse = makeApiButton("收起", "rr-icon-button",
+      () => setNavigationCollapsed(!state.navigationCollapsed));
     collapse.setAttribute("aria-expanded", "true");
     navigationHead.append(collapse);
     navigation.append(navigationHead);
@@ -2311,6 +2748,20 @@
       XHTML_NS, "select",
     );
     librarySelect.setAttribute("aria-label", "选择文库");
+    const libraryChoice = makeChoice(librarySelect, {
+      label: "选择文库", className: "rr-library-choice",
+    });
+    const collectionSelect = currentDocument().createElementNS(
+      XHTML_NS, "select",
+    );
+    collectionSelect.setAttribute("aria-label", "当前收藏夹");
+    const collectionChoice = makeChoice(collectionSelect, {
+      label: "当前收藏夹", className: "rr-collection-choice",
+    });
+    const collectionTree = make("div", "rr-collection-tree");
+    collectionTree.setAttribute("role", "tree");
+    collectionTree.setAttribute("aria-label", "Zotero 文库与收藏夹");
+    const catalogScope = make("div", "rr-catalog-scope", "全部可访问文库");
     const filters = make("div", "rr-catalog-filters");
     const allFilter = makeApiButton(
       "全部", "rr-filter active", () => setCatalogFilter(false),
@@ -2338,7 +2789,10 @@
     pager.append(prevButton, catalogCount, nextButton);
     navigationBody.append(
       search,
-      librarySelect,
+      libraryChoice.root,
+      collectionChoice.root,
+      collectionTree,
+      catalogScope,
       filters,
       make("h3", "rr-nav-label", "快速切换"),
       focusedChips,
@@ -2464,7 +2918,11 @@
       XHTML_NS, "select",
     );
     setValue(attachmentSelect, "");
-    attachmentField.append(attachmentSelect);
+    const attachmentChoice = makeChoice(attachmentSelect, {
+      label: "选择用于原文与分析的本地 PDF",
+      className: "rr-attachment-choice",
+    });
+    attachmentField.append(attachmentChoice.root);
     const notesLabel = make("label", "rr-field rr-notes-field");
     notesLabel.append(make(
       "span", "rr-field-label", "阅读笔记 · 切换论文前自动保存",
@@ -2541,7 +2999,20 @@
       navigation,
       navigationBody,
       searchInput: search,
+      workspace,
+      navigationCollapsed: false,
       librarySelect,
+      libraryChoice: libraryChoice.binding,
+      collectionSelect,
+      collectionChoice: collectionChoice.binding,
+      collectionTree,
+      catalogScope,
+      libraries: [],
+      collections: [],
+      expandedCollections: new Set(),
+      collectionsLoading: false,
+      collectionsError: "",
+      splitPercent: 52,
       allFilter,
       focusFilter,
       focusedChips,
@@ -2603,8 +3074,27 @@
       }, 280);
     });
     librarySelect.addEventListener("change", () => {
-      state.catalog.offset = 0;
-      void loadCatalog();
+      const libraryValue = getValue(librarySelect);
+      const library = state.libraries.find(entry =>
+        String(entry.id) === libraryValue);
+      setValue(collectionSelect, "");
+      collectionChoice.binding.syncSelection("");
+      state.libraryChoice.syncSelection(libraryValue);
+      void (async () => {
+        await loadCollections(library ? library.id : null);
+        resetCatalogScope();
+      })();
+    });
+    collectionSelect.addEventListener("change", () => {
+      const collectionID = getValue(collectionSelect);
+      const collection = state.collections.find(entry =>
+        String(entry.id) === collectionID);
+      if (collection) {
+        setValue(librarySelect, String(collection.libraryID));
+        libraryChoice.binding.syncSelection(getValue(librarySelect));
+      }
+      collectionChoice.binding.syncSelection(collectionID);
+      resetCatalogScope();
     });
     notesInput.addEventListener("input", scheduleNotesSave);
     attachmentSelect.addEventListener("change", () => {
@@ -2649,12 +3139,34 @@
             + (event.key === "ArrowRight" ? 4 : -4),
         ),
       );
-      state.splitPercent = width;
-      readingGrid.setAttribute(
-        "style",
-        `grid-template-columns: minmax(0, ${width}fr) 6px minmax(0, ${100 - width}fr);`,
-      );
+      setSplitPercent(width);
     });
+    let dragStartX = null;
+    let dragStartPercent = 52;
+    const finishSplitDrag = () => {
+      dragStartX = null;
+      setClass(splitter, "rr-splitter");
+    };
+    splitter.addEventListener("pointerdown", event => {
+      if (event.button != null && event.button !== 0) return;
+      event.preventDefault();
+      dragStartX = Number(event.clientX) || 0;
+      dragStartPercent = state.splitPercent || 52;
+      setClass(splitter, "rr-splitter dragging");
+      splitter.setPointerCapture?.(event.pointerId);
+    });
+    splitter.addEventListener("pointermove", event => {
+      if (dragStartX == null || !readingGrid.getBoundingClientRect) return;
+      const rect = readingGrid.getBoundingClientRect();
+      if (!rect || !rect.width) return;
+      const delta = (Number(event.clientX) - dragStartX) / rect.width * 100;
+      setSplitPercent(dragStartPercent + delta);
+    });
+    splitter.addEventListener("pointerup", finishSplitDrag);
+    splitter.addEventListener("pointercancel", finishSplitDrag);
+    bindChoiceOutsideDismiss();
+    renderCollectionTree();
+    renderCatalogScope();
     setBusy(false);
   }
   function setCatalogFilter(focusOnly) {
@@ -2667,18 +3179,97 @@
       "rr-filter" + (focusOnly ? " active" : ""));
     void loadCatalog();
   }
+  function resetCatalogScope() {
+    state.catalog.offset = 0;
+    state.catalog.items = [];
+    state.catalog.total = 0;
+    state.catalog.query = getValue(state.searchInput).trim();
+    renderCatalogScope();
+    renderCollectionTree();
+    void loadCatalog();
+  }
+  async function selectLibrary(library) {
+    if (!state || !library) return;
+    setValue(state.librarySelect, String(library.id));
+    setValue(state.collectionSelect, "");
+    state.libraryChoice.syncSelection(getValue(state.librarySelect));
+    state.collectionChoice.syncSelection("");
+    await loadCollections(library.id);
+    resetCatalogScope();
+  }
+  async function selectCollection(collection) {
+    if (!state || !collection) return;
+    try {
+      await flushPendingEdits();
+    }
+    catch (error) {
+      setStatus(
+        state.globalStatus,
+        `切换已取消：当前笔记保存失败（${safeError(error).message}）。`,
+        "error",
+      );
+      return;
+    }
+    setValue(state.librarySelect, String(collection.libraryID));
+    setValue(state.collectionSelect, String(collection.id));
+    state.libraryChoice.syncSelection(getValue(state.librarySelect));
+    state.collectionChoice.syncSelection(getValue(state.collectionSelect));
+    resetCatalogScope();
+  }
+  function setSplitPercent(value) {
+    if (!state) return;
+    const width = Math.max(28, Math.min(72, Number(value) || 52));
+    state.splitPercent = width;
+    state.readingGrid.setAttribute(
+      "style",
+      `grid-template-columns: minmax(0, ${width}fr) 6px minmax(0, ${100 - width}fr);`,
+    );
+    if (pdfResizeTimer != null) clearTimeout(pdfResizeTimer);
+    pdfResizeTimer = setTimeout(() => {
+      pdfResizeTimer = null;
+      if (state && state.pdfController) {
+        try { void state.pdfController.setZoom("page-width"); }
+        catch (error) { logError("resize PDF", error); }
+      }
+    }, 120);
+  }
+  function selectedHostScope() {
+    try {
+      const win = Zotero.getMainWindow();
+      const pane = win && win.ZoteroPane;
+      if (!pane) return null;
+      const libraryID = typeof pane.getSelectedLibraryID === "function"
+        ? Number(pane.getSelectedLibraryID()) : null;
+      const collection = typeof pane.getSelectedCollection === "function"
+        ? pane.getSelectedCollection() : null;
+      if (collection && Number.isSafeInteger(Number(collection.id))) {
+        return {
+          libraryID: Number(collection.libraryID),
+          collectionID: Number(collection.id),
+        };
+      }
+      return Number.isSafeInteger(libraryID) && libraryID > 0
+        ? { libraryID, collectionID: null } : null;
+    }
+    catch (error) {
+      logError("read host collection scope", error);
+      return null;
+    }
+  }
   async function loadLibraries() {
     if (!state) return;
     try {
       const libraries = await state.service.listLibraries();
+      state.libraries = Array.isArray(libraries) ? libraries : [];
       state.librarySelect.replaceChildren();
+      state.libraryChoice.close(false);
       const all = currentDocument().createElementNS(
         XHTML_NS, "option",
       );
       setValue(all, "");
       all.textContent = "全部可访问文库";
       state.librarySelect.append(all);
-      for (const library of libraries) {
+      for (const library of state.libraries) {
         const option = currentDocument().createElementNS(
           XHTML_NS, "option",
         );
@@ -2687,12 +3278,120 @@
         state.librarySelect.append(option);
       }
       setValue(state.librarySelect, "");
+      state.libraryChoice.syncOptions();
+      const hostScope = selectedHostScope();
+      if (hostScope && state.libraries.some(
+        library => Number(library.id) === hostScope.libraryID,
+      )) {
+        setValue(state.librarySelect, String(hostScope.libraryID));
+        state.libraryChoice.syncSelection(getValue(state.librarySelect));
+        await loadCollections(hostScope.libraryID);
+        if (hostScope.collectionID
+            && state.collections.some(entry =>
+              Number(entry.id) === hostScope.collectionID)) {
+          setValue(state.collectionSelect, String(hostScope.collectionID));
+          state.collectionChoice.syncSelection(
+            getValue(state.collectionSelect),
+          );
+          const selected = state.collections.find(entry => entry.id === hostScope.collectionID);
+          let parent = state.collections.find(entry => entry.id === selected?.parentID);
+          const seen = new Set();
+          while (parent && !seen.has(parent.id)) {
+            seen.add(parent.id);
+            state.expandedCollections.add(parent.id);
+            parent = state.collections.find(entry => entry.id === parent.parentID);
+          }
+        }
+      }
+      else await loadCollections(null);
+      renderCollectionTree();
+      renderCatalogScope();
     }
     catch (error) {
       state.librarySelect.replaceChildren(
         make("option", null, "文库读取失败"),
       );
+      state.libraryChoice.syncOptions();
       setStatus(state.globalStatus, safeError(error).message, "error");
+    }
+  }
+  async function loadCollections(libraryID) {
+    if (!state) return;
+    const generation = ++collectionsGeneration;
+    state.collectionsLoading = true;
+    state.collectionsError = "";
+    renderCollectionTree();
+    try {
+      if (typeof state.service.listCollections !== "function") {
+        throw Object.assign(new Error("当前服务版本不支持收藏夹目录。"), {
+          code: "COLLECTIONS_UNAVAILABLE",
+        });
+      }
+      const rows = await state.service.listCollections({
+        libraryID: null,
+      });
+      if (!state || generation !== collectionsGeneration) return;
+      state.collections = Array.isArray(rows) ? rows.filter(row =>
+        row && Number.isSafeInteger(Number(row.id))
+        && Number.isSafeInteger(Number(row.libraryID))) : [];
+      state.collectionSelect.replaceChildren();
+      state.collectionChoice.close(false);
+      const root = currentDocument().createElementNS(
+        XHTML_NS, "option",
+      );
+      setValue(root, "");
+      root.textContent = "当前文库全部论文";
+      state.collectionSelect.append(root);
+      const visible = state.collections;
+      for (const collection of visible) {
+        const option = currentDocument().createElementNS(
+          XHTML_NS, "option",
+        );
+        setValue(option, String(collection.id));
+        const names = [];
+        const seen = new Set();
+        let current = collection;
+        while (current && !seen.has(current.id)) {
+          seen.add(current.id);
+          names.unshift(current.name || "未命名收藏夹");
+          current = state.collections.find(row => row.id === current.parentID
+            && row.libraryID === collection.libraryID);
+        }
+        const library = state.libraries.find(row => row.id === collection.libraryID);
+        option.textContent = [library?.name || "文库", ...names].join(" / ");
+        state.collectionSelect.append(option);
+      }
+      state.collectionChoice.syncOptions();
+      const selected = getValue(state.collectionSelect);
+      if (selected && !visible.some(entry =>
+        String(entry.id) === selected)) {
+        setValue(state.collectionSelect, "");
+        state.collectionChoice.syncSelection("");
+      }
+    }
+    catch (error) {
+      if (!state || generation !== collectionsGeneration) return;
+      const safe = safeError(error);
+      state.collections = [];
+      state.collectionsError = safe.message;
+      state.collectionSelect.replaceChildren();
+      const root = currentDocument().createElementNS(
+        XHTML_NS, "option",
+      );
+      setValue(root, "");
+      root.textContent = "当前文库全部论文";
+      state.collectionSelect.append(root);
+      state.collectionChoice.syncOptions();
+      if (!["COLLECTIONS_UNAVAILABLE"].includes(safe.code)) {
+        setStatus(state.globalStatus, safe.message, "error");
+      }
+    }
+    finally {
+      if (state && generation === collectionsGeneration) {
+        state.collectionsLoading = false;
+        renderCollectionTree();
+        renderCatalogScope();
+      }
     }
   }
   function start(options = {}) {
@@ -2731,6 +3430,12 @@
       if (selected) await selectItem(selected);
     })();
     targetWindow.addEventListener("unload", () => {
+      closeOpenChoices();
+      disposeChoices(targetDocument.documentElement);
+      catalogGeneration++;
+      collectionsGeneration++;
+      if (pdfResizeTimer != null) clearTimeout(pdfResizeTimer);
+      pdfResizeTimer = null;
       void flushPendingEdits().catch(error => logError("save edits on close", error));
       if (noteTimer) clearTimeout(noteTimer);
       if (checklistTimer) clearTimeout(checklistTimer);

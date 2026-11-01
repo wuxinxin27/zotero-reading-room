@@ -6,7 +6,7 @@ A local-first, experimental Zotero 10 reading companion. The latest released ver
 
 - Manually select **Unread / To read / Reading / Read / Parked**. Completed analysis never means the user has read or fully reviewed the paper.
 - Record local notes and a reading checklist; show bibliographic metadata, local PDFs, and note/annotation counts.
-- Browse every accessible Zotero library, search and page through papers, select a library, filter focused papers, and switch quickly among focused-paper chips. The navigation pane collapses.
+- Browse the original library, collection and subcollection hierarchy, including empty collections. Filter direct collection members, search/page within scope and switch among global focused-paper chips. Collapsing navigation gives its width back to the reading panes.
 - Read local source PDFs in a left pane and AI analysis plus notes in a right pane, with a keyboard-adjustable splitter and stacked narrow layout. Evidence buttons jump to physical PDF pages and attempt to highlight literal text. Missing page numbers are never guessed.
 - AI analysis returns a natural overview, a reading guide, six source-backed dimensions, and text references to figures and tables. Figure cards lazily render the “source page containing the reference”; they do not claim a precise crop or visual interpretation.
 - OpenAI-compatible, Anthropic Messages, Google Gemini, and native Ollama configurations are independent from analysis. Analysis is cached per paper and attachment and is reused without a model request; only an explicit reanalysis sets `force: true`.

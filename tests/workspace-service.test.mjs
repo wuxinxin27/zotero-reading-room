@@ -46,6 +46,172 @@ test("all accessible libraries expose only regular metadata with bounded paging,
   assert.equal(h.calls.noteSaves, 0);
 });
 
+test("collection metadata preserves nested and empty folders across accessible read-only libraries", async () => {
+  const h = createHarness();
+  h.libraries.set(2, { libraryID: 2, name: "Synthetic group", libraryType: "group", editable: false });
+  h.libraries.set(3, { libraryID: 3, name: "Hidden feed", libraryType: "feed" });
+  for (const collection of [
+    { id: 10, key: "FOLDER10", libraryID: 1, name: "Research", parentID: false },
+    { id: 11, key: "FOLDER11", libraryID: 1, name: "Zulu child", parentID: 10 },
+    { id: 12, key: "FOLDER12", libraryID: 1, name: "Alpha empty", parentID: 10 },
+    { id: 13, key: "FOLDER13", libraryID: 1, name: "Nested empty", parentID: 12 },
+    { id: 20, key: "FOLDER10", libraryID: 2, name: "Read-only folder", parentID: null },
+    { id: 30, key: "FOLDER30", libraryID: 3, name: "Hidden folder", parentID: null }
+  ]) h.collections.set(collection.id, collection);
+  const queried = [];
+  const getAllIDs = h.Zotero.Collections.getAllIDs;
+  h.Zotero.Collections.getAllIDs = async id => { queried.push(id); return getAllIDs(id); };
+  const collections = plain(await h.service.listCollections());
+  assert.deepEqual(collections.map(row => row.id), [12, 13, 10, 11, 20]);
+  assert.deepEqual(collections.find(row => row.id === 10), { id: 10, key: "FOLDER10", libraryID: 1, name: "Research", parentID: null });
+  assert.equal(collections.find(row => row.id === 13).parentID, 12);
+  assert.deepEqual(collections.filter(row => row.parentID === 10).map(row => row.name), ["Alpha empty", "Zulu child"]);
+  assert.deepEqual(queried, [1, 2]);
+  assert.deepEqual(plain(await h.service.listCollections({ libraryID: "2" })), [collections[4]]);
+  assert.equal((await h.service.listPapers({ libraryID: 1, collectionID: 13 })).total, 0);
+  await assert.rejects(h.service.listCollections({ libraryID: 3 }), { code: "LIBRARY_UNAVAILABLE" });
+  assert.equal(h.calls.writes.length, 0);
+  assert.equal(h.calls.extracts, 0);
+  assert.equal(h.calls.requests.length, 0);
+});
+
+test("deleted, missing and cross-library parents never create dangling or cyclic collection hierarchies", async () => {
+  const h = createHarness();
+  h.libraries.set(2, { libraryID: 2, libraryType: "group", editable: false });
+  for (const collection of [
+    { id: 10, key: "FOLDER10", libraryID: 1, name: "Trashed", parentID: null, deleted: true },
+    { id: 11, key: "FOLDER11", libraryID: 1, name: "Child of trash", parentID: 10 },
+    { id: 12, key: "FOLDER12", libraryID: 1, name: "Missing parent", parentID: 999 },
+    { id: 13, key: "FOLDER13", libraryID: 1, name: "Cross library", parentID: 20 },
+    { id: 14, key: "FOLDER14", libraryID: 1, name: "Self cycle", parentID: 14 },
+    { id: 15, key: "FOLDER15", libraryID: 1, name: "Cycle A", parentID: 16 },
+    { id: 16, key: "FOLDER16", libraryID: 1, name: "Cycle B", parentID: 17 },
+    { id: 17, key: "FOLDER17", libraryID: 1, name: "Cycle C", parentID: 15 },
+    { id: 20, key: "FOLDER20", libraryID: 2, name: "Group root", parentID: null }
+  ]) h.collections.set(collection.id, collection);
+  const originals = plain([...h.collections.values()]);
+  const rows = plain(await h.service.listCollections());
+  const byID = new Map(rows.map(row => [row.id, row]));
+  assert.equal(byID.has(10), false);
+  for (const id of [11, 12, 13, 14]) assert.equal(byID.get(id).parentID, null);
+  assert.equal([15, 16, 17].filter(id => byID.get(id).parentID === null).length, 1);
+  for (const row of rows) {
+    const seen = new Set();
+    let current = row;
+    while (current) {
+      assert.equal(seen.has(current.id), false);
+      seen.add(current.id);
+      const parent = byID.get(current.parentID);
+      if (parent) assert.equal(parent.libraryID, row.libraryID);
+      current = parent;
+    }
+  }
+  assert.deepEqual(plain([...h.collections.values()]), originals);
+  assert.deepEqual(plain(await h.service.listCollections()), rows);
+});
+
+test("collection paper filters use direct membership before search, focus and paging without duplicate cards", async () => {
+  const h = createHarness();
+  h.libraries.set(2, { libraryID: 2, name: "Read-only group", libraryType: "group", editable: false });
+  for (const collection of [
+    { id: 10, key: "FOLDER10", libraryID: 1, name: "Parent", parentID: null },
+    { id: 11, key: "FOLDER11", libraryID: 1, name: "Child", parentID: 10 },
+    { id: 20, key: "FOLDER20", libraryID: 2, name: "Group", parentID: null }
+  ]) h.collections.set(collection.id, collection);
+  h.parent.collections = [10, 11];
+  for (const [id, title, collections, libraryID, deleted] of [
+    [3, "Alpha direct paper", [10], 1, false],
+    [4, "Beta descendant paper", [11], 1, false],
+    [5, "Deleted direct paper", [10], 1, true],
+    [9, "Group paper", [20], 2, false]
+  ]) h.records.set(id, { ...h.parent, id, key: id === 9 ? h.parent.key : "PAPER00" + id, libraryID, deleted, collections,
+    fields: { ...h.parent.fields, title } });
+  await h.service.setFocused(h.parent, true);
+  await h.service.setFocused(h.records.get(4), true);
+  h.service._document.items["1:PAPER001"].analysis = { id: "cached-analysis", mode: "model" };
+  const getAll = h.Zotero.Items.getAll;
+  h.Zotero.Items.getAll = async id => [...await getAll(id), h.parent, h.records.get(9)];
+  const direct = await h.service.listPapers({ libraryID: "1", collectionID: "10" });
+  assert.deepEqual(plain(direct.items.map(item => item.id)), [1, 3]);
+  assert.equal(direct.total, 2);
+  assert.equal(direct.items[0].hasAnalysis, true);
+  const page = await h.service.listPapers({ collectionID: 10, query: "direct", offset: 1, limit: 1 });
+  assert.equal(page.total, 1);
+  assert.equal(page.items.length, 0);
+  const second = await h.service.listPapers({ collectionID: 10, offset: 1, limit: 1 });
+  assert.equal(second.total, 2);
+  assert.deepEqual(plain(second.items.map(item => item.id)), [3]);
+  assert.deepEqual(plain((await h.service.listPapers({ collectionID: 11, query: "descendant" })).items.map(item => item.id)), [4]);
+  assert.deepEqual(plain((await h.service.listPapers({ collectionID: 10, focusOnly: true })).items.map(item => item.id)), [1]);
+  assert.deepEqual(plain((await h.service.listPapers({ collectionID: 20 })).items.map(item => item.id)), [9]);
+  assert.equal((await h.service.listPapers({ libraryID: 2, collectionID: 20, focusOnly: true })).total, 0);
+  assert.equal((await h.service.listPapers({ libraryID: 1, collectionID: null })).total, 3);
+  assert.equal((await h.service.listPapers()).total, 4);
+  assert.equal(h.service.getState(h.parent).analysis.id, "cached-analysis");
+  assert.equal(h.calls.extracts, 0);
+  assert.equal(h.calls.requests.length, 0);
+});
+
+test("invalid or inaccessible collection IDs fail closed within the selected accessible library", async () => {
+  const h = createHarness();
+  h.libraries.set(2, { libraryID: 2, libraryType: "group", editable: false });
+  h.libraries.set(3, { libraryID: 3, libraryType: "feed" });
+  for (const collection of [
+    { id: 10, key: "FOLDER10", libraryID: 1, name: "Personal", parentID: null },
+    { id: 11, key: "FOLDER11", libraryID: 1, name: "Deleted", parentID: null, deleted: true },
+    { id: 20, key: "FOLDER20", libraryID: 2, name: "Group", parentID: null },
+    { id: 30, key: "FOLDER30", libraryID: 3, name: "Hidden", parentID: null },
+    { id: 40, key: "FOLDER40", libraryID: 4, name: "Unregistered", parentID: null }
+  ]) h.collections.set(collection.id, collection);
+  const queried = [];
+  const getAllIDs = h.Zotero.Collections.getAllIDs;
+  h.Zotero.Collections.getAllIDs = async id => { queried.push(id); return getAllIDs(id); };
+  h.Zotero.Items.getAll = async () => { throw new Error("invalid scope must not read any items"); };
+  for (const collectionID of [0, -1, "bad", 1.5, true, [], [10], {}, 11, 20, 30, 40, 999]) {
+    await assert.rejects(h.service.listPapers({ libraryID: 1, collectionID }), { code: "COLLECTION_UNAVAILABLE" });
+  }
+  for (const collectionID of [11, 30, 40, 999]) {
+    await assert.rejects(h.service.listPapers({ collectionID }), { code: "COLLECTION_UNAVAILABLE" });
+  }
+  assert.ok(queried.every(id => [1, 2].includes(id)));
+  await assert.rejects(h.service.listPapers({ libraryID: 3, collectionID: 30 }), { code: "LIBRARY_UNAVAILABLE" });
+  assert.equal(h.calls.writes.length, 0);
+});
+
+test("collection membership loads its item datatype through bulk and individual adapters", async () => {
+  for (const bulk of [true, false]) {
+    const h = createHarness();
+    h.collections.set(10, { id: 10, key: "FOLDER10", libraryID: 1, name: "Synthetic", parentID: null });
+    h.parent.collections = [10];
+    const loaded = [];
+    h.parent.inCollection = function (id) {
+      assert.ok(loaded.includes("collections"), "collections must load before direct membership");
+      return this.collections.includes(id);
+    };
+    if (bulk) {
+      h.Zotero.Items.loadDataTypes = async (items, types) => {
+        assert.deepEqual(plain(items.map(item => item.id)), [1]);
+        loaded.push(...types);
+      };
+      h.parent.loadDataType = () => { throw new Error("must use skip-loaded bulk adapter"); };
+    }
+    else h.parent.loadDataType = async type => { loaded.push(type); };
+    const result = await h.service.listPapers({ collectionID: 10 });
+    assert.equal(result.items[0].id, 1);
+    assert.deepEqual(plain(loaded), ["itemData", "creators", "collections"]);
+    assert.equal(h.parent.fields.title, "A Synthetic Calibration Study");
+    assert.equal(h.calls.writes.length, 0);
+  }
+});
+
+test("missing collection APIs report a scoped error while all-paper listing stays available", async () => {
+  const h = createHarness();
+  delete h.Zotero.Collections;
+  assert.equal((await h.service.listPapers()).total, 1);
+  await assert.rejects(h.service.listCollections(), { code: "COLLECTIONS_UNAVAILABLE" });
+  await assert.rejects(h.service.listPapers({ collectionID: 10 }), { code: "COLLECTIONS_UNAVAILABLE" });
+});
+
 test("pre-existing schema v1 notes, checklist and legacy extractive results survive focus migration", async () => {
   const h = createHarness({ configured: false });
   const legacy = { schemaVersion: 1, status: "reading", notes: "legacy notes", checklist: { theory: true },

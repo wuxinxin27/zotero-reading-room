@@ -2,6 +2,10 @@
 
 ## Unreleased — reading workspace
 
+- Fix Zotero chrome-window dropdowns with in-document listboxes, solid popup surfaces, real DOM change events, HTMLCollection-compatible option enumeration, keyboard navigation and popup cleanup; refresh PDF choices after each paper loads.
+- Preserve library and nested collection hierarchy, including empty collections, and filter the catalog by direct collection membership while keeping global focused-paper shortcuts.
+- Reclaim navigation space at the root grid when collapsed, re-fit the PDF to the wider pane and preserve the source/AI split ratio. Add installed-host API and native UI verification records.
+
 - Replace extractive prereading with AI-only analysis. Model output now includes a natural overview, reading guide, verified six-dimension evidence and figure/table text references; legacy extractive results remain only as archived records that prompt for replacement.
 - Add a searchable cross-library paper catalog with library selection, all/focused filters, paging, focused-paper chips and a collapsible navigation pane. Focus state uses library ID plus item key and remains local.
 - Add side-by-side embedded source and AI reading, with a keyboard-adjustable splitter and a stacked layout for narrow windows. Evidence buttons jump to physical PDF pages and attempt text highlighting; missing page numbers are never guessed.

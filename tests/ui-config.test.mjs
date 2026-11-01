@@ -31,6 +31,7 @@ class Element {
     this.disabled = false;
     this.focused = false;
     this.src = "";
+    this.style = { display: "", gridTemplateColumns: "" };
   }
   setAttribute(name, value) {
     const text = String(value);
@@ -103,6 +104,12 @@ class Element {
     this.focused = true;
     this.dispatchEvent({ type: "focus", target: this });
   }
+  contains(node) {
+    return node === this || this.children.some(child => child.contains?.(node));
+  }
+  getBoundingClientRect() {
+    return { left: 0, right: 1000, top: 0, bottom: 800, width: 1000, height: 800 };
+  }
   click() { this.dispatchEvent({ type: "click", target: this }); }
   setAttributeNS(_namespace, name, value) {
     this.setAttribute(name, value);
@@ -118,8 +125,36 @@ class Document {
     this.body = new Element(this, "body");
     this.documentElement.append(this.head, this.body);
     this.title = "";
+    this.listeners = new Map();
   }
-  createElementNS(_namespace, name) { return new Element(this, name); }
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+  dispatchEvent(event) {
+    event.target ||= this;
+    for (const listener of [...(this.listeners.get(event.type) || [])]) listener(event);
+    return true;
+  }
+  createElementNS(_namespace, name) {
+    const element = new Element(this, name);
+    if (name === "select") {
+      let values = element.children;
+      // HTMLCollection is iterable and array-like, but is not an Array.
+      const collection = new Proxy({}, {
+        get(_target, key) {
+          const value = values[key];
+          return typeof value === "function" ? value.bind(values) : value;
+        },
+      });
+      Object.defineProperty(element, "children", {
+        get() { return collection; },
+        set(next) { values = Array.from(next); },
+      });
+    }
+    return element;
+  }
   getElementsByTagNameNS(_namespace, name) {
     if (name === "head") return [this.head];
     if (name === "body") return [this.body];
@@ -134,6 +169,27 @@ function descendants(root, predicate) {
     found.push(...descendants(child, predicate));
   }
   return found;
+}
+function choice(root, label) {
+  const trigger = descendants(root, node => node.localName === "button"
+    && node.getAttribute("aria-label") === label
+    && node.getAttribute("aria-haspopup") === "listbox")[0];
+  assert.ok(trigger, `missing choice ${label}`);
+  const menu = descendants(root, node => node.localName === "div"
+    && node.getAttribute("role") === "listbox"
+    && node.getAttribute("id") === trigger.getAttribute("aria-controls"))[0];
+  assert.ok(menu, `missing listbox ${label}`);
+  return { trigger, menu };
+}
+function choose(root, label, optionText) {
+  const { trigger, menu } = choice(root, label);
+  trigger.click();
+  const option = descendants(menu, node => node.localName === "button"
+    && node.getAttribute("role") === "option"
+    && node.textContent === optionText)[0];
+  assert.ok(option, `missing option ${optionText}`);
+  option.click();
+  return trigger;
 }
 function button(root, text) {
   return descendants(root, node => node.localName === "button"
@@ -201,7 +257,13 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
   }
   const win = {
     document,
+    Event: class DOMEvent {
+      constructor(type, options = {}) { this.type = type; Object.assign(this, options); }
+      preventDefault() {}
+      stopPropagation() {}
+    },
     AbortController: FakeAbortController,
+    requestAnimationFrame(callback) { callback(); return 1; },
     setTimeout(callback) {
       timers.push(callback);
       return timers.length;
@@ -213,6 +275,7 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
       windowListeners.set(type, listeners);
     },
   };
+  document.defaultView = win;
   const papers = [
     paper(1, "Synthetic Alpha"),
     paper(2, "Synthetic Beta", true),
@@ -247,12 +310,34 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
       };
     },
     async listLibraries() {
-      return [{ id: 1, name: "Synthetic Library",
-        type: "user", editable: true }];
+      return [
+        { id: 1, name: "Synthetic Library",
+          type: "user", editable: true },
+        { id: 7, name: "Synthetic Group",
+          type: "group", editable: false },
+      ];
+    },
+    async listCollections(options = {}) {
+      calls.push({ type: "listCollections", options });
+      return [
+        { id: 11, key: "COL11", libraryID: 1,
+          name: "Methods", parentID: null },
+        { id: 12, key: "COL12", libraryID: 1,
+          name: "Nested", parentID: 11 },
+        { id: 13, key: "COL13", libraryID: 1,
+          name: "Empty folder", parentID: null },
+        { id: 71, key: "COL71", libraryID: 7,
+          name: "Group folder", parentID: null },
+      ].filter(row => options.libraryID == null
+        || row.libraryID === options.libraryID);
     },
     async listPapers(options) {
       calls.push({ type: "listPapers", options });
       let items = papers.map(entry => ({ ...entry }));
+      if (options.collectionID === 12) {
+        items = items.filter(entry => entry.id === 3);
+      }
+      else if (options.collectionID === 13) items = [];
       if (options.focusOnly) items = items.filter(entry => entry.focused);
       if (options.query) {
         items = items.filter(entry =>
@@ -371,7 +456,14 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
         userLibraryID: 1,
       },
       getMainWindows() { return []; },
-      getMainWindow() { return win; },
+      getMainWindow() {
+        return {
+          ZoteroPane: {
+            getSelectedLibraryID() { return 1; },
+            getSelectedCollection() { return { id: 11, libraryID: 1 }; },
+          },
+        };
+      },
       Items: { get(id) { return parents.get(Number(id)) || null; } },
       Reader: { async open() {} },
       debug() {},
@@ -445,7 +537,8 @@ test("workspace uses catalog and prior analysis without model request", async ()
     call => call.type === "listConfiguredModels"), false);
   const listCalls = h.service.calls.filter(
     call => call.type === "listPapers");
-  assert.ok(listCalls.some(call => call.options.libraryID === null));
+  assert.ok(listCalls.some(call => call.options.libraryID === 1
+    && call.options.collectionID === 11));
 });
 
 test("AI button analyzes directly and handles preparing state", async () => {
@@ -553,7 +646,6 @@ test("settings load config without exposing plaintext key", async () => {
 test("host or provider change clears key, permissions, and models", async () => {
   const h = await fixture();
   const dialog = await h.openSettings();
-  const provider = fieldByText(dialog, "AI 协议").children[1];
   const endpoint = fieldByText(dialog, "API 端点").children[1];
   const key = fieldByText(dialog, "API 密钥").children[1];
   key.value = "synthetic-memory-key";
@@ -569,12 +661,57 @@ test("host or provider change clears key, permissions, and models", async () => 
     permission.checked = true;
     permission.dispatchEvent({ type: "change", target: permission });
   }
-  provider.value = "anthropic";
-  provider.dispatchEvent({ type: "change", target: provider });
+  choose(dialog, "AI 协议", "Anthropic Messages");
   assert.equal(key.value, "");
   assert.ok(permissions.every(permission => !permission.checked));
   assert.equal(descendants(dialog,
     node => node.textContent === "Synthetic A").length, 0);
+});
+
+test("visible AI protocol listbox changes the backing value by click and keyboard", async () => {
+  const h = await fixture();
+  const dialog = await h.openSettings();
+  const { trigger, menu } = choice(dialog, "AI 协议");
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+  trigger.click();
+  assert.equal(trigger.getAttribute("aria-expanded"), "true");
+  assert.equal(menu.hasAttribute("hidden"), false);
+  const anthropic = descendants(menu,
+    node => node.getAttribute("role") === "option"
+      && node.textContent === "Anthropic Messages")[0];
+  assert.ok(anthropic);
+  const backing = descendants(dialog, node => node.localName === "select"
+    && node.getAttribute("aria-label") === "AI 协议")[0];
+  assert.equal(Array.isArray(backing.children), false);
+  let changeEvent;
+  backing.addEventListener("change", event => { changeEvent = event; });
+  anthropic.click();
+  assert.ok(changeEvent instanceof h.document.defaultView.Event);
+  assert.equal(changeEvent.bubbles, true);
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+  assert.equal(trigger.children[0].textContent, "Anthropic Messages");
+  const provider = descendants(dialog,
+    node => node.localName === "select"
+      && node.getAttribute("aria-label") === "AI 协议")[0];
+  assert.equal(provider.value, "anthropic");
+
+  trigger.click();
+  const gemini = descendants(menu,
+    node => node.getAttribute("role") === "option"
+      && node.textContent === "Google Gemini")[0];
+  menu.dispatchEvent({ type: "keydown", key: "ArrowDown",
+    target: gemini, preventDefault() {}, stopPropagation() {} });
+  menu.dispatchEvent({ type: "keydown", key: "Enter",
+    target: gemini, preventDefault() {}, stopPropagation() {} });
+  assert.equal(provider.value, "gemini");
+  assert.equal(gemini.getAttribute("tabindex"), "0");
+  assert.equal(trigger.focused, true);
+
+  trigger.click();
+  menu.dispatchEvent({ type: "keydown", key: "Escape",
+    target: menu, preventDefault() {}, stopPropagation() {} });
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+  assert.equal(trigger.focused, true);
 });
 
 test("remote consent saves current origin and provider together", async () => {
@@ -623,6 +760,153 @@ test("missing consentProvider does not restore remote permissions", async () => 
   const permissions = remoteRows.flatMap(row =>
     descendants(row, child => child.localName === "input"));
   assert.ok(permissions.every(permission => !permission.checked));
+});
+
+test("collection tree keeps nested and empty folders and scopes catalog selection", async () => {
+  const h = await fixture();
+  assert.ok(descendants(h.document.body,
+    node => node.textContent === "Synthetic Library").length);
+  assert.ok(descendants(h.document.body,
+    node => node.textContent === "Empty folder").length);
+  const methods = descendants(h.document.body,
+    node => node.localName === "button"
+      && node.textContent === "Methods")[0];
+  assert.ok(methods);
+  const toggle = descendants(h.document.body,
+    node => node.localName === "button"
+      && node.getAttribute("aria-label") === "展开 Methods")[0];
+  assert.ok(toggle);
+  toggle.click();
+  const expandedToggle = descendants(h.document.body,
+    node => node.localName === "button"
+      && node.getAttribute("aria-label") === "收起 Methods")[0];
+  assert.ok(expandedToggle);
+  assert.equal(expandedToggle.getAttribute("aria-expanded"), "true");
+  const nested = descendants(h.document.body,
+    node => node.localName === "button"
+      && node.textContent === "Nested")[0];
+  assert.ok(nested);
+  nested.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(descendants(h.document.body,
+    node => node.localName === "button"
+      && node.textContent === "Nested"
+      && node.getAttribute("aria-current") === "true").length);
+  const scoped = h.service.calls.filter(call =>
+    call.type === "listPapers"
+    && call.options.collectionID === 12).at(-1);
+  assert.ok(scoped);
+  assert.equal(scoped.options.libraryID, 1);
+  assert.ok(descendants(h.document.body,
+    node => node.textContent === "Synthetic Library / Methods / Nested").length);
+  assert.ok(descendants(h.document.body,
+    node => node.textContent === "Synthetic Gamma").length);
+  assert.equal(descendants(h.document.body,
+    node => node.textContent === "Synthetic Alpha").length, 0);
+});
+
+test("library trees never duplicate folders across libraries and remain available after selection", async () => {
+  const h = await fixture();
+  const libraries = descendants(h.document.body, node =>
+    node.classList.contains("rr-tree-library"));
+  assert.equal(libraries.length, 2);
+  assert.equal(descendants(libraries[0], node => node.textContent === "Group folder").length, 0);
+  assert.equal(descendants(libraries[1], node => node.textContent === "Methods").length, 0);
+  choose(h.document.body, "选择文库", "Synthetic Group · 群组");
+  await new Promise(resolve => setImmediate(resolve));
+  const personal = descendants(h.document.body, node => node.localName === "button"
+    && node.textContent === "Methods")[0];
+  assert.ok(personal, "other library tree must remain available");
+  personal.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(h.service.calls.some(call => call.type === "listPapers"
+    && call.options.libraryID === 1 && call.options.collectionID === 11));
+});
+
+test("attachment choices populate after selecting a paper", async () => {
+  const h = await fixture();
+  const { trigger, menu } = choice(h.document.body, "选择用于原文与分析的本地 PDF");
+  trigger.click();
+  const options = descendants(menu, node => node.getAttribute("role") === "option");
+  assert.equal(options.length, 1);
+  assert.equal(options[0].textContent, "Synthetic PDF");
+  options[0].click();
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+});
+
+test("focused-paper shortcuts survive selecting an empty collection", async () => {
+  const h = await fixture();
+  const empty = descendants(h.document.body, node => node.localName === "button"
+    && node.textContent === "Empty folder")[0];
+  empty.click();
+  await new Promise(resolve => setImmediate(resolve));
+  const chips = descendants(h.document.body, node => node.classList.contains("rr-focus-chip"));
+  assert.ok(chips.some(node => node.textContent === "Synthetic Beta"));
+  const query = h.service.calls.filter(call => call.type === "listPapers"
+    && call.options.focusOnly).at(-1).options;
+  assert.equal(query.libraryID, null);
+  assert.equal(query.collectionID, null);
+});
+
+test("scope switch flushes dirty notes and search resets page and scope", async () => {
+  const h = await fixture();
+  const notes = descendants(h.document.body,
+    node => node.localName === "textarea")[0];
+  notes.value = "scope switch must save";
+  notes.dispatchEvent({ type: "input", target: notes });
+  choose(h.document.body, "选择文库", "Synthetic Group · 群组");
+  await new Promise(resolve => setImmediate(resolve));
+  const groupFolder = descendants(h.document.body,
+    node => node.localName === "button"
+      && node.textContent === "Group folder")[0];
+  assert.ok(groupFolder);
+  groupFolder.click();
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  // Switching a directory scope updates only the catalog query; it does not
+  // replace the current paper, so dirty notes remain queued for paper switch.
+  const draft = descendants(h.document.body,
+    node => node.localName === "textarea")[0];
+  assert.equal(draft.value, "scope switch must save");
+  const scoped = h.service.calls.filter(call =>
+    call.type === "listPapers"
+    && call.options.libraryID === 7
+    && call.options.collectionID === 71).at(-1);
+  assert.ok(scoped);
+  const search = descendants(h.document.body,
+    node => node.localName === "input"
+      && node.getAttribute("type") === "search")[0];
+  search.value = "Gamma";
+  search.dispatchEvent({ type: "input", target: search });
+  const callback = h.timers.at(-1);
+  callback();
+  await new Promise(resolve => setImmediate(resolve));
+  const searched = h.service.calls.filter(call =>
+    call.type === "listPapers"
+    && call.options.query === "Gamma").at(-1);
+  assert.ok(searched);
+  assert.equal(searched.options.offset, 0);
+  assert.equal(searched.options.libraryID, 7);
+  assert.equal(searched.options.collectionID, 71);
+});
+
+test("navigation collapse updates the root workspace class and restores it", async () => {
+  const h = await fixture();
+  const workspace = descendants(h.document.body,
+    node => node.localName === "div"
+      && node.classList.contains("rr-workspace"))[0];
+  const navigation = descendants(h.document.body,
+    node => node.localName === "aside")[0];
+  assert.ok(workspace && navigation);
+  const collapse = button(h.document.body, "收起");
+  collapse.click();
+  assert.ok(workspace.classList.contains("navigation-collapsed"));
+  assert.ok(navigation.classList.contains("collapsed"));
+  assert.equal(collapse.getAttribute("aria-expanded"), "false");
+  collapse.click();
+  assert.equal(workspace.classList.contains("navigation-collapsed"), false);
+  assert.equal(navigation.classList.contains("collapsed"), false);
+  assert.equal(collapse.getAttribute("aria-expanded"), "true");
 });
 
 test("source uses safe DOM APIs and has no extractive mode entry", () => {

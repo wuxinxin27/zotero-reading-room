@@ -21,6 +21,7 @@ export function createHarness({ libraryType = "user", editable = true, files = n
   let nextID = 100;
   const library = { libraryID: 1, libraryType, editable };
   const libraries = new Map([[1, library]]);
+  const collections = new Map();
   const logins = [];
   const loginStore = {
     async searchLoginsAsync({ origin, httpRealm }) { return logins.filter(login => login.origin === origin && login.httpRealm === httpRealm); },
@@ -31,12 +32,13 @@ export function createHarness({ libraryType = "user", editable = true, files = n
     init(origin, formActionOrigin, httpRealm, username, password) { Object.assign(this, { origin, formActionOrigin, httpRealm, username, password }); }
   }
   const parent = {
-    id: 1, key: "PAPER001", libraryID: 1, itemTypeID: 1, deleted: false,
+    id: 1, key: "PAPER001", libraryID: 1, itemTypeID: 1, deleted: false, collections: [],
     fields: { title: "A Synthetic Calibration Study", date: "2025-04-08", DOI: "10.0000/synthetic", publicationTitle: "Synthetic Robotics" },
     isRegularItem() { return true; }, isAttachment() { return false; }, isNote() { return false; },
     isEditable() { return editable; },
     getField(name) { return this.fields[name] || ""; },
     getCreators() { return [{ firstName: "Test", lastName: "Author" }]; },
+    inCollection(id) { return this.collections.includes(id); },
     getAttachments() { return Array.from(records.values()).filter(item => item.parentItemID === this.id && item.isAttachment()).map(item => item.id); },
     getNotes() { return Array.from(records.values()).filter(item => item.parentItemID === this.id && item.isNote()).map(item => item.id); }
   };
@@ -89,6 +91,10 @@ export function createHarness({ libraryType = "user", editable = true, files = n
       async getByLibraryAndKeyAsync(libraryID, key) { return Array.from(records.values()).find(item => item.libraryID === libraryID && item.key === key); }
     },
     Libraries: { userLibraryID: 1, get(id) { return libraries.get(id); }, getAll() { return [...libraries.values()]; } },
+    Collections: {
+      async getAllIDs(libraryID) { return [...collections.values()].filter(collection => collection.libraryID === libraryID).map(collection => collection.id); },
+      async getAsync(ids) { return Array.isArray(ids) ? ids.map(id => collections.get(id)).filter(Boolean) : collections.get(ids); }
+    },
     OSKeyStore: {
       available: secureStorage,
       isEncrypted(value) { return typeof value === "string" && value.startsWith("oskv1:"); },
@@ -118,6 +124,6 @@ export function createHarness({ libraryType = "user", editable = true, files = n
   if (configured) service._document.aiConfig = { provider: "openai", endpoint: "http://127.0.0.1:11434/v1", model: "demo",
     allowRemoteDiscovery: false, allowRemoteAnalysis: false, consentOrigin: null, rememberKey: false, updatedAt: "2026-01-01T00:00:00Z" };
   return { service, Core: context.ReadingRoomCore, Service: context.ReadingRoomService, Zotero,
-    parent, attachment, files, io, records, calls, library, libraries, logins, loginStore, Note,
+    parent, attachment, files, io, records, calls, library, libraries, collections, logins, loginStore, Note,
     statePath: "/synthetic/zotero-data/reading-room/state-v1.json" };
 }

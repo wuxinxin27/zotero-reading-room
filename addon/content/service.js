@@ -408,21 +408,85 @@
           type: library.libraryType, editable: library.editable !== false }));
     }
 
-    async listPapers({ libraryID, query = "", focusOnly = false, offset = 0, limit = 80 } = {}) {
+    async _collectionObjects(libraries) {
+      const collections = this.Zotero.Collections;
+      if (!collections || typeof collections.getAllIDs !== "function" || typeof collections.getAsync !== "function") {
+        throw Core.error("COLLECTIONS_UNAVAILABLE", "无法读取 Zotero 分类目录。");
+      }
+      // Enumerate IDs rather than recursively walking descendants: empty folders and
+      // orphaned rows remain available, and a malformed parent cycle cannot recurse.
+      return (await Promise.all(libraries.map(async library => {
+        const ids = await collections.getAllIDs(library.id);
+        const objects = ids.length ? await collections.getAsync(ids) : [];
+        return objects.filter(collection => collection && !collection.deleted && collection.libraryID === library.id);
+      }))).flat();
+    }
+
+    async listCollections({ libraryID = null } = {}) {
       await this._ready();
       const libraries = await this.listLibraries();
       const id = libraryID == null ? null : Number(libraryID);
       if (id != null && !libraries.some(library => library.id === id)) throw Core.error("LIBRARY_UNAVAILABLE", "所选文库不可用。");
+      const collections = await this._collectionObjects(id == null ? libraries : libraries.filter(library => library.id === id));
+      const rows = collections.map(collection => ({ id: collection.id, key: collection.key, libraryID: collection.libraryID,
+        name: String(collection.name || ""), parentID: collection.parentID || null }));
+      rows.sort((a, b) => a.libraryID - b.libraryID || a.name.localeCompare(b.name) || a.id - b.id);
+      const byID = new Map(rows.map(row => [row.id, row]));
+      for (const row of rows) {
+        const parent = byID.get(row.parentID);
+        if (!parent || parent.libraryID !== row.libraryID || parent.id === row.id) row.parentID = null;
+      }
+      const checked = new Set();
+      for (const row of rows) {
+        const path = new Set();
+        let current = row;
+        while (current && !checked.has(current.id)) {
+          if (path.has(current.id)) {
+            current.parentID = null;
+            break;
+          }
+          path.add(current.id);
+          current = byID.get(current.parentID);
+        }
+        for (const entry of path) checked.add(entry);
+      }
+      return rows;
+    }
+
+    async listPapers({ libraryID, collectionID = null, query = "", focusOnly = false, offset = 0, limit = 80 } = {}) {
+      await this._ready();
+      const libraries = await this.listLibraries();
+      let id = libraryID == null ? null : Number(libraryID);
+      if (id != null && !libraries.some(library => library.id === id)) throw Core.error("LIBRARY_UNAVAILABLE", "所选文库不可用。");
       if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200
           || typeof query !== "string" || query.length > 1000) throw Core.error("INVALID_QUERY", "文库分页或搜索参数无效。");
+      let collection = null;
+      if (collectionID != null) {
+        const selectedID = Number(collectionID);
+        if (!["number", "string"].includes(typeof collectionID) || !Number.isSafeInteger(selectedID) || selectedID < 1) {
+          throw Core.error("COLLECTION_UNAVAILABLE", "所选分类不可用。");
+        }
+        const collections = await this._collectionObjects(id == null ? libraries : libraries.filter(library => library.id === id));
+        collection = collections.find(entry => entry.id === selectedID);
+        if (!collection) throw Core.error("COLLECTION_UNAVAILABLE", "所选分类不可用。");
+        id = collection.libraryID;
+      }
       const targets = id == null ? libraries.map(library => library.id) : [id];
-      const items = (await Promise.all(targets.map(target => this.Zotero.Items.getAll(target, true, false, false)))).flat().filter(isRegular);
-      if (typeof this.Zotero.Items.loadDataTypes === "function") await this.Zotero.Items.loadDataTypes(items, ["itemData", "creators"]);
+      const seen = new Set();
+      const items = (await Promise.all(targets.map(target => this.Zotero.Items.getAll(target, true, false, false)))).flat()
+        .filter(item => {
+          if (!isRegular(item) || !targets.includes(item.libraryID) || seen.has(item.id)) return false;
+          seen.add(item.id);
+          return true;
+        });
+      const dataTypes = collection ? ["itemData", "creators", "collections"] : ["itemData", "creators"];
+      if (typeof this.Zotero.Items.loadDataTypes === "function") await this.Zotero.Items.loadDataTypes(items, dataTypes);
       const terms = Core.normalizeText(query).toLocaleLowerCase().split(" ").filter(Boolean);
       const matches = [];
       for (const item of items) {
         if (focusOnly && this._stored(item).focused !== true) continue;
-        if (typeof this.Zotero.Items.loadDataTypes !== "function") await this._load(item, ["itemData", "creators"]);
+        if (typeof this.Zotero.Items.loadDataTypes !== "function") await this._load(item, dataTypes);
+        if (collection && !item.inCollection(collection.id)) continue;
         const metadata = this._metadata(item);
         const searchable = Core.normalizeText([metadata.title, ...metadata.creators, metadata.year, metadata.venue, metadata.doi, metadata.key, metadata.itemType].join(" ")).toLocaleLowerCase();
         if (!terms.every(term => searchable.includes(term))) continue;
