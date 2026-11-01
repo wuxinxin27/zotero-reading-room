@@ -1,13 +1,15 @@
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" windowtype="zotero:reading-room">
+<html xmlns="http://www.w3.org/1999/xhtml">
   <head>
     <meta charset="UTF-8" />
     <title>Reading Room · 论文阅读室</title>
     <script src="chrome://zotero/content/include.js"></script>
+    <link rel="stylesheet" href="room.css" />
     <style type="text/css">
       html, body {
         width: 100%;
         height: 100%;
+        min-width: 0;
         margin: 0;
         overflow: hidden;
         background: #f4f7f5;
@@ -30,6 +32,16 @@
         "use strict";
         var attempts = 0;
         var timer = setInterval(function () {
+          var context = window.ReadingRoomNativeContext || null;
+          try {
+            if (!context && window.parent && window.parent !== window) {
+              context = window.parent.ReadingRoomNativeContext || null;
+            }
+          }
+          catch (_) {}
+          if (context) {
+            document.documentElement.setAttribute("data-embedded", "true");
+          }
           var api = window.Zotero && window.Zotero.ReadingRoom;
           if (api && typeof api.mountWindow === "function") {
             clearInterval(timer);
@@ -37,7 +49,7 @@
               window.MozXULElement.insertFTLIfNeeded("reading-room.ftl");
             }
             catch (_) {}
-            api.mountWindow(window);
+            api.mountWindow(window, context && context.itemID, context);
             return;
           }
           if (++attempts >= 40) {

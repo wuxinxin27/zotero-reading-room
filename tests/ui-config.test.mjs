@@ -222,7 +222,13 @@ function paper(id, title, focused = false) {
   };
 }
 
-async function fixture({ cached = false, failAnalysis = null } = {}) {
+async function fixture({
+  cached = false,
+  failAnalysis = null,
+  batchFactory = null,
+  promptConfig = null,
+  initialBatchState = null,
+} = {}) {
   const windowListeners = new Map();
   const document = new Document();
   const timers = [];
@@ -283,8 +289,37 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
   ];
   const calls = [];
   const savedConfigs = [];
+  const promptSaves = [];
+  const promptResets = [];
+  const defaultSystemPrompt = "Default complete system prompt.";
+  const defaultSynthesisInstruction = "Default synthesis instruction.";
+  const defaultChatSystemPrompt = "Default complete chat system prompt.";
+  let currentPrompt = promptConfig || {
+    systemPrompt: defaultSystemPrompt,
+    synthesisInstruction: defaultSynthesisInstruction,
+    chatSystemPrompt: defaultChatSystemPrompt,
+    defaultSystemPrompt,
+    defaultSynthesisInstruction,
+    defaultChatSystemPrompt,
+    chatPromptHash: "default-chat-prompt-hash",
+    promptHash: "default-prompt-hash",
+    isCustom: false,
+    updatedAt: null,
+  };
+  let batchState = {
+    id: null,
+    status: "idle",
+    force: false,
+    entries: [],
+    counts: {
+      total: 0, queued: 0, running: 0, reused: 0,
+      succeeded: 0, failed: 0, cancelled: 0,
+    },
+  };
+  if (initialBatchState) batchState = initialBatchState;
   const cachedAnalysis = {
     mode: "model",
+    source: { attachmentKey: "ATTACH01" },
     model: "cached-model",
     provider: "openai",
     createdAt: "2026-10-31T00:00:00.000Z",
@@ -300,6 +335,8 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
   const service = {
     calls,
     savedConfigs,
+    promptSaves,
+    promptResets,
     normalizeItem(item) { return item || null; },
     getState() {
       return {
@@ -379,8 +416,40 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
         status: patch.status || "unread",
         notes: patch.notes || "",
         checklist: patch.checklist || {},
+        tagSync: Object.hasOwn(patch, "status") ? {
+          status: "synced", tag: `阅读室/${patch.status}`,
+        } : undefined,
         analysis: null,
       };
+    },
+    async getConversation(item, options) {
+      calls.push({ type: "getConversation", item, options });
+      return {
+        attachmentID: options.attachmentID,
+        attachmentKey: "ATTACH01",
+        messages: [],
+      };
+    },
+    async askPaper(item, question, options) {
+      calls.push({ type: "askPaper", item, question, options });
+      options.onProgress?.({ status: "extracting", detail: "extracting synthetic text" });
+      return {
+        attachmentID: options.attachmentID,
+        attachmentKey: "ATTACH01",
+        messages: [
+          { id: "u1", role: "user", content: question,
+            createdAt: "2026-11-01T03:00:00.000Z" },
+          { id: "a1", role: "assistant", content: "Synthetic grounded answer.",
+            createdAt: "2026-11-01T03:00:01.000Z", grounded: true,
+            verificationNotice: "Synthetic verification notice.",
+            evidence: [{ quote: "Synthetic source quote", pageIndex: 4,
+              attachmentKey: "ATTACH01", verified: true }] },
+        ],
+      };
+    },
+    cancelChat(item) {
+      calls.push({ type: "cancelChat", item });
+      return true;
     },
     async getReaderAttachment() {
       return {
@@ -400,6 +469,86 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
       return cachedAnalysis;
     },
     cancelAnalysis() { return false; },
+    async getPromptConfig() {
+      calls.push({ type: "getPromptConfig" });
+      return { ...currentPrompt };
+    },
+    async savePromptConfig(input) {
+      calls.push({ type: "savePromptConfig", input });
+      promptSaves.push({ ...input });
+      currentPrompt = {
+        ...input,
+        defaultSystemPrompt,
+        defaultSynthesisInstruction,
+        defaultChatSystemPrompt,
+        chatPromptHash: "custom-chat-prompt-hash",
+        promptHash: "custom-prompt-hash",
+        isCustom: input.systemPrompt !== defaultSystemPrompt
+          || input.synthesisInstruction !== defaultSynthesisInstruction,
+        updatedAt: "2026-11-01T01:00:00.000Z",
+      };
+      return { ...currentPrompt };
+    },
+    async resetPromptConfig() {
+      calls.push({ type: "resetPromptConfig" });
+      promptResets.push(true);
+      currentPrompt = {
+        systemPrompt: defaultSystemPrompt,
+        synthesisInstruction: defaultSynthesisInstruction,
+        chatSystemPrompt: defaultChatSystemPrompt,
+        defaultSystemPrompt,
+        defaultSynthesisInstruction,
+        defaultChatSystemPrompt,
+        chatPromptHash: "default-chat-prompt-hash",
+        promptHash: "default-prompt-hash",
+        isCustom: false,
+        updatedAt: "2026-11-01T02:00:00.000Z",
+      };
+      return { ...currentPrompt };
+    },
+    getBatchState() {
+      return JSON.parse(JSON.stringify(batchState));
+    },
+    async analyzeBatch(items, options) {
+      calls.push({ type: "analyzeBatch", items, options });
+      if (batchFactory) {
+        return batchFactory({
+          items,
+          options,
+          service: this,
+          setState(value) { batchState = value; },
+        });
+      }
+      const entries = items.map(item => {
+        const id = typeof item === "number" ? item : item.itemID;
+        const metadata = papers.find(entry => entry.id === id);
+        return {
+          itemID: id,
+          libraryID: 1,
+          key: metadata.key,
+          title: metadata.title,
+          status: "succeeded",
+        };
+      });
+      batchState = {
+        id: "batch-test",
+        status: "completed",
+        force: options.force,
+        entries,
+        counts: {
+          total: entries.length, queued: 0, running: 0, reused: 0,
+          succeeded: entries.length, failed: 0, cancelled: 0,
+        },
+        startedAt: "2026-11-01T01:00:00.000Z",
+        finishedAt: "2026-11-01T01:01:00.000Z",
+      };
+      options.onProgress?.(JSON.parse(JSON.stringify(batchState)));
+      return JSON.parse(JSON.stringify(batchState));
+    },
+    cancelBatch() {
+      calls.push({ type: "cancelBatch" });
+      return batchState.status === "running";
+    },
     async getAIConfig() {
       return {
         provider: "openai",
@@ -500,6 +649,11 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
     window: win,
     document,
     itemID: 2,
+    nativeContext: {
+      embedded: true,
+      itemID: 2,
+      tabID: "reader-tab-2",
+    },
   });
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
@@ -514,6 +668,17 @@ async function fixture({ cached = false, failAnalysis = null } = {}) {
     async openSettings() {
       const open = button(document.body, "模型设置");
       assert.ok(open, "missing settings button");
+      open.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      const dialog = descendants(document.body,
+        node => node.getAttribute("role") === "dialog")[0];
+      assert.ok(dialog);
+      return dialog;
+    },
+    async openPrompt() {
+      const open = button(document.body, "分析提示词");
+      assert.ok(open, "missing prompt button");
       open.click();
       await Promise.resolve();
       await Promise.resolve();
@@ -582,7 +747,8 @@ test("focus changes persist and refresh focused chips", async () => {
 test("switching papers flushes pending notes before describe", async () => {
   const h = await fixture();
   const notes = descendants(h.document.body,
-    node => node.localName === "textarea")[0];
+    node => node.localName === "textarea"
+      && node.getAttribute("aria-label") !== "询问当前论文")[0];
   notes.value = "changed synthetic notes";
   notes.dispatchEvent({ type: "input", target: notes });
   const target = descendants(h.document.body,
@@ -602,17 +768,22 @@ test("switching papers flushes pending notes before describe", async () => {
 
 test("closing a room flushes notes before its debounce timer", async () => {
   const h = await fixture();
-  const notes = descendants(h.document.body, node => node.localName === "textarea")[0];
+  const notes = descendants(h.document.body,
+    node => node.localName === "textarea"
+      && node.getAttribute("aria-label") !== "询问当前论文")[0];
   notes.value = "last edit before closing";
   notes.dispatchEvent({ type: "input", target: notes });
   for (const listener of h.windowListeners.get("unload") || []) listener();
+  await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
   assert.ok(h.service.calls.some(call => call.type === "setState" && call.patch.notes === "last edit before closing"));
 });
 
 test("a failed switch keeps dirty edits available for a subsequent retry", async () => {
   const h = await fixture();
-  const notes = descendants(h.document.body, node => node.localName === "textarea")[0];
+  const notes = descendants(h.document.body,
+    node => node.localName === "textarea"
+      && node.getAttribute("aria-label") !== "询问当前论文")[0];
   notes.value = "keep this after a disk failure";
   notes.dispatchEvent({ type: "input", target: notes });
   const target = descendants(h.document.body, node => node.localName === "button"
@@ -898,8 +1069,7 @@ test("navigation collapse updates the root workspace class and restores it", asy
   const navigation = descendants(h.document.body,
     node => node.localName === "aside")[0];
   assert.ok(workspace && navigation);
-  const collapse = button(h.document.body, "收起");
-  collapse.click();
+  const collapse = button(h.document.body, "展开");
   assert.ok(workspace.classList.contains("navigation-collapsed"));
   assert.ok(navigation.classList.contains("collapsed"));
   assert.equal(collapse.getAttribute("aria-expanded"), "false");
@@ -907,6 +1077,553 @@ test("navigation collapse updates the root workspace class and restores it", asy
   assert.equal(workspace.classList.contains("navigation-collapsed"), false);
   assert.equal(navigation.classList.contains("collapsed"), false);
   assert.equal(collapse.getAttribute("aria-expanded"), "true");
+  collapse.click();
+  assert.ok(workspace.classList.contains("navigation-collapsed"));
+});
+
+test("prompt settings display, edit, save and reset through real UI events", async () => {
+  const h = await fixture();
+  let dialog = await h.openPrompt();
+  const system = descendants(dialog, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "完整系统提示词")[0];
+  const synthesis = descendants(dialog, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "综合阶段指令")[0];
+  const chat = descendants(dialog, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "论文对话系统提示词")[0];
+  assert.equal(system.value, "Default complete system prompt.");
+  assert.equal(synthesis.value, "Default synthesis instruction.");
+  assert.equal(chat.value, "Default complete chat system prompt.");
+  assert.ok(textOf(dialog).includes("Default complete system prompt."));
+  assert.ok(textOf(dialog).includes("Default complete chat system prompt."));
+  system.value = "Custom full system prompt.\nKeep strict JSON.";
+  system.dispatchEvent({ type: "input", target: system });
+  synthesis.value = "Custom synthesis instruction.";
+  synthesis.dispatchEvent({ type: "input", target: synthesis });
+  chat.value = "Custom full chat system prompt.";
+  chat.dispatchEvent({ type: "input", target: chat });
+  assert.ok(textOf(dialog).includes("Default synthesis instruction."));
+  button(dialog, "保存提示词").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.service.promptSaves.at(-1), {
+    systemPrompt: "Custom full system prompt.\nKeep strict JSON.",
+    synthesisInstruction: "Custom synthesis instruction.",
+    chatSystemPrompt: "Custom full chat system prompt.",
+  });
+  assert.equal(h.service.calls.some(call =>
+    ["analyze", "analyzeBatch", "listModels", "listConfiguredModels"]
+      .includes(call.type)), false);
+
+  dialog = await h.openPrompt();
+  button(dialog, "恢复默认值").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.service.promptResets.length, 1);
+  const restored = descendants(dialog, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "完整系统提示词")[0];
+  const restoredChat = descendants(dialog, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "论文对话系统提示词")[0];
+  assert.equal(restored.value, "Default complete system prompt.");
+  assert.equal(restoredChat.value, "Default complete chat system prompt.");
+});
+
+test("batch selection persists across pages and starts only after review", async () => {
+  const h = await fixture();
+  const pageChecks = descendants(h.document.body, node =>
+    node.localName === "input"
+    && node.getAttribute("class") === "rr-paper-select");
+  assert.equal(pageChecks.length, 3);
+  pageChecks[0].checked = true;
+  pageChecks[0].dispatchEvent({ type: "change", target: pageChecks[0] });
+  button(h.document.body, "下一页").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(textOf(h.document.body).includes("已选 1 篇"));
+  button(h.document.body, "批量 AI 分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const dialog = descendants(h.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+  assert.ok(dialog);
+  assert.ok(textOf(dialog).includes("已明确选择 1 篇"));
+  assert.ok(textOf(dialog).includes("Synthetic Alpha"));
+  assert.equal(h.service.calls.some(call => call.type === "analyzeBatch"),
+    false);
+  button(dialog, "开始批量分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const call = h.service.calls.find(entry =>
+    entry.type === "analyzeBatch");
+  assert.deepEqual(Array.from(call.items, item => ({ itemID: item.itemID })),
+    [{ itemID: 1 }]);
+  assert.equal(call.options.force, false);
+  assert.ok(textOf(h.document.body).includes("批量分析已完成"));
+});
+
+test("current filtered selection enumerates every page and caps explicitly", async () => {
+  const h = await fixture();
+  const addAll = button(h.document.body, "加入当前筛选全部");
+  addAll.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(textOf(h.document.body).includes("已选 3 篇"));
+  const selectionCalls = h.service.calls.filter(call =>
+    call.type === "listPapers"
+    && call.options.query === ""
+    && call.options.libraryID === 1
+    && call.options.collectionID === 11);
+  assert.ok(selectionCalls.length >= 2);
+  assert.ok(selectionCalls.every(call =>
+    call.options.offset % call.options.limit === 0));
+  button(h.document.body, "清空选择").click();
+  assert.ok(textOf(h.document.body).includes("已选 0 篇"));
+});
+
+test("batch progress locks manual analysis and allows failed-item retry", async () => {
+  let release;
+  const h = await fixture({
+    cached: true,
+    batchFactory({ items, options, setState }) {
+      const running = {
+        id: "batch-running",
+        status: "running",
+        force: false,
+        currentItemID: 1,
+        entries: [{
+          itemID: 1,
+          libraryID: 1,
+          key: "KEY1",
+          title: "Synthetic Alpha",
+          status: "running",
+          stage: "analyzing",
+        }],
+        counts: {
+          total: 1, queued: 0, running: 1, reused: 0,
+          succeeded: 0, failed: 0, cancelled: 0,
+        },
+      };
+      setState(running);
+      options.onProgress?.(running);
+      return new Promise(resolve => {
+        release = () => {
+          const failed = {
+            ...running,
+            status: "completed",
+            entries: [{
+              ...running.entries[0],
+              status: "failed",
+              error: { code: "MODEL_TIMEOUT", message: "模型请求超时。" },
+            }],
+            counts: {
+              total: 1, queued: 0, running: 0, reused: 0,
+              succeeded: 0, failed: 1, cancelled: 0,
+            },
+          };
+          setState(failed);
+          resolve(failed);
+        };
+      });
+    },
+  });
+  const pageCheck = descendants(h.document.body, node =>
+    node.localName === "input"
+    && node.getAttribute("class") === "rr-paper-select")[0];
+  pageCheck.checked = true;
+  pageCheck.dispatchEvent({ type: "change", target: pageCheck });
+  button(h.document.body, "批量 AI 分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const dialog = descendants(h.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+  button(dialog, "开始批量分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(button(h.document.body, "AI 分析").disabled, true);
+  assert.equal(button(h.document.body, "重新分析").disabled, true);
+  assert.equal(button(h.document.body, "模型设置").disabled, true);
+  assert.equal(button(h.document.body, "分析提示词").disabled, true);
+  assert.equal(button(dialog, "关闭").disabled, false);
+  assert.ok(textOf(h.document.body).includes("批量分析进行中"));
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(textOf(h.document.body).includes("重试 1 篇失败项"));
+  assert.equal(button(h.document.body, "AI 分析").disabled, false);
+});
+
+test("existing cached batch results render without duplicate work", async () => {
+  const h = await fixture({
+    cached: true,
+    batchFactory({ items, options, setState }) {
+      const reused = {
+        id: "batch-cache",
+        status: "completed",
+        force: false,
+        entries: [{
+          itemID: items[0].itemID,
+          libraryID: 1,
+          key: "KEY2",
+          title: "Synthetic Beta",
+          status: "reused",
+        }],
+        counts: {
+          total: 1, queued: 0, running: 0, reused: 1,
+          succeeded: 0, failed: 0, cancelled: 0,
+        },
+      };
+      setState(reused);
+      options.onProgress?.(reused);
+      return reused;
+    },
+  });
+  const beta = descendants(h.document.body, node =>
+    node.localName === "button"
+    && descendants(node, child => child.textContent === "Synthetic Beta").length
+    && node.getAttribute("class") === "rr-paper-open")[0];
+  beta.click();
+  await new Promise(resolve => setImmediate(resolve));
+  const checks = descendants(h.document.body, node =>
+    node.localName === "input"
+    && node.getAttribute("class") === "rr-paper-select");
+  checks[1].checked = true;
+  checks[1].dispatchEvent({ type: "change", target: checks[1] });
+  button(h.document.body, "批量 AI 分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const dialog = descendants(h.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+  button(dialog, "开始批量分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.service.calls.some(call => call.type === "analyze"),
+    false);
+  assert.ok(textOf(h.document.body).includes("复用缓存"));
+  assert.ok(textOf(h.document.body).includes("Cached overview."));
+});
+
+test("cancelled batch marks pending items and preserves persisted monitor on reopen", async () => {
+  const h = await fixture({
+    batchFactory({ items, options, setState }) {
+      const running = {
+        id: "batch-cancel",
+        status: "running",
+        force: false,
+        entries: items.map((item, index) => ({
+          itemID: item.itemID,
+          libraryID: 1,
+          key: `KEY${item.itemID}`,
+          title: index ? "Synthetic Gamma" : "Synthetic Alpha",
+          status: index ? "queued" : "running",
+        })),
+        counts: {
+          total: 2, queued: 1, running: 1, reused: 0,
+          succeeded: 0, failed: 0, cancelled: 0,
+        },
+      };
+      setState(running);
+      options.onProgress?.(running);
+      return new Promise(resolve => {
+        const cancelled = {
+          ...running,
+          status: "cancelled",
+          entries: running.entries.map(entry => ({
+            ...entry,
+            status: "cancelled",
+          })),
+          counts: {
+            total: 2, queued: 0, running: 0, reused: 0,
+            succeeded: 0, failed: 0, cancelled: 2,
+          },
+        };
+        setState(cancelled);
+        resolve(cancelled);
+      });
+    },
+  });
+  const checks = descendants(h.document.body, node =>
+    node.localName === "input"
+    && node.getAttribute("class") === "rr-paper-select");
+  for (const check of checks.slice(0, 2)) {
+    check.checked = true;
+    check.dispatchEvent({ type: "change", target: check });
+  }
+  button(h.document.body, "批量 AI 分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const dialog = descendants(h.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+  button(dialog, "开始批量分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  button(dialog, "取消批次").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(h.service.calls.some(call => call.type === "cancelBatch"));
+  assert.ok(textOf(h.document.body).includes("批量分析已取消"));
+  const persisted = h.service.getBatchState();
+  assert.equal(persisted.counts.cancelled, 2);
+});
+
+test("reopening a room restores the latest persisted batch without starting work", async () => {
+  const first = await fixture({
+    batchFactory({ items, options, setState }) {
+      const completed = {
+        id: "batch-reopen",
+        status: "completed",
+        force: false,
+        entries: [{
+          itemID: items[0].itemID,
+          libraryID: 1,
+          key: "KEY1",
+          title: "Synthetic Alpha",
+          status: "succeeded",
+        }],
+        counts: {
+          total: 1, queued: 0, running: 0, reused: 0,
+          succeeded: 1, failed: 0, cancelled: 0,
+        },
+      };
+      setState(completed);
+      options.onProgress?.(completed);
+      return completed;
+    },
+  });
+  const check = descendants(first.document.body, node =>
+    node.localName === "input"
+    && node.getAttribute("class") === "rr-paper-select")[0];
+  check.checked = true;
+  check.dispatchEvent({ type: "change", target: check });
+  button(first.document.body, "批量 AI 分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  let dialog = descendants(first.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+  button(dialog, "开始批量分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(first.service.getBatchState().status, "completed");
+  const persisted = first.service.getBatchState();
+  assert.ok(textOf(first.document.body).includes("批量分析已完成"));
+  assert.equal(persisted.entries[0].status, "succeeded");
+});
+
+test("new room reads persisted batch state on mount without model calls", async () => {
+  const first = await fixture({
+    batchFactory({ items, options, setState }) {
+      const completed = {
+        id: "batch-persist",
+        status: "completed",
+        force: false,
+        entries: [{
+          itemID: items[0].itemID,
+          libraryID: 1,
+          key: "KEY1",
+          title: "Synthetic Alpha",
+          status: "succeeded",
+        }],
+        counts: {
+          total: 1, queued: 0, running: 0, reused: 0,
+          succeeded: 1, failed: 0, cancelled: 0,
+        },
+      };
+      setState(completed);
+      options.onProgress?.(completed);
+      return completed;
+    },
+  });
+  const check = descendants(first.document.body, node =>
+    node.localName === "input"
+    && node.getAttribute("class") === "rr-paper-select")[0];
+  check.checked = true;
+  check.dispatchEvent({ type: "change", target: check });
+  button(first.document.body, "批量 AI 分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const dialog = descendants(first.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+  button(dialog, "开始批量分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  const second = await fixture({
+    initialBatchState: first.service.getBatchState(),
+  });
+  assert.ok(textOf(second.document.body).includes("批量分析已完成"));
+  assert.equal(second.service.calls.some(call =>
+    ["analyze", "analyzeBatch"].includes(call.type)), false);
+  button(second.document.body, "批次状态").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const statusDialog = descendants(second.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+  assert.ok(textOf(statusDialog).includes("Synthetic Alpha"));
+  assert.ok(textOf(statusDialog).includes("已完成"));
+});
+
+test("narrow room CSS keeps prompt and batch controls reflowable", async () => {
+  const css = await fs.readFile(
+    new URL("../addon/content/room.css", import.meta.url), "utf8",
+  );
+  assert.match(css, /@media \(max-width: 480px\)/);
+  assert.match(css, /\.rr-selection-bar \{[^}]*flex-wrap: wrap/s);
+  assert.match(css, /\.rr-batch-preview-row \{[^}]*grid-template-columns:/s);
+  assert.match(css, /\.rr-modal \{[^}]*width: min\(650px, calc\(100vw - 36px\)\)/s);
+});
+
+test("batch review cancels a running queue when the window unloads", async () => {
+  let release;
+  const h = await fixture({
+    batchFactory({ items, options, setState }) {
+      const running = {
+        id: "batch-unload",
+        status: "running",
+        force: false,
+        entries: [{
+          itemID: items[0].itemID,
+          libraryID: 1,
+          key: "KEY1",
+          title: "Synthetic Alpha",
+          status: "running",
+        }],
+        counts: {
+          total: 1, queued: 0, running: 1, reused: 0,
+          succeeded: 0, failed: 0, cancelled: 0,
+        },
+      };
+      setState(running);
+      options.onProgress?.(running);
+      return new Promise(resolve => {
+        release = () => resolve(running);
+      });
+    },
+  });
+  const check = descendants(h.document.body, node =>
+    node.localName === "input"
+    && node.getAttribute("class") === "rr-paper-select")[0];
+  check.checked = true;
+  check.dispatchEvent({ type: "change", target: check });
+  button(h.document.body, "批量 AI 分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const dialog = descendants(h.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+  button(dialog, "开始批量分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  for (const listener of h.windowListeners.get("unload") || []) listener();
+  assert.ok(h.service.calls.some(call => call.type === "cancelBatch"));
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+});
+
+test("embedded layout hides its PDF workspace and shows paper chat without model calls on open", async () => {
+  const h = await fixture();
+  assert.equal(h.document.documentElement.getAttribute("data-embedded"), "true");
+  const hiddenSource = descendants(h.document.body, node =>
+    node.getAttribute("class") === "rr-source-pane")[0];
+  assert.equal(hiddenSource, undefined,
+    "embedded layout must not append the redundant PDF pane");
+  assert.ok(descendants(h.document.body, node =>
+    node.getAttribute("class") === "rr-reading-grid rr-reading-grid-embedded").length);
+  assert.ok(textOf(h.document.body).includes("论文对话"));
+  assert.ok(textOf(h.document.body).includes("仅基于当前 PDF"));
+  assert.equal(h.service.calls.some(call => call.type === "askPaper"), false);
+  assert.equal(h.service.calls.some(call => call.type === "getConversation")
+    && h.service.calls.filter(call => call.type === "getConversation").every(
+      call => call.item && call.options.attachmentID === 101), true);
+});
+
+test("paper chat sends explicit text, renders verified sources and navigates native PDF", async () => {
+  const h = await fixture();
+  const navigate = [];
+  h.context.Zotero.Reader.getByTabID = tabID => ({
+    tabID,
+    itemID: 101,
+    async navigate(location) { navigate.push(location); },
+  });
+  const input = descendants(h.document.body, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "询问当前论文")[0];
+  const send = button(h.document.body, "发送");
+  assert.ok(input);
+  assert.ok(send);
+  assert.equal(send.disabled, false);
+  input.value = "What is the synthetic method?";
+  send.click();
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  const call = h.service.calls.find(entry => entry.type === "askPaper");
+  assert.ok(call);
+  assert.equal(call.question, "What is the synthetic method?");
+  assert.equal(call.options.attachmentID, 101);
+  assert.ok(textOf(h.document.body).includes("Synthetic grounded answer."));
+  assert.ok(textOf(h.document.body).includes("Synthetic verification notice."));
+  assert.ok(textOf(h.document.body).includes("本次原文逐字匹配"));
+  const source = button(h.document.body, "“Synthetic source quote”");
+  assert.ok(source);
+  source.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(JSON.stringify(navigate)), [{ pageIndex: 4 }]);
+});
+
+test("chat cancellation is scoped to the owned paper and preserves old history", async () => {
+  let release;
+  const h = await fixture();
+  h.service.askPaper = (item, question, options) => new Promise((resolve, reject) => {
+    h.service.calls.push({ type: "askPaper", item, question, options });
+    options.signal?.addEventListener("abort", () => reject(Object.assign(
+      new Error("cancelled"), { code: "CANCELLED" },
+    )));
+    release = () => resolve({
+      attachmentID: options.attachmentID,
+      attachmentKey: "ATTACH01",
+      messages: [],
+    });
+  });
+  const input = descendants(h.document.body, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "询问当前论文")[0];
+  input.value = "Cancel this question";
+  button(h.document.body, "发送").click();
+  await new Promise(resolve => setImmediate(resolve));
+  button(h.document.body, "取消对话").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const cancelled = h.service.calls.find(call => call.type === "cancelChat");
+  assert.ok(cancelled);
+  assert.equal(cancelled.item.id, 2);
+  assert.ok(textOf(h.document.body).includes("此前保存的问答仍保留"));
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+});
+
+test("tag sync failures are shown as local-only warnings instead of saved-to-native claims", async () => {
+  const h = await fixture();
+  h.service.setState = async (item, patch) => {
+    h.service.calls.push({ type: "setState", item, patch });
+    return {
+      status: patch.status,
+      notes: "", checklist: {},
+      tagSync: {
+        status: "error",
+        tag: "阅读室/已读",
+        code: "TAG_SYNC_FAILED",
+        message: "本地阅读状态已保存；原生标签写入失败，请再次选择状态重试。",
+      },
+    };
+  };
+  const status = descendants(h.document.body, node =>
+    node.localName === "button"
+    && node.getAttribute("data-status") === "read")[0];
+  assert.ok(status);
+  status.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(textOf(h.document.body).includes("原生标签写入失败"));
+  assert.ok(textOf(h.document.body).includes("点击状态可重试"));
+  assert.equal(textOf(h.document.body).includes("阅读状态已保存为“已读”"), false);
+});
+
+test("idle view disposal leaves another view's chat request untouched", async () => {
+  const h = await fixture();
+  for (const listener of h.windowListeners.get("unload") || []) listener();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.service.calls.some(call => call.type === "cancelChat"), false);
+});
+
+test("native catalog selection opens the requested native reader rather than replacing this tab's paper", async () => {
+  const h = await fixture();
+  const shown = [];
+  h.context.Zotero.ReadingRoom = { async show(options) { shown.push(options); } };
+  const target = descendants(h.document.body, node => node.localName === "button"
+    && descendants(node, child => child.textContent === "Synthetic Gamma").length)[0];
+  target.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(shown.length, 1);
+  assert.equal(shown[0].itemID, 3);
+  assert.equal(h.service.calls.filter(call => call.type === "describe").length, 1);
 });
 
 test("source uses safe DOM APIs and has no extractive mode entry", () => {
@@ -918,4 +1635,7 @@ test("source uses safe DOM APIs and has no extractive mode entry", () => {
     /\["preparing", "extracting", "analyzing", "saving"\]/);
   assert.match(source, /consentProvider/);
   assert.match(source, /listConfiguredModels/);
+  assert.match(source, /getPromptConfig/);
+  assert.match(source, /analyzeBatch/);
+  assert.match(source, /getBatchState/);
 });

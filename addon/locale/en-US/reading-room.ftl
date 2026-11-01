@@ -1,5 +1,7 @@
-reading-room-pane = Reading Room
-reading-room-pane-sidenav = Reading Room
+reading-room-pane =
+    .label = Reading Room
+reading-room-pane-sidenav =
+    .tooltiptext = Reading Room
 reading-room-column = Reading status
 reading-room-menu-tools = Open Reading Room
     .label = Open Reading Room

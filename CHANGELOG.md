@@ -2,6 +2,12 @@
 
 ## Unreleased — reading workspace
 
+- Move default entry points into the right sidebar of Zotero's normal PDF reader instead of opening a top-level Reading Room window. Paper selection and evidence navigation follow the current reader attachment. Native UI acceptance for this migration remains pending; earlier standalone-window checks below describe that earlier implementation.
+- Add full editing/reset of the analysis system prompt, multi-chunk synthesis instruction and paper-chat system prompt, with verbatim defaults in docs/AI-PROMPTS.md. Prompt saves do not call models or invalidate cached analyses; explicit reanalysis stores prompt provenance.
+- Add reviewed, explicit batch selections of up to 1000 papers, sequential processing, per-paper progress/cache/error states, cancellation and failed-item retry. Freeze batch scope and prompts; stop later sends if model/endpoint/permission/credential configuration changes. Completed results survive cancellation; queues do not automatically resume after restart.
+- Add current-paper chat over bounded extracted-text excerpts and recent history across all four API protocols. Persist only successful question/answer pairs and validated source quotes per paper/attachment; preserve history on failure/cancellation and label unsupported answers unverified. Remote paper-text consent and group restrictions also apply to chat.
+- On manual reading-status changes only, save local state then synchronize exactly one of the five reserved tags: `阅读室/未读`, `阅读室/待读`, `阅读室/在读`, `阅读室/已读`, `阅读室/搁置`. Preserve unrelated tags and fields; retain local status with an explicit warning when native writes are unavailable or fail. Native tags may sync through Zotero; local sidecar records are not automatically merged or restored from tags. AI never marks papers read.
+
 - Fix Zotero chrome-window dropdowns with in-document listboxes, solid popup surfaces, real DOM change events, HTMLCollection-compatible option enumeration, keyboard navigation and popup cleanup; refresh PDF choices after each paper loads.
 - Preserve library and nested collection hierarchy, including empty collections, and filter the catalog by direct collection membership while keeping global focused-paper shortcuts.
 - Reclaim navigation space at the root grid when collapsed, re-fit the PDF to the wider pane and preserve the source/AI split ratio. Add installed-host API and native UI verification records.

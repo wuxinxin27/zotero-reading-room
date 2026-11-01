@@ -113,3 +113,10 @@ npm run xref -- configure-mcp
 仅下载公开参考源码并在本机索引项目源码。不要读取/索引 Zotero 文库、个人 PDF、profile、凭据、个人文档或真实集成测试输出。参考克隆和索引均不随 MIT 插件分发，也不进入 XPI。
 
 不运行 `xerj init`，不开放公网监听、共享或隧道，不使用 Hub。上游网页提出的自动反馈、field report 或外发报告不属于本项目授权；不得自动发送。索引、搜索与状态输出的成功情况以实际执行证据为准，不以本文替代验证。
+
+
+## 原生侧栏实现参考（2026-11-01）
+
+本轮在编辑前检索项目与固定上游；只借鉴接口和生命周期，不复制上游实现。Template `306d4e2a0959a7b2f5e44bb38169fb25f841dbaf` 的 `src/modules/examples.ts:265` 及 `addon/locale/zh-CN/mainWindow.ftl:4` 给出 Reader section 和属性式 Fluent 消息；Toolkit `0fbfd0258921044de1854b89d66b27762b10ee0a` 的 `src/managers/keyboard.ts:62` 给出注册后覆盖已打开 Reader 的行为参考。Zotero 参考 SHA 仍为清单内 `212a7d6a585d1209bc4e698a904490205f139500`。
+
+另外核对实际安装 Zotero 10.0.7 的 `itemPaneCustomSection.js:188`（HTML body、同步/异步 hook、toggle event）、`itemDetails.js` 与 `contextPane.js`（每标签实例、tabID 和原生侧栏）、`xpcom/reader.js:767`（物理页导航）、`item.js:4805`（标签及事务）、`pdfWorker/manager.js:612`（提取文本）。宿主打包源码用于版本适配核查，不加入索引或分发。旧源码索引未包含新 sidebar 文件的首次查询只能返回附近符号；新增源码加入跟踪后再刷新项目索引。

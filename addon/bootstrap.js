@@ -4,6 +4,7 @@
 var ReadingRoomBootstrap = {
   data: null,
   service: null,
+  sidebar: null,
   sharedScope: null,
   chromeHandle: null,
   stopped: false,
@@ -77,8 +78,10 @@ var ReadingRoomBootstrap = {
       this.loadScript(scope, rootURI, "service.js");
       this.loadScript(scope, rootURI, "reader.js");
       this.loadScript(scope, rootURI, "room.js");
+      this.loadScript(scope, rootURI, "sidebar.js");
 
-      if (!scope.ReadingRoomCore || !scope.ReadingRoomService || !scope.ReadingRoomPDF || !scope.ReadingRoomUI) {
+      if (!scope.ReadingRoomCore || !scope.ReadingRoomService || !scope.ReadingRoomPDF
+          || !scope.ReadingRoomUI || !scope.ReadingRoomNativeSidebar) {
         throw new Error("插件脚本未导出预期的共享接口。");
       }
       this.service = new scope.ReadingRoomService(Zotero, { rootURI });
@@ -90,15 +93,13 @@ var ReadingRoomBootstrap = {
 
       const api = {
         service: this.service,
-        show: options => scope.ReadingRoomUI.show(options || {}),
+        show: options => this.sidebar
+          ? this.sidebar.show(options || {}) : null,
         start: options => {
-          const win = Services.wm.getMostRecentWindow("zotero:reading-room")
-            || scope.ReadingRoomUI.window();
-          if (win) {
-            scope.ReadingRoomUI.mountWindow(win, options && options.itemID);
-          }
+          return this.sidebar ? this.sidebar.show(options || {}) : null;
         },
-        mountWindow: (win, itemID) => scope.ReadingRoomUI.mountWindow(win, itemID),
+        mountWindow: (win, itemID, context) => this.sidebar
+          ? this.sidebar.mountWindow(win, itemID, context) : null,
         status: "ready",
         version,
         diagnostics: Object.freeze({
@@ -112,6 +113,23 @@ var ReadingRoomBootstrap = {
       Zotero.ReadingRoom = api;
       scope.Zotero = Zotero;
       scope.ReadingRoomWindow = api;
+      this.sidebar = new scope.ReadingRoomNativeSidebar({
+        service: this.service,
+        core: scope.ReadingRoomCore,
+        pdf: scope.ReadingRoomPDF,
+        dependencies: {
+          ChromeUtils,
+          IOUtils: scope.IOUtils,
+          Services,
+        },
+        scriptLoader: (url, target) => this.loadScript(
+          target, rootURI, "room.js"),
+        rootURI,
+        cssURL: rootURI + "content/room.css",
+        iconURL: rootURI + "icon.svg",
+        version,
+      });
+      scope.ReadingRoomNativeSidebarInstance = this.sidebar;
       await scope.ReadingRoomUI.startup({
         id,
         version,
@@ -119,7 +137,9 @@ var ReadingRoomBootstrap = {
         service: this.service,
         cssURL: rootURI + "content/room.css",
         iconURL: rootURI + "icon.svg",
+        ownsHost: false,
       });
+      await this.sidebar.startup();
       this.log("startup complete; version " + version);
     }
     catch (error) {
@@ -176,6 +196,13 @@ var ReadingRoomBootstrap = {
       catch (_) {}
     }
     try {
+      if (this.sidebar) await this.sidebar.shutdown();
+    }
+    catch (error) {
+      const safe = this.safeError(error);
+      this.log("native sidebar shutdown failed [" + safe.code + "]: " + safe.message);
+    }
+    try {
       if (scope && scope.ReadingRoomUI) await scope.ReadingRoomUI.shutdown();
     }
     catch (error) {
@@ -199,9 +226,12 @@ var ReadingRoomBootstrap = {
       try { delete scope.ReadingRoomUI; } catch (_) {}
       try { delete scope.ReadingRoomPDF; } catch (_) {}
       try { delete scope.ReadingRoomWindow; } catch (_) {}
+      try { delete scope.ReadingRoomNativeSidebar; } catch (_) {}
+      try { delete scope.ReadingRoomNativeSidebarInstance; } catch (_) {}
       try { delete scope.ReadingRoomRootURI; } catch (_) {}
     }
     this.service = null;
+    this.sidebar = null;
     if (this.chromeHandle) {
       try { this.chromeHandle.destruct(); }
       catch (error) {
