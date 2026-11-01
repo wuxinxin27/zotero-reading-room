@@ -56,14 +56,19 @@ for (const provider of ["openai", "anthropic", "gemini", "ollama"]) {
     const h = createHarness();
     await h.service.saveAIConfig({ provider, endpoint: "http://127.0.0.1:11434", model: "chat-test" }, { apiKey: "synthetic-chat-key", rememberKey: false });
     const defaults = await h.service.getPromptConfig();
-    const custom = "  完整对话提示词\nReturn answer/evidence JSON.  ";
-    await h.service.savePromptConfig({ systemPrompt: defaults.systemPrompt, synthesisInstruction: defaults.synthesisInstruction, chatSystemPrompt: custom });
+    const custom = "  完整对话提示词\n用自然段解释论文。  ";
+    const config = await h.service.savePromptConfig({ systemPrompt: defaults.systemPrompt, synthesisInstruction: defaults.synthesisInstruction, chatSystemPrompt: custom });
     mockChat(h, provider);
     const result = await h.service.askPaper(h.attachment, "方法是什么？", { attachmentID: h.attachment.id });
     assert.equal(h.calls.requests.length, 1);
     const call = h.calls.requests[0], payload = JSON.parse(call.options.body);
     const system = provider === "anthropic" ? payload.system : provider === "gemini" ? payload.systemInstruction.parts[0].text : payload.messages[0].content;
-    assert.equal(system, custom);
+    assert.equal(system, custom + "\n\n" + config.chatOutputContract);
+    assert.equal(result.reply.effectiveSystemPrompt, system);
+    assert.deepEqual(plain(result.reply.promptSnapshot), { systemPrompt: custom });
+    assert.equal(result.reply.outputContractSnapshot, config.chatOutputContract);
+    assert.equal(result.reply.outputContractVersion, config.outputContractVersion);
+    assert.equal(result.reply.chatPromptHash, h.Core.hash(system));
     assert.equal(payload.model || "chat-test", "chat-test");
     const body = userPayload(call, provider);
     assert.equal(body.question, "方法是什么？"); assert.deepEqual(body.history, []);
@@ -165,14 +170,34 @@ test("invalid questions, missing configuration/PDF/text and malformed output are
   h.files.delete(h.attachment.localPath);
   await assert.rejects(h.service.askPaper(h.parent, "missing"), { code: "PDF_MISSING" });
   h.files.set(h.attachment.localPath, "synthetic");
-  for (const value of [{ answer: "", evidence: [] }, { answer: "x".repeat(12001), evidence: [] }, { answer: "x" }, { answer: "x", evidence: Array(17).fill({}) }]) {
-    mockChat(h, "openai", value); await assert.rejects(h.service.askPaper(h.parent, "invalid output"), { code: "INVALID_MODEL_OUTPUT" });
+  for (const [value, code, message] of [
+    [{ answer: "", evidence: [] }, "CHAT_ANSWER_INVALID", /非空/],
+    [{ answer: 42, evidence: [] }, "CHAT_ANSWER_INVALID", /answer/],
+    [{ answer: "x".repeat(12001), evidence: [] }, "CHAT_ANSWER_TOO_LONG", /12000/],
+    [{ answer: "x", evidence: {} }, "CHAT_EVIDENCE_INVALID", /数组/],
+    [{ answer: "x", evidence: Array(17).fill({}) }, "CHAT_EVIDENCE_TOO_MANY", /16/],
+    [{ dimensions: [] }, "CHAT_STRUCTURE_INVALID", /分析任务结构/]
+  ]) {
+    mockChat(h, "openai", value); await assert.rejects(h.service.askPaper(h.parent, "invalid output"), error => error.code === code && message.test(error.message));
   }
   assert.deepEqual(plain(await h.service.getConversation(h.parent)), before);
   const noConfig = createHarness({ configured: false });
   await assert.rejects(noConfig.service.askPaper(noConfig.parent, "need model"), { code: "MODEL_REQUIRED" }); assert.equal(noConfig.calls.extracts, 0);
   const empty = createHarness({ extracted: { text: "", extractedPages: 1, totalPages: 1 } });
   await assert.rejects(empty.service.askPaper(empty.parent, "scan"), { code: "PDF_TEXT_EMPTY" }); assert.equal(empty.calls.requests.length, 0);
+});
+
+test("missing or null evidence yields an explicitly unverified answer without fabricated citations", async () => {
+  const h = createHarness();
+  for (const value of [{ answer: "信息不足" }, { answer: "无引用的回答", evidence: null }]) {
+    mockChat(h, "openai", value);
+    const result = await h.service.askPaper(h.parent, "无引用问题");
+    assert.equal(result.reply.content, value.answer);
+    assert.equal(result.reply.grounded, false);
+    assert.deepEqual(plain(result.reply.evidence), []);
+    assert.equal(result.reply.rejectedEvidenceCount, 0);
+    assert.match(result.reply.verificationNotice, /未核验.*信息不足/);
+  }
 });
 
 test("one active request per paper, frozen question/attachment/config/prompt and cancellation preserve earlier pairs", async () => {

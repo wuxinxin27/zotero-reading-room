@@ -1849,6 +1849,32 @@ summary:focus-visible,
   font-size: 14px;
 }
 
+.rr-prompt-protocol {
+  margin-top: 7px;
+  border: 1px solid var(--rr-line);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.rr-prompt-protocol summary {
+  padding: 7px 9px;
+  color: var(--rr-teal-deep);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.rr-prompt-protocol[open] summary {
+  border-bottom: 1px solid var(--rr-line);
+}
+
+.rr-prompt-protocol > .rr-prompt-default {
+  max-height: 230px;
+  margin: 0;
+  border: 0;
+  border-radius: 0 0 7px 7px;
+}
+
 .rr-prompt-default {
   max-height: 155px;
   margin: 4px 0 9px;

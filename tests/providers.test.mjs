@@ -11,6 +11,39 @@ const listReply = provider => provider === "gemini"
   : provider === "ollama" ? { models: [{ model: "demo", name: "Demo model" }] }
     : { data: [{ id: "demo", display_name: "Demo model" }] };
 
+const outputWrappers = [
+  ["BOM", text => "\uFEFF \n" + text + "\n"],
+  ["complete fence", text => "```json\n" + text + "\n```"],
+  ["leading thinking and fence", text => "<think>Private reasoning { incomplete lure, never source evidence.</think>\n```json\n" + text + "\n```"],
+  ["fenced thinking", text => "```\n<think>Private reasoning.</think>\n" + text + "\n```"],
+  ["single double encoding", text => JSON.stringify(text)],
+  ["one object surrounded by prose", text => '说明 "quoted {decoy}"：\n' + text + "\n以上为返回结果。"]
+];
+const prose = '候选解释含括号 {literal}、数组 [literal] 和引号 "quoted"；仍需核对。';
+function modelReply(provider, content) {
+  if (provider === "anthropic") return { stop_reason: "end_turn", content: [{ type: "thinking", thinking: "hidden reasoning" }, { type: "text", text: content }] };
+  if (provider === "gemini") return { candidates: [{ finishReason: "STOP", content: { parts: [{ thought: true, text: "hidden reasoning" }, { text: content }] } }] };
+  if (provider === "ollama") return { done: true, done_reason: "stop", message: { content } };
+  return { choices: [{ finish_reason: "stop", message: { reasoning_content: "hidden reasoning", content } }] };
+}
+function submittedChunk(options, provider) {
+  const payload = JSON.parse(options.body);
+  return JSON.parse(provider === "gemini" ? payload.contents[0].parts[0].text : payload.messages.find(entry => entry.role === "user").content);
+}
+function outputFor(task, chunk) {
+  const excerpt = task === "chat" ? chunk.excerpts[0] : chunk.stage === "synthesis" ? chunk.excerpts[0] : chunk;
+  const evidence = excerpt ? [{ quote: (excerpt.text || excerpt.quote).slice(0, 80), pageIndex: excerpt.pageIndex }] : [];
+  return task === "chat" ? { answer: prose, evidence } : {
+    dimensions: ["problem", "novelty", "contributions", "prior-work", "superiority", "technical-uniqueness"]
+      .map(id => ({ id, summary: prose, evidence: id === "problem" ? evidence : [] })),
+    overview: prose, overviewEvidence: evidence, readingGuide: "", readingGuideEvidence: [], figureTableReferences: []
+  };
+}
+async function configureProvider(h, provider, apiKey) {
+  await h.service.saveAIConfig({ provider, endpoint: endpointFor(provider), model: "demo" }, { apiKey, rememberKey: false });
+}
+const invokeTask = (h, task) => task === "chat" ? h.service.askPaper(h.parent, "论文的方法是什么？") : h.service.analyze(h.parent, { force: true });
+
 function fakeHTTP(h, respond) {
   h.Zotero.HTTP.request = async (method, url, options) => {
     h.calls.requests.push({ method, url, options });
@@ -284,13 +317,13 @@ test("own HTTP deadlines cancel stalled discovery and analysis even if the HTTP 
 test("upstream analysis errors, executable text, and echoed credentials never replace a saved result", async () => {
   const h = createHarness();
   const earlier = await h.service.analyze(h.parent);
-  for (const response of [
-    { choices: [{ message: { content: "globalThis.executeAnything()" } }] },
-    { choices: [{ message: { content: JSON.stringify({ dimensions: [{ id: "problem", summary: secret }] }) } }] },
-    { choices: [{ message: { tool_calls: [{ function: { name: "execute" } }] } }] }
+  for (const [response, code] of [
+    [{ choices: [{ message: { content: "globalThis.executeAnything()" } }] }, "INVALID_MODEL_OUTPUT"],
+    [{ choices: [{ message: { content: JSON.stringify({ dimensions: [{ id: "problem", summary: secret }] }) } }] }, "INVALID_MODEL_OUTPUT"],
+    [{ choices: [{ message: { tool_calls: [{ function: { name: "execute" } }] } }] }, "MODEL_OUTPUT_TOOL_ONLY"]
   ]) {
     fakeHTTP(h, () => response);
-    await assert.rejects(h.service.analyze(h.parent, { force: true, mode: "model", model: "demo", apiKey: secret }), error => error.code === "INVALID_MODEL_OUTPUT" && !error.message.includes(secret));
+    await assert.rejects(h.service.analyze(h.parent, { force: true, mode: "model", model: "demo", apiKey: secret }), error => error.code === code && !error.message.includes(secret));
     assert.equal(h.service.getState(h.parent).analysis.id, earlier.id);
     assert.equal(h.files.get(h.statePath).includes(secret), false);
   }
@@ -375,4 +408,184 @@ test("model discovery caps response cardinality and normalizes duplicate entries
   assert.equal(result.models.length, 500);
   assert.equal(new Set(result.models.map(model => model.id)).size, 500);
   assert.equal(h.calls.requests.length, 1);
+});
+
+for (const provider of providers) {
+  for (const task of ["analysis", "chat"]) {
+    test(`${provider} ${task}: bounded wrappers preserve the same validated data and ignore separate reasoning`, async () => {
+      const h = createHarness();
+      await configureProvider(h, provider);
+      for (const [label, wrap] of outputWrappers) {
+        fakeHTTP(h, ({ options }) => modelReply(provider, wrap(JSON.stringify(outputFor(task, submittedChunk(options, provider))))));
+        const value = await invokeTask(h, task);
+        const result = task === "chat" ? value.reply : value.dimensions[0];
+        assert.equal(task === "chat" ? result.content : result.summary, prose, label);
+        assert.ok(result.evidence.length > 0, label);
+        assert.ok(result.evidence.every(entry => entry.verified), label);
+        assert.equal(JSON.stringify(value).includes("Private reasoning"), false, label);
+        assert.equal(JSON.stringify(value).includes("hidden reasoning"), false, label);
+      }
+    });
+
+    test(`${provider} ${task}: ambiguous, broken, quoted, or excessively encoded JSON never changes saved bytes`, async () => {
+      const h = createHarness();
+      await configureProvider(h, provider);
+      fakeHTTP(h, ({ options }) => modelReply(provider, JSON.stringify(outputFor(task, submittedChunk(options, provider)))));
+      await invokeTask(h, task);
+      const bytes = h.files.get(h.statePath), writes = h.calls.writes.length;
+      const text = JSON.stringify(task === "chat" ? { answer: prose, evidence: [] } : { dimensions: [] });
+      for (const content of [
+        text + "\n" + text,
+        text + '\n{"truncated":',
+        text.slice(0, -1),
+        "<think>unclosed reasoning " + text,
+        "<think><think>nested reasoning</think>" + text,
+        text + "\n<think>unclosed reasoning",
+        "说明 " + JSON.stringify(text) + " 完毕",
+        "说明 '  " + text + "  ' 完毕",
+        '说明 "unclosed quote ' + text,
+        "说明 [" + text + "] 完毕",
+        "说明 {broken]} " + text,
+        "```javascript\n" + text + "\n```",
+        "```json\n" + text,
+        JSON.stringify(JSON.stringify(text)),
+        "[]", "null", "42", "false", JSON.stringify("free text")
+      ]) {
+        fakeHTTP(h, () => modelReply(provider, content));
+        await assert.rejects(invokeTask(h, task), { code: "INVALID_MODEL_OUTPUT" }, content.slice(0, 70));
+        assert.equal(h.files.get(h.statePath), bytes);
+        assert.equal(h.calls.writes.length, writes);
+      }
+    });
+
+    test(`${provider} ${task}: wrappers and decoding cannot hide credential echoes or oversized bodies`, async () => {
+      const h = createHarness();
+      await configureProvider(h, provider, secret);
+      const bytes = h.files.get(h.statePath), writes = h.calls.writes.length;
+      for (const [, wrap] of outputWrappers) {
+        for (const encoded of [false, true]) {
+          const raw = JSON.stringify(task === "chat" ? { answer: secret, evidence: [] } : { dimensions: [], overview: secret });
+          const content = wrap(encoded ? raw.replace(secret, "\\u0073" + secret.slice(1)) : raw);
+          fakeHTTP(h, () => modelReply(provider, content));
+          await assert.rejects(invokeTask(h, task), error => error.code === "INVALID_MODEL_OUTPUT"
+            && !error.message.includes(secret) && !error.message.includes("Private reasoning"));
+          assert.equal(h.files.get(h.statePath), bytes);
+          assert.equal(h.calls.writes.length, writes);
+        }
+      }
+      const valid = JSON.stringify(task === "chat" ? { answer: "信息不足", evidence: [] } : { dimensions: [] });
+      for (const content of ["<think>" + secret + "</think>" + valid, "前置说明 " + secret + "\n" + valid]) {
+        fakeHTTP(h, () => modelReply(provider, content));
+        await assert.rejects(invokeTask(h, task), error => error.code === "INVALID_MODEL_OUTPUT" && !error.message.includes(secret));
+        assert.equal(h.files.get(h.statePath), bytes);
+        assert.equal(h.calls.writes.length, writes);
+      }
+      fakeHTTP(h, () => modelReply(provider, "<think>" + "x".repeat(1000001) + "</think>" + JSON.stringify({ dimensions: [] })));
+      await assert.rejects(invokeTask(h, task), { code: "INVALID_MODEL_OUTPUT" });
+      assert.equal(h.files.get(h.statePath), bytes);
+    });
+  }
+}
+
+function failedCompletions(provider, text) {
+  const base = modelReply(provider, text);
+  if (provider === "openai") return [
+    [{ choices: [{ finish_reason: "length", message: { content: text } }] }, "MODEL_OUTPUT_TRUNCATED"],
+    [{ choices: [{ finish_reason: "content_filter", message: { content: text } }] }, "MODEL_OUTPUT_REFUSED"],
+    [{ choices: [{ message: { content: text, refusal: "private refusal body" } }] }, "MODEL_OUTPUT_REFUSED"],
+    [{ choices: [{ message: { content: [{ type: "refusal", refusal: "private refusal body" }, { type: "text", text }] } }] }, "MODEL_OUTPUT_REFUSED"],
+    [{ ...base, status: "incomplete" }, "MODEL_OUTPUT_INCOMPLETE"],
+    [{ ...base, status: "failed", error: { message: "private refusal body" } }, "MODEL_REQUEST_FAILED"],
+    [{ choices: [{ finish_reason: "tool_calls", message: { content: text, tool_calls: [{ function: { name: "never_run" } }] } }] }, "MODEL_OUTPUT_TOOL_ONLY"]
+  ];
+  if (provider === "anthropic") return [
+    [{ ...base, stop_reason: "max_tokens" }, "MODEL_OUTPUT_TRUNCATED"],
+    [{ ...base, stop_reason: "refusal" }, "MODEL_OUTPUT_REFUSED"],
+    [{ ...base, content: [{ type: "refusal", refusal: "private refusal body" }, ...base.content] }, "MODEL_OUTPUT_REFUSED"],
+    [{ ...base, stop_reason: "pause_turn" }, "MODEL_OUTPUT_INCOMPLETE"],
+    [{ ...base, stop_reason: "tool_use" }, "MODEL_OUTPUT_TOOL_ONLY"],
+    [{ content: [{ type: "tool_use", name: "never_run" }] }, "MODEL_OUTPUT_TOOL_ONLY"]
+  ];
+  if (provider === "gemini") return [
+    [{ candidates: [{ ...base.candidates[0], finishReason: "MAX_TOKENS" }] }, "MODEL_OUTPUT_TRUNCATED"],
+    [{ candidates: [{ ...base.candidates[0], finishReason: "SAFETY" }] }, "MODEL_OUTPUT_REFUSED"],
+    [{ ...base, promptFeedback: { blockReason: "PROHIBITED_CONTENT", blockReasonMessage: "private refusal body" } }, "MODEL_OUTPUT_REFUSED"],
+    [{ candidates: [{ ...base.candidates[0], safetyRatings: [{ blocked: true }] }] }, "MODEL_OUTPUT_REFUSED"],
+    [{ candidates: [{ ...base.candidates[0], finishReason: "MALFORMED_FUNCTION_CALL" }] }, "MODEL_OUTPUT_TOOL_ONLY"],
+    [{ candidates: [{ content: { parts: [{ functionCall: { name: "never_run" } }] } }] }, "MODEL_OUTPUT_TOOL_ONLY"]
+  ];
+  return [
+    [{ ...base, done: false }, "MODEL_OUTPUT_INCOMPLETE"],
+    [{ ...base, done: false, done_reason: "length" }, "MODEL_OUTPUT_TRUNCATED"],
+    [{ ...base, done_reason: "content_filter" }, "MODEL_OUTPUT_REFUSED"],
+    [{ message: { tool_calls: [{ function: { name: "never_run" } }] }, done: true }, "MODEL_OUTPUT_TOOL_ONLY"]
+  ];
+}
+
+for (const provider of providers) {
+  test(`${provider}: completion and refusal metadata reject even valid JSON before parsing or saving either task`, async () => {
+    const h = createHarness();
+    await configureProvider(h, provider);
+    fakeHTTP(h, ({ options }) => {
+      const chunk = submittedChunk(options, provider);
+      return modelReply(provider, JSON.stringify(outputFor(chunk.question ? "chat" : "analysis", chunk)));
+    });
+    const analysis = await invokeTask(h, "analysis");
+    await invokeTask(h, "chat");
+    const bytes = h.files.get(h.statePath), writes = h.calls.writes.length;
+    for (const task of ["analysis", "chat"]) {
+      for (const text of [JSON.stringify(task === "chat" ? { answer: prose, evidence: [] } : { dimensions: [] }), "{broken JSON"]) {
+        for (const [response, code] of failedCompletions(provider, text)) {
+          fakeHTTP(h, () => response);
+          const requests = h.calls.requests.length;
+          await assert.rejects(invokeTask(h, task), error => error.code === code
+            && !error.message.includes("private refusal body") && !error.message.includes("hidden reasoning") && !error.message.includes(text));
+          assert.equal(h.calls.requests.length, requests + 1);
+          assert.equal(h.files.get(h.statePath), bytes);
+          assert.equal(h.calls.writes.length, writes);
+          assert.equal(h.service.getState(h.parent).analysis.id, analysis.id);
+          assert.equal((await h.service.getConversation(h.parent)).messages.length, 2);
+        }
+      }
+    }
+  });
+}
+
+test("unknown completion values remain compatible and separate reasoning_content is ignored", async () => {
+  const h = createHarness();
+  fakeHTTP(h, () => ({ choices: [{ finish_reason: "gateway_complete_v2", message: {
+    content: '{"answer":"信息不足","evidence":[]}', reasoning_content: '{"answer":"not the answer"}'
+  } }] }));
+  const result = await invokeTask(h, "chat");
+  assert.equal(result.reply.content, "信息不足");
+  assert.equal(result.reply.grounded, false);
+  assert.equal(h.files.get(h.statePath).includes("not the answer"), false);
+});
+
+test("format compatibility still rejects citations from actual PDF regions absent from the submitted analysis chunk or chat excerpts", async () => {
+  const pages = Array.from({ length: 12 }, (_, index) => "Page " + index + ". " + "Ordinary source content for a synthetic paper. ".repeat(80));
+  const unseen = "This exact sentence exists only on the last page and was not submitted to this request.";
+  pages[11] = unseen + pages[11];
+  const h = createHarness({ extracted: { text: pages.join("\f"), extractedPages: 12, totalPages: 12 } });
+  for (const task of ["analysis", "chat"]) {
+    fakeHTTP(h, ({ options }) => {
+      const chunk = submittedChunk(options, "openai");
+      const evidence = [{ quote: unseen, pageIndex: 11 }];
+      // Analysis only tries the unseen quote in page 0 and synthesis, never where it was admitted.
+      const raw = task === "chat" ? { answer: prose, evidence } : { dimensions: [{ id: "problem", summary: prose,
+        evidence: chunk.pageIndex === 0 || chunk.stage === "synthesis" ? evidence : [] }] };
+      if (task === "chat") assert.equal(JSON.stringify(chunk.excerpts).includes(unseen), false);
+      return modelReply("openai", outputWrappers[2][1](JSON.stringify(raw)));
+    });
+    const value = await invokeTask(h, task);
+    if (task === "chat") {
+      assert.equal(value.reply.grounded, false);
+      assert.equal(value.reply.evidence.length, 0);
+      assert.equal(value.reply.rejectedEvidenceCount, 1);
+    }
+    else {
+      assert.equal(value.dimensions[0].summary, "信息不足");
+      assert.equal(value.dimensions[0].evidence.length, 0);
+    }
+  }
 });

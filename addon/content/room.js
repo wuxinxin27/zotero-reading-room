@@ -353,6 +353,56 @@
       message: error && error.message ? String(error.message) : "操作未完成。",
     };
   }
+  function taskErrorText(task, error) {
+    const safe = safeError(error);
+    return `${task}失败 [${safe.code}]：${fixedTaskErrorMessage(task, safe)}`;
+  }
+  const fixedTaskErrorMessages = Object.freeze({
+    MODEL_OUTPUT_TRUNCATED:
+      "模型输出被长度限制截断；请提高模型输出上限或精简提示词后重试。",
+    MODEL_OUTPUT_INCOMPLETE:
+      "模型响应尚未完成；请检查服务完成状态后重试。",
+    MODEL_OUTPUT_REFUSED:
+      "模型服务拒答或触发安全拦截；请核对请求内容及服务设置。",
+    MODEL_OUTPUT_TOOL_ONLY:
+      "模型返回了工具调用；请使用支持直接文本回答的模型或配置。",
+    INVALID_MODEL_OUTPUT:
+      "模型返回格式无效或超出大小限制。",
+    MODEL_REQUEST_FAILED:
+      "模型请求失败，请检查服务后重试。",
+    MODEL_AUTH_FAILED:
+      "模型服务拒绝凭据，请检查 API 密钥。",
+    CHAT_ANSWER_INVALID:
+      "模型未返回有效的 answer 文本；请核对对话提示词及模型输出。",
+    CHAT_ANSWER_TOO_LONG:
+      "模型 answer 超过 12000 字符；请要求模型精简回答后重试。",
+    CHAT_EVIDENCE_INVALID:
+      "模型 evidence 格式无效；请核对对话提示词及模型输出。",
+    CHAT_EVIDENCE_TOO_MANY:
+      "模型 evidence 超过 16 条；请要求模型减少引文后重试。",
+    CHAT_STRUCTURE_INVALID:
+      "模型返回了错误的任务结构；论文对话需要 answer 与 evidence。",
+  });
+  function fixedTaskErrorMessage(task, safe) {
+    if (Object.hasOwn(fixedTaskErrorMessages, safe.code)) {
+      return fixedTaskErrorMessages[safe.code];
+    }
+    if (safe.code === "CANCELLED") {
+      return task === "对话" ? "对话已取消。" : "分析已取消。";
+    }
+    return task === "对话"
+      ? "对话未完成；此前保存的问答仍保留。"
+      : "分析未完成；此前的阅读状态与分析仍保留。";
+  }
+  function visibleAnalysisError(job) {
+    const code = String(job && job.code || "ANALYSIS_FAILED");
+    const message = code === "AI_CONFIG_REQUIRED" || code === "AI_NOT_CONFIGURED"
+      ? "尚未配置 AI 模型。请点击“模型设置”，保存后可在这里直接分析。"
+      : Object.hasOwn(fixedTaskErrorMessages, code)
+        ? fixedTaskErrorMessages[code]
+        : "分析未完成；此前的阅读状态与分析仍保留。";
+    return { code, message };
+  }
   function logError(where, error) {
     const safe = safeError(error);
     try {
@@ -762,7 +812,7 @@
       if (!state || generation !== loadGeneration || state.currentItem !== item) return;
       renderChat(null);
       setStatus(state.chatStatus,
-        `对话记录读取失败：${safeError(error).message}`, "error");
+        taskErrorText("对话", error), "error");
     }
   }
   function cancelOwnedChat() {
@@ -773,7 +823,7 @@
       return true;
     }
     catch (error) {
-      setStatus(state.chatStatus, safeError(error).message, "error");
+      setStatus(state.chatStatus, taskErrorText("对话", error), "error");
       return false;
     }
   }
@@ -843,7 +893,7 @@
       setStatus(state.chatStatus,
         safe.code === "CANCELLED"
           ? "对话已取消；此前保存的问答仍保留。"
-          : safe.message,
+          : taskErrorText("对话", error),
         safe.code === "CANCELLED" ? "warning" : "error");
       await loadConversation(generation === chatGeneration ? loadGeneration : -1);
     }
@@ -1249,8 +1299,9 @@
     }
     else if (current.status === "error") {
       setBusy(false);
+      const { code, message } = visibleAnalysisError(current);
       setStatus(state.aiStatus,
-        current.detail || "分析失败。", "error");
+        `分析失败 [${code}]：${message}`, "error");
     }
     else if (current.status === "cancelled") {
       setBusy(false);
@@ -1326,13 +1377,15 @@
           || safe.code === "AI_NOT_CONFIGURED") {
         showJob({
           status: "error",
+          code: safe.code,
           detail: "尚未配置 AI 模型。请点击“模型设置”，保存后可在这里直接分析。",
         });
       }
       else {
         showJob({
           status: safe.code === "CANCELLED" ? "cancelled" : "error",
-          detail: safe.message,
+          code: safe.code,
+          detail: fixedTaskErrorMessage("分析", safe),
         });
       }
     }
@@ -1353,7 +1406,7 @@
         cancelled ? "pending" : "warning");
     }
     catch (error) {
-      setStatus(state.aiStatus, safeError(error).message, "error");
+      setStatus(state.aiStatus, taskErrorText("分析", error), "error");
     }
   }
   function dialogShell(title, onClose) {
@@ -1418,47 +1471,71 @@
   function promptLengthLabel(textarea, limit) {
     return `${String(getValue(textarea) || "").length.toLocaleString()} / ${limit.toLocaleString()} 字符`;
   }
+  function appendReadOnlyPromptPreview(container, title, text) {
+    const details = make("details", "rr-prompt-protocol");
+    const summary = make("summary", null, title);
+    const preview = make("pre", "rr-prompt-default", text);
+    preview.setAttribute("aria-label", title);
+    details.append(summary, preview);
+    container.append(details);
+    return { details, summary, preview };
+  }
   async function openPromptSettings() {
     if (!state) return null;
-    const shell = dialogShell("分析提示词", () => {});
+    const shell = dialogShell("分析与对话提示词", () => {});
     const { modal } = shell;
     const status = make("div", "rr-message");
     setHidden(status, true);
     const intro = make("div", "rr-callout");
-    intro.textContent = "这里显示并保存分析和论文对话将要发送的完整系统提示词。保存或恢复默认不会调用模型；旧结果保持原样，新分析或新对话才使用当前提示词。结构化 JSON 字段与可核验原文证据仍由后端校验。";
+    intro.textContent = "可编辑的学术指令 + 固定应用输出协议 = 实际发送内容。下面三项学术指令可保存或恢复；固定协议和实际完整系统提示词只读，可展开核对。保存或恢复不会调用模型；旧结果保持原样，新分析或新对话才使用当前设置。";
     const system = currentDocument().createElementNS(
       XHTML_NS, "textarea",
     );
     system.setAttribute("rows", "15");
     system.setAttribute("spellcheck", "false");
-    system.setAttribute("aria-label", "完整系统提示词");
+    system.setAttribute("aria-label", "分析学术指令（可编辑）");
     const synthesis = currentDocument().createElementNS(
       XHTML_NS, "textarea",
     );
     synthesis.setAttribute("rows", "5");
     synthesis.setAttribute("spellcheck", "false");
-    synthesis.setAttribute("aria-label", "综合阶段指令");
+    synthesis.setAttribute("aria-label", "综合阶段指令（可编辑）");
     const chat = currentDocument().createElementNS(
       XHTML_NS, "textarea",
     );
     chat.setAttribute("rows", "8");
-    chat.setAttribute("aria-label", "论文对话系统提示词");
+    chat.setAttribute("spellcheck", "false");
+    chat.setAttribute("aria-label", "论文对话学术指令（可编辑）");
     const systemCounter = make("span", "rr-field-help");
     const synthesisCounter = make("span", "rr-field-help");
     const chatCounter = make("span", "rr-field-help");
     const current = make("div", "rr-prompt-state");
     current.append(make("span", null, "正在读取当前提示词…"));
+    const actual = make("div", "rr-prompt-defaults");
+    actual.append(
+      make("h3", null, "实际发送内容（只读）"),
+      make("p", "rr-field-help",
+        "以下协议由应用固定追加，不能在这里编辑。有效完整提示词展示协议追加后的最终内容。"),
+    );
+    const analysisProtocol = appendReadOnlyPromptPreview(
+      actual, "固定分析应用输出协议", "");
+    const analysisEffective = appendReadOnlyPromptPreview(
+      actual, "有效完整分析系统提示词", "");
+    const chatProtocol = appendReadOnlyPromptPreview(
+      actual, "固定对话应用输出协议", "");
+    const chatEffective = appendReadOnlyPromptPreview(
+      actual, "有效完整对话系统提示词", "");
     const defaults = make("div", "rr-prompt-defaults");
-    defaults.append(make("h3", null, "当前默认值（只读，预览为完整实际文本）"));
+    defaults.append(make("h3", null, "当前版本默认学术指令（只读）"));
     const defaultSystem = make("pre", "rr-prompt-default");
     const defaultSynthesis = make("pre", "rr-prompt-default");
     const defaultChat = make("pre", "rr-prompt-default");
     defaults.append(
-      make("span", "rr-field-label", "默认完整系统提示词"),
+      make("span", "rr-field-label", "默认分析学术指令"),
       defaultSystem,
       make("span", "rr-field-label", "默认综合阶段指令"),
       defaultSynthesis,
-      make("span", "rr-field-label", "默认论文对话系统提示词"),
+      make("span", "rr-field-label", "默认论文对话学术指令"),
       defaultChat,
     );
     const updateCounters = () => {
@@ -1481,11 +1558,11 @@
     system.addEventListener("input", updateCounters);
     synthesis.addEventListener("input", updateCounters);
     chat.addEventListener("input", updateCounters);
-    const systemField = makeField("完整系统提示词", system);
+    const systemField = makeField("分析学术指令（可编辑）", system);
     systemField.append(systemCounter);
-    const synthesisField = makeField("综合阶段指令", synthesis);
+    const synthesisField = makeField("综合阶段指令（可编辑）", synthesis);
     synthesisField.append(synthesisCounter);
-    const chatField = makeField("论文对话系统提示词", chat);
+    const chatField = makeField("论文对话学术指令（可编辑）", chat);
     chatField.append(chatCounter);
     const actions = make("div", "rr-modal-actions");
     let config = null;
@@ -1498,7 +1575,7 @@
     actions.append(cancel, reset, save);
     modal.append(
       intro, current, systemField, synthesisField, chatField,
-      defaults, status, actions,
+      actual, defaults, status, actions,
     );
     const setWorking = value => {
       working = value;
@@ -1510,18 +1587,43 @@
       setBooleanAttribute(chat, "disabled", value);
     };
     const showConfig = next => {
-      config = next;
-      setValue(system, next.systemPrompt || "");
-      setValue(synthesis, next.synthesisInstruction || "");
-      setValue(chat, next.chatSystemPrompt || "");
-      defaultSystem.textContent = next.defaultSystemPrompt || "";
-      defaultSynthesis.textContent = next.defaultSynthesisInstruction || "";
-      defaultChat.textContent = next.defaultChatSystemPrompt || "";
+      config = next || {};
+      const value = name => typeof config[name] === "string" ? config[name] : "";
+      const missing = "当前服务未提供此只读内容。";
+      const version = config.outputContractVersion == null
+        || String(config.outputContractVersion).trim() === ""
+        ? "未提供" : String(config.outputContractVersion).trim();
+      setValue(system, value("systemPrompt"));
+      setValue(synthesis, value("synthesisInstruction"));
+      setValue(chat, value("chatSystemPrompt"));
+      defaultSystem.textContent = value("defaultSystemPrompt");
+      defaultSynthesis.textContent = value("defaultSynthesisInstruction");
+      defaultChat.textContent = value("defaultChatSystemPrompt");
+      analysisProtocol.summary.textContent =
+        `固定分析应用输出协议（只读 · 版本 ${version}）`;
+      chatProtocol.summary.textContent =
+        `固定对话应用输出协议（只读 · 版本 ${version}）`;
+      analysisProtocol.preview.textContent =
+        value("analysisOutputContract") || missing;
+      analysisEffective.preview.textContent =
+        value("effectiveAnalysisSystemPrompt") || missing;
+      chatProtocol.preview.textContent =
+        value("chatOutputContract") || missing;
+      chatEffective.preview.textContent =
+        value("effectiveChatSystemPrompt") || missing;
+      const analysisCustom = config.isCustom === true;
+      const chatCustom = config.isChatCustom === true;
+      const customLabel = analysisCustom && chatCustom
+        ? "当前使用自定义分析与对话提示词"
+        : analysisCustom
+          ? "当前使用自定义分析提示词"
+          : chatCustom
+            ? "当前使用自定义对话提示词"
+            : "当前使用默认提示词";
       current.replaceChildren(
-        make("strong", null,
-          next.isCustom ? "当前使用自定义提示词" : "当前使用默认提示词"),
+        make("strong", null, customLabel),
         make("span", null,
-          `Hash ${next.promptHash || "未记录"} · 保存于 ${formatDate(next.updatedAt)}`),
+          `应用输出协议版本 ${version} · 保存于 ${formatDate(config.updatedAt)}`),
       );
       updateCounters();
     };
@@ -1553,7 +1655,8 @@
         });
         showConfig(saved);
         setStatus(state.globalStatus,
-          "分析提示词已保存；新分析将使用此版本。", "success");
+          "分析、综合与对话三项提示词已保存；新分析或新对话将使用此版本。",
+          "success");
         shell.close();
       }
       catch (error) {
@@ -1572,7 +1675,8 @@
         const restored = await state.service.resetPromptConfig();
         showConfig(restored);
         setStatus(state.globalStatus,
-          "分析提示词已恢复为当前版本默认值。", "success");
+          "分析、综合与对话三项提示词已恢复为当前版本默认值。",
+          "success");
       }
       catch (error) {
         setStatus(status, safeError(error).message, "error");
@@ -2687,9 +2791,9 @@
         : "论文阅读室 · 原文与 AI 对照"),
     );
     const headerActions = make("div", "rr-header-actions");
-    const promptButton = makeApiButton("分析提示词", "rr-secondary",
+    const promptButton = makeApiButton("提示词设置", "rr-secondary",
       () => void openPromptSettings(),
-      "查看、编辑或恢复 AI 分析提示词");
+      "查看、编辑或恢复分析与对话提示词");
     const modelButton = makeApiButton("模型设置", "rr-secondary",
       () => void openModelSettings());
     headerActions.append(promptButton, modelButton);

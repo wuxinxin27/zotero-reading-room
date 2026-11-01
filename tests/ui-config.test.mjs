@@ -225,6 +225,7 @@ function paper(id, title, focused = false) {
 async function fixture({
   cached = false,
   failAnalysis = null,
+  failChat = null,
   promptConfig = null,
   contextOverrides = {},
   sharedService = null,
@@ -294,18 +295,35 @@ async function fixture({
   const defaultSystemPrompt = "Default complete system prompt.";
   const defaultSynthesisInstruction = "Default synthesis instruction.";
   const defaultChatSystemPrompt = "Default complete chat system prompt.";
-  let currentPrompt = promptConfig || {
-    systemPrompt: defaultSystemPrompt,
-    synthesisInstruction: defaultSynthesisInstruction,
-    chatSystemPrompt: defaultChatSystemPrompt,
+  const analysisOutputContract =
+    "Analysis application output protocol v1: return validated JSON.";
+  const chatOutputContract =
+    "Chat application output protocol v1: return answer and evidence.";
+  const effectivePrompt = (prompt, contract) => `${prompt}\n\n${contract}`;
+  const makePromptConfig = input => ({
+    ...input,
     defaultSystemPrompt,
     defaultSynthesisInstruction,
     defaultChatSystemPrompt,
-    chatPromptHash: "default-chat-prompt-hash",
-    promptHash: "default-prompt-hash",
-    isCustom: false,
+    analysisOutputContract,
+    chatOutputContract,
+    outputContractVersion: "1",
+    effectiveAnalysisSystemPrompt:
+      effectivePrompt(input.systemPrompt, analysisOutputContract),
+    effectiveChatSystemPrompt:
+      effectivePrompt(input.chatSystemPrompt, chatOutputContract),
+    chatPromptHash: "test-chat-prompt-hash",
+    promptHash: "test-prompt-hash",
+    isCustom: input.systemPrompt !== defaultSystemPrompt
+      || input.synthesisInstruction !== defaultSynthesisInstruction,
+    isChatCustom: input.chatSystemPrompt !== defaultChatSystemPrompt,
+  });
+  let currentPrompt = promptConfig || makePromptConfig({
+    systemPrompt: defaultSystemPrompt,
+    synthesisInstruction: defaultSynthesisInstruction,
+    chatSystemPrompt: defaultChatSystemPrompt,
     updatedAt: null,
-  };
+  });
   const cachedAnalysis = {
     mode: "model",
     source: { attachmentKey: "ATTACH01" },
@@ -381,6 +399,7 @@ async function fixture({
     async askPaper(item, question, options) {
       calls.push({ type: "askPaper", item, question, options });
       options.onProgress?.({ status: "extracting", detail: "extracting synthetic text" });
+      if (failChat) throw failChat;
       return {
         attachmentID: options.attachmentID,
         attachmentKey: "ATTACH01",
@@ -424,34 +443,21 @@ async function fixture({
     async savePromptConfig(input) {
       calls.push({ type: "savePromptConfig", input });
       promptSaves.push({ ...input });
-      currentPrompt = {
+      currentPrompt = makePromptConfig({
         ...input,
-        defaultSystemPrompt,
-        defaultSynthesisInstruction,
-        defaultChatSystemPrompt,
-        chatPromptHash: "custom-chat-prompt-hash",
-        promptHash: "custom-prompt-hash",
-        isCustom: input.systemPrompt !== defaultSystemPrompt
-          || input.synthesisInstruction !== defaultSynthesisInstruction,
         updatedAt: "2026-11-01T01:00:00.000Z",
-      };
+      });
       return { ...currentPrompt };
     },
     async resetPromptConfig() {
       calls.push({ type: "resetPromptConfig" });
       promptResets.push(true);
-      currentPrompt = {
+      currentPrompt = makePromptConfig({
         systemPrompt: defaultSystemPrompt,
         synthesisInstruction: defaultSynthesisInstruction,
         chatSystemPrompt: defaultChatSystemPrompt,
-        defaultSystemPrompt,
-        defaultSynthesisInstruction,
-        defaultChatSystemPrompt,
-        chatPromptHash: "default-chat-prompt-hash",
-        promptHash: "default-prompt-hash",
-        isCustom: false,
         updatedAt: "2026-11-01T02:00:00.000Z",
-      };
+      });
       return { ...currentPrompt };
     },
     async getAIConfig() {
@@ -609,7 +615,7 @@ async function fixture({
       return dialog;
     },
     async openPrompt() {
-      const open = button(document.body, "分析提示词");
+      const open = button(document.body, "提示词设置");
       assert.ok(open, "missing prompt button");
       open.click();
       await Promise.resolve();
@@ -800,24 +806,59 @@ test("prompt settings display, edit, save and reset through real UI events", asy
   let dialog = await h.openPrompt();
   const system = descendants(dialog, node =>
     node.localName === "textarea"
-    && node.getAttribute("aria-label") === "完整系统提示词")[0];
+    && node.getAttribute("aria-label") === "分析学术指令（可编辑）")[0];
   const synthesis = descendants(dialog, node =>
     node.localName === "textarea"
-    && node.getAttribute("aria-label") === "综合阶段指令")[0];
+    && node.getAttribute("aria-label") === "综合阶段指令（可编辑）")[0];
   const chat = descendants(dialog, node =>
     node.localName === "textarea"
-    && node.getAttribute("aria-label") === "论文对话系统提示词")[0];
+    && node.getAttribute("aria-label") === "论文对话学术指令（可编辑）")[0];
+  const promptText = textOf(dialog);
+  const analysisProtocol = descendants(dialog, node =>
+    node.localName === "pre"
+    && node.getAttribute("aria-label") === "固定分析应用输出协议")[0];
+  const analysisEffective = descendants(dialog, node =>
+    node.localName === "pre"
+    && node.getAttribute("aria-label") === "有效完整分析系统提示词")[0];
+  const chatProtocol = descendants(dialog, node =>
+    node.localName === "pre"
+    && node.getAttribute("aria-label") === "固定对话应用输出协议")[0];
+  const chatEffective = descendants(dialog, node =>
+    node.localName === "pre"
+    && node.getAttribute("aria-label") === "有效完整对话系统提示词")[0];
   assert.equal(system.value, "Default complete system prompt.");
   assert.equal(synthesis.value, "Default synthesis instruction.");
   assert.equal(chat.value, "Default complete chat system prompt.");
-  assert.ok(textOf(dialog).includes("Default complete system prompt."));
-  assert.ok(textOf(dialog).includes("Default complete chat system prompt."));
+  assert.match(promptText, /可编辑的学术指令 \+ 固定应用输出协议 = 实际发送内容/);
+  assert.ok(analysisProtocol);
+  assert.ok(analysisEffective);
+  assert.ok(chatProtocol);
+  assert.ok(chatEffective);
+  assert.equal(analysisProtocol.textContent,
+    "Analysis application output protocol v1: return validated JSON.");
+  assert.equal(chatProtocol.textContent,
+    "Chat application output protocol v1: return answer and evidence.");
+  assert.equal(analysisEffective.textContent,
+    "Default complete system prompt.\n\n"
+      + "Analysis application output protocol v1: return validated JSON.");
+  assert.equal(chatEffective.textContent,
+    "Default complete chat system prompt.\n\n"
+      + "Chat application output protocol v1: return answer and evidence.");
+  assert.ok(promptText.includes("固定分析应用输出协议（只读 · 版本 1）"));
+  assert.ok(promptText.includes("固定对话应用输出协议（只读 · 版本 1）"));
   system.value = "Custom full system prompt.\nKeep strict JSON.";
   system.dispatchEvent({ type: "input", target: system });
   synthesis.value = "Custom synthesis instruction.";
   synthesis.dispatchEvent({ type: "input", target: synthesis });
   chat.value = "Custom full chat system prompt.";
   chat.dispatchEvent({ type: "input", target: chat });
+  assert.equal(analysisProtocol.textContent,
+    "Analysis application output protocol v1: return validated JSON.");
+  assert.equal(analysisEffective.textContent,
+    "Default complete system prompt.\n\n"
+      + "Analysis application output protocol v1: return validated JSON.");
+  assert.equal(system.value,
+    "Custom full system prompt.\nKeep strict JSON.");
   assert.ok(textOf(dialog).includes("Default synthesis instruction."));
   button(dialog, "保存提示词").click();
   await new Promise(resolve => setImmediate(resolve));
@@ -829,19 +870,176 @@ test("prompt settings display, edit, save and reset through real UI events", asy
   assert.equal(h.service.calls.some(call =>
     ["analyze", "askPaper", "listModels", "listConfiguredModels"]
       .includes(call.type)), false);
+  assert.ok(textOf(h.document.body).includes(
+    "分析、综合与对话三项提示词已保存"));
 
   dialog = await h.openPrompt();
   button(dialog, "恢复默认值").click();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(h.service.promptResets.length, 1);
+  assert.ok(textOf(h.document.body).includes(
+    "分析、综合与对话三项提示词已恢复"));
   const restored = descendants(dialog, node =>
     node.localName === "textarea"
-    && node.getAttribute("aria-label") === "完整系统提示词")[0];
+    && node.getAttribute("aria-label") === "分析学术指令（可编辑）")[0];
   const restoredChat = descendants(dialog, node =>
     node.localName === "textarea"
-    && node.getAttribute("aria-label") === "论文对话系统提示词")[0];
+    && node.getAttribute("aria-label") === "论文对话学术指令（可编辑）")[0];
   assert.equal(restored.value, "Default complete system prompt.");
   assert.equal(restoredChat.value, "Default complete chat system prompt.");
+});
+
+test("chat-only customization is labeled without changing editable prompts", async () => {
+  const h = await fixture();
+  let dialog = await h.openPrompt();
+  const chat = descendants(dialog, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "论文对话学术指令（可编辑）")[0];
+  chat.value = "Chat-only academic instruction.";
+  chat.dispatchEvent({ type: "input", target: chat });
+  button(dialog, "保存提示词").click();
+  await new Promise(resolve => setImmediate(resolve));
+  dialog = await h.openPrompt();
+  assert.ok(textOf(dialog).includes("当前使用自定义对话提示词"));
+  assert.equal(textOf(dialog).includes("当前使用自定义分析提示词"), false);
+  const analysis = descendants(dialog, node =>
+    node.localName === "textarea"
+    && node.getAttribute("aria-label") === "分析学术指令（可编辑）")[0];
+  const analysisProtocol = descendants(dialog, node =>
+    node.localName === "pre"
+    && node.getAttribute("aria-label") === "固定分析应用输出协议")[0];
+  assert.equal(analysis.value, "Default complete system prompt.");
+  assert.equal(analysisProtocol.textContent,
+    "Analysis application output protocol v1: return validated JSON.");
+});
+
+test("prompt settings tolerate missing contract fields from an older service", async () => {
+  const h = await fixture({
+    promptConfig: {
+      systemPrompt: "Legacy analysis prompt.",
+      synthesisInstruction: "Legacy synthesis prompt.",
+      chatSystemPrompt: "Legacy chat prompt.",
+      defaultSystemPrompt: "Legacy default analysis.",
+      defaultSynthesisInstruction: "Legacy default synthesis.",
+      defaultChatSystemPrompt: "Legacy default chat.",
+      isCustom: false,
+      isChatCustom: false,
+      updatedAt: null,
+    },
+  });
+  const dialog = await h.openPrompt();
+  assert.ok(textOf(dialog).includes("固定分析应用输出协议（只读 · 版本 未提供）"));
+  assert.ok(textOf(dialog).includes("固定对话应用输出协议（只读 · 版本 未提供）"));
+  assert.ok(textOf(dialog).includes("当前服务未提供此只读内容。"));
+});
+
+test("prompt fields are sent by textContent without executing markup", async () => {
+  const markup = "<img src=x onerror=alert(1)> protocol";
+  const h = await fixture({
+    promptConfig: {
+      systemPrompt: "Analysis academic instruction.",
+      synthesisInstruction: "Synthesis academic instruction.",
+      chatSystemPrompt: "Chat academic instruction.",
+      defaultSystemPrompt: "Default analysis.",
+      defaultSynthesisInstruction: "Default synthesis.",
+      defaultChatSystemPrompt: "Default chat.",
+      analysisOutputContract: markup,
+      chatOutputContract: markup,
+      effectiveAnalysisSystemPrompt: markup,
+      effectiveChatSystemPrompt: markup,
+      outputContractVersion: "1",
+      isCustom: false,
+      isChatCustom: false,
+      updatedAt: null,
+    },
+  });
+  const dialog = await h.openPrompt();
+  const protocol = descendants(dialog, node =>
+    node.localName === "pre"
+    && node.getAttribute("aria-label") === "固定分析应用输出协议")[0];
+  assert.equal(protocol.textContent, markup);
+  assert.equal(protocol.children.length, 0);
+  assert.equal(source.includes("innerHTML"), false);
+});
+
+test("model failures show their task and safe code without raw transport details", async () => {
+  const analysis = new Error(
+    "Safe analysis message. endpoint=/secret/path raw-model-output reasoning");
+  analysis.code = "MODEL_OUTPUT_TRUNCATED";
+  const analysisView = await fixture({ failAnalysis: analysis });
+  button(analysisView.document.body, "AI 分析").click();
+  await new Promise(resolve => setImmediate(resolve));
+  const analysisText = textOf(analysisView.document.body);
+  assert.ok(analysisText.includes("分析失败 [MODEL_OUTPUT_TRUNCATED]"));
+  assert.ok(analysisText.includes(
+    "模型输出被长度限制截断；请提高模型输出上限或精简提示词后重试。"));
+  assert.equal(analysisText.includes("endpoint=/secret/path"), false);
+  assert.equal(analysisText.includes("raw-model-output"), false);
+
+  const chat = new Error("Safe chat message.");
+  chat.code = "CHAT_ANSWER_INVALID";
+  const chatView = await fixture({ failChat: chat });
+  questionInput(chatView).value = "Synthetic invalid answer";
+  button(chatView.document.body, "发送").click();
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  const chatText = textOf(chatView.document.body);
+  assert.ok(chatText.includes("对话失败 [CHAT_ANSWER_INVALID]"));
+  assert.ok(chatText.includes(
+    "模型未返回有效的 answer 文本；请核对对话提示词及模型输出。"));
+  assert.equal(chatText.includes("分析失败 [CHAT_ANSWER_INVALID]"), false);
+});
+
+test("persisted analysis errors keep their code and fixed task message", async () => {
+  const h = await fixture();
+  const originalDescribe = h.service.describe;
+  h.service.describe = async item => {
+    const description = await originalDescribe(item);
+    description.state.analysisJob = {
+      status: "error",
+      code: "MODEL_OUTPUT_TRUNCATED",
+      detail: "endpoint=/secret/path raw-model-output",
+    };
+    return description;
+  };
+  await h.switchContext({
+    ...h.nativeContext,
+    tabID: "reader-tab-2",
+    attachmentID: 102,
+    attachmentKey: "ATTACH02",
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("分析失败 [MODEL_OUTPUT_TRUNCATED]"));
+  assert.ok(text.includes(
+    "模型输出被长度限制截断；请提高模型输出上限或精简提示词后重试。"));
+  assert.equal(text.includes("endpoint=/secret/path"), false);
+  assert.equal(text.includes("raw-model-output"), false);
+});
+
+test("legacy persisted analysis errors omit a safe code instead of guessing", async () => {
+  const h = await fixture();
+  const originalDescribe = h.service.describe;
+  h.service.describe = async item => {
+    const description = await originalDescribe(item);
+    description.state.analysisJob = {
+      status: "error",
+      detail: "endpoint=/secret/path raw-model-output",
+    };
+    return description;
+  };
+  await h.switchContext({
+    ...h.nativeContext,
+    tabID: "reader-tab-2",
+    attachmentID: 102,
+    attachmentKey: "ATTACH02",
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("分析失败 [ANALYSIS_FAILED]"));
+  assert.ok(text.includes("分析未完成；此前的阅读状态与分析仍保留。"));
+  assert.equal(text.includes("endpoint=/secret/path"), false);
+  assert.equal(text.includes("raw-model-output"), false);
 });
 
 test("embedded layout hides its PDF workspace and shows paper chat without model calls on open", async () => {
