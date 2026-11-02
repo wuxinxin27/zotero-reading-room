@@ -1767,6 +1767,62 @@ summary:focus-visible,
   color: #6c531f;
 }
 
+.rr-coverage {
+  padding: 0;
+  border: 1px solid var(--rr-line);
+  border-left: 3px solid var(--rr-teal);
+  border-radius: 0 7px 7px 0;
+  background: #f8faf8;
+}
+
+.rr-coverage > summary {
+  padding: 7px 9px;
+  color: var(--rr-teal-deep);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.rr-coverage-body {
+  padding: 0 9px 8px;
+}
+
+.rr-coverage p {
+  margin: 5px 0 0;
+}
+
+.rr-coverage-range {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 12px;
+}
+
+.rr-coverage-muted,
+.rr-coverage-note {
+  color: var(--rr-muted);
+}
+
+.rr-coverage-warning {
+  color: #6c531f;
+  font-weight: 600;
+}
+
+.rr-coverage-sections {
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(52, 111, 98, .2);
+}
+
+.rr-coverage-section {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 3px;
+}
+
+.rr-coverage-section.rr-missing {
+  color: #6c531f;
+}
+
 .rr-modal-overlay {
   position: fixed;
   z-index: 50;

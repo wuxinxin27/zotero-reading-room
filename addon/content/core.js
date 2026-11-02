@@ -189,6 +189,177 @@
     return { chunks, analyzedCharacters: used, totalCharacters: document.segments.reduce((sum, segment) => sum + segment.text.length, 0) };
   }
 
+  // Heading labels are local selection hints, never classifications of a paper's claims.
+  function analysisSectionHint(line) {
+    const heading = line.trim().replace(/^#{1,6}\s*/, "")
+      .replace(/^(?:第[一二三四五六七八九十\d]+[章节]\s*|[一二三四五六七八九十百]+、\s*|(?:\d+(?:\.\d+)*[.)]?|[IVXLCDM]+[.)]?|[A-Z][.)])\s+)/, "");
+    if (!heading || heading.length > 120) return null;
+    const headings = [
+      ["appendix", /^(?:appendi(?:x|ces)\b|supplement(?:ary)?(?:\s+(?:material|information))?\b|附录|补充材料)/i],
+      ["references", /^(?:references?\b|bibliography\b|参考文献)/i],
+      ["limitations", /^(?:limitations?\b|局限(?:性)?|研究局限)/i],
+      ["conclusion", /^(?:conclusions?\b|concluding remarks\b|结论|总结与展望)/i],
+      ["methods", /^(?:methods?\b|methodology\b|materials? and methods\b|(?:proposed )?(?:approach|algorithm|framework)\b|system (?:design|architecture)\b|implementation\b|方法|研究方法|算法|系统设计|实现)/i],
+      ["experiments", /^(?:experiments?\b|experimental (?:setup|results|evaluation)\b|实验|试验)/i],
+      ["evaluation", /^(?:evaluation\b|performance evaluation\b|评估|评价|性能评测)/i],
+      ["results", /^(?:results?\b|结果|研究结果)/i],
+      ["discussion", /^(?:discussion\b|讨论)/i],
+      ["related-work", /^(?:related work\b|background\b|相关工作|背景)/i],
+      ["introduction", /^(?:introduction\b|引言|绪论)/i],
+      ["abstract", /^(?:abstract\b|摘要)/i]
+    ];
+    // Sentence-shaped lines remain unknown even when they start with a cue word.
+    if (/[。！？!?;；]|\.(?:\s|$)/.test(heading)) return null;
+    const match = headings.find(([, pattern]) => pattern.test(heading));
+    return match ? match[0] : null;
+  }
+
+  function planAnalysis(document, options = {}) {
+    options = options && typeof options === "object" ? options : {};
+    const limit = (value, fallback) => typeof value === "number" && Number.isFinite(value)
+      ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(value))) : fallback;
+    const maxCharacters = limit(options.maxCharacters, 120000);
+    const packetCharacters = limit(options.packetCharacters, 16000);
+    const maxPackets = limit(options.maxPackets, 12);
+    const segments = Array.isArray(document && document.segments) ? document.segments : [];
+    const sections = new Map();
+    const spans = [];
+    let totalCharacters = 0;
+    let currentHint = "unknown";
+    const addSpan = (segment, segmentIndex, start, end, hint) => {
+      if (end <= start) return;
+      const pageIndex = Number.isInteger(segment.pageIndex) && segment.pageIndex >= 0 ? segment.pageIndex : null;
+      spans.push({ segmentIndex, pageIndex, start, end, hint, text: segment.text });
+      if (!sections.has(hint)) sections.set(hint, { hint, totalCharacters: 0, selectedCharacters: 0 });
+      sections.get(hint).totalCharacters += end - start;
+    };
+    // Inspect every segment before applying a budget. In particular, references do
+    // not terminate scanning: appendices and later experiments may follow them.
+    segments.forEach((segment, segmentIndex) => {
+      if (!segment || typeof segment.text !== "string") return;
+      const text = segment.text;
+      totalCharacters += text.length;
+      let spanStart = 0;
+      for (let start = 0; start < text.length;) {
+        const newline = text.indexOf("\n", start);
+        const end = newline < 0 ? text.length : newline + 1;
+        const hint = analysisSectionHint(text.slice(start, end));
+        if (hint && hint !== currentHint) {
+          addSpan(segment, segmentIndex, spanStart, start, currentHint);
+          spanStart = start;
+          currentHint = hint;
+        }
+        start = end;
+      }
+      addSpan(segment, segmentIndex, spanStart, text.length, currentHint);
+    });
+    const capacity = Math.min(Number.MAX_SAFE_INTEGER, packetCharacters * maxPackets);
+    const budget = Math.min(totalCharacters, maxCharacters, capacity);
+    const windows = [];
+    if (budget > 0) {
+      const windowCharacters = 4000;
+      for (const span of spans) {
+        for (let start = span.start; start < span.end; start += windowCharacters) {
+          windows.push({ ...span, start, end: Math.min(start + windowCharacters, span.end) });
+        }
+      }
+    }
+    let selected = windows;
+    if (budget > 0 && budget < totalCharacters) {
+      // Even a short, single-region document needs two anchors when sampled.
+      if (windows.length === 1 && windows[0].end - windows[0].start > 1) {
+        const window = windows[0];
+        const middle = window.start + Math.ceil((window.end - window.start) / 2);
+        windows.splice(0, 1, { ...window, end: middle }, { ...window, start: middle });
+      }
+      const groups = new Map();
+      windows.forEach((window, index) => {
+        if (!groups.has(window.hint)) groups.set(window.hint, []);
+        groups.get(window.hint).push(index);
+      });
+      // First/last/midpoint breadth-first order spreads each hint over its full
+      // source range. Round-robin across hints retains small, late sections.
+      const queues = Array.from(groups.values(), indices => {
+        const order = [indices[0]];
+        if (indices.length > 1) order.push(indices[indices.length - 1]);
+        const ranges = [[1, indices.length - 2]];
+        for (let cursor = 0; cursor < ranges.length; cursor++) {
+          const [left, right] = ranges[cursor];
+          if (left > right) continue;
+          const middle = Math.floor((left + right) / 2);
+          order.push(indices[middle]);
+          if (left < middle) ranges.push([left, middle - 1]);
+          if (middle < right) ranges.push([middle + 1, right]);
+        }
+        return { order, cursor: 0 };
+      });
+      const chosen = new Set();
+      let available = 0;
+      const choose = index => {
+        if (available >= budget || chosen.has(index)) return;
+        chosen.add(index);
+        available += windows[index].end - windows[index].start;
+      };
+      choose(0);
+      // Reserve an end anchor before spending the rest of a small budget.
+      if (budget > 1 && windows.length > 1) {
+        const last = windows.length - 1;
+        chosen.add(last);
+        available += windows[last].end - windows[last].start;
+      }
+      while (available < budget) {
+        for (const queue of queues) {
+          while (queue.cursor < queue.order.length && chosen.has(queue.order[queue.cursor])) queue.cursor++;
+          if (queue.cursor < queue.order.length) choose(queue.order[queue.cursor++]);
+        }
+      }
+      selected = Array.from(chosen).sort((a, b) => a - b).map(index => ({ ...windows[index], selected: 0 }));
+      // Water-fill selected windows so both anchors survive small budgets and
+      // no duplicated or overlapping source interval is needed to use the budget.
+      let remaining = budget;
+      let active = selected.slice();
+      while (remaining > 0) {
+        const share = Math.max(1, Math.floor(remaining / active.length));
+        const next = [];
+        for (const window of active) {
+          const take = Math.min(share, remaining, window.end - window.start - window.selected);
+          window.selected += take;
+          remaining -= take;
+          if (window.selected < window.end - window.start) next.push(window);
+        }
+        active = next;
+      }
+      selected = selected.filter(window => window.selected > 0).map(window => {
+        const last = window.segmentIndex === windows[windows.length - 1].segmentIndex
+          && window.end === windows[windows.length - 1].end;
+        return { ...window, start: last ? window.end - window.selected : window.start,
+          end: last ? window.end : window.start + window.selected };
+      });
+    }
+    const packets = [];
+    let packetUsed = 0;
+    let analyzedCharacters = 0;
+    for (const window of selected) {
+      for (let start = window.start; start < window.end;) {
+        if (!packets.length || packetUsed === packetCharacters) {
+          packets.push({ excerpts: [] });
+          packetUsed = 0;
+        }
+        const end = Math.min(window.end, start + packetCharacters - packetUsed);
+        const text = window.text.slice(start, end);
+        packets[packets.length - 1].excerpts.push({ id: "s" + window.segmentIndex + ":" + start,
+          pageIndex: window.pageIndex, segmentIndex: window.segmentIndex, start, end, text, sectionHint: window.hint });
+        packetUsed += text.length;
+        analyzedCharacters += text.length;
+        sections.get(window.hint).selectedCharacters += text.length;
+        start = end;
+      }
+    }
+    return { packets, totalCharacters, analyzedCharacters, omittedCharacters: totalCharacters - analyzedCharacters,
+      selectionStrategy: analyzedCharacters === totalCharacters ? "complete-source" : "section-position-heuristic",
+      sections: Array.from(sections.values()), completeSelection: analyzedCharacters === totalCharacters };
+  }
+
   function validateModelOutput(raw, document, source) {
     if (!raw || !Array.isArray(raw.dimensions) || raw.dimensions.length > 12) {
       throw error("MODEL_SCHEMA_INVALID", "模型 JSON 的 dimensions 数组缺失、类型错误或条目数超限；请检查分析提示词与模型输出。");
@@ -276,5 +447,5 @@
 
   scope.ReadingRoomCore = Object.freeze({ SCHEMA_VERSION, STATUSES, API_PROVIDERS, DIMENSIONS, CONTRIBUTION_TYPES, error, clone, identity,
     defaultState, patchState, escapeHTML, hash, normalizeText, documentFromFullText, validateEvidence,
-    validateEndpoint, chunkDocument, validateModelOutput, validateModelNarrative, analysisNoteHTML });
+    validateEndpoint, chunkDocument, planAnalysis, validateModelOutput, validateModelNarrative, analysisNoteHTML });
 })(this);

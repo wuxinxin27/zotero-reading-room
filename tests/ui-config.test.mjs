@@ -224,6 +224,7 @@ function paper(id, title, focused = false) {
 
 async function fixture({
   cached = false,
+  cachedCoverage = null,
   failAnalysis = null,
   failChat = null,
   promptConfig = null,
@@ -339,6 +340,9 @@ async function fixture({
     coverage: { analyzedCharacters: 10, extractedCharacters: 20 },
     limitations: [],
   };
+  if (cachedCoverage) {
+    cachedAnalysis.coverage = { ...cachedAnalysis.coverage, ...cachedCoverage };
+  }
   const service = {
     calls,
     savedConfigs,
@@ -1281,6 +1285,9 @@ test("mount reuses only the current PDF cache and renders no catalog or attachme
   assert.ok(text.includes("Synthetic Beta"));
   assert.ok(text.includes("Synthetic PDF"));
   assert.ok(text.includes("Cached overview."));
+  assert.equal(descendants(h.document.body, node =>
+    node.classList.contains("rr-coverage")).length, 0);
+  assert.ok(text.includes("覆盖：10 / 20"));
   assert.equal(text.includes("Second PDF cached overview."), false);
   assert.equal(text.includes("Synthetic Alpha"), false);
   assert.equal(descendants(h.document.body, node => node.localName === "select"
@@ -1589,4 +1596,83 @@ test("a late status save from the previous parent cannot replace the current par
     && node.classList.contains("active"))[0];
   assert.ok(active);
   assert.equal(textOf(h.document.body).includes("阅读状态已保存，并同步为原生标签"), false);
+});
+
+test("new analysis coverage discloses complete extraction separately from page coverage", async () => {
+  const h = await fixture({ cached: true, cachedCoverage: {
+    analysisPlanVersion: 1,
+    selectionStrategy: "complete-source",
+    analyzedCharacters: 200,
+    extractedCharacters: 200,
+    omittedCharacters: 0,
+    extractedPages: 20,
+    totalPages: 20,
+    sections: [
+      { hint: "methods", totalCharacters: 100, selectedCharacters: 100 },
+      { hint: "references", totalCharacters: 100, selectedCharacters: 100 },
+    ],
+  } });
+  const panel = descendants(h.document.body, node =>
+    node.classList.contains("rr-coverage"))[0];
+  assert.ok(panel);
+  assert.equal(panel.localName, "details");
+  const text = textOf(panel);
+  assert.ok(text.includes("选中文字：200 / 200 字符"));
+  assert.ok(text.includes("PDF 文本抽取：20 / 20 页"));
+  assert.match(text, /已提交全部可提取文字/);
+  assert.match(text, /结构线索覆盖（自动识别，需核对）/);
+  assert.ok(text.includes("方法选中 100 / 100 字符"));
+  assert.match(text, /字符覆盖范围也不能证明模型已理解全文/);
+  assert.equal(/synthetic|api.?key|path=/i.test(text), false);
+});
+
+test("sampled coverage marks omitted and unselected late sections without inferring absence", async () => {
+  const h = await fixture({ cached: true, cachedCoverage: {
+    analysisPlanVersion: 1,
+    selectionStrategy: "section-position-heuristic",
+    analyzedCharacters: 650,
+    extractedCharacters: 1000,
+    omittedCharacters: 350,
+    extractedPages: 18,
+    totalPages: 20,
+    sections: [
+      { hint: "methods", totalCharacters: 400, selectedCharacters: 400 },
+      { hint: "experiments", totalCharacters: 250, selectedCharacters: 0 },
+      { hint: "appendix", totalCharacters: 250, selectedCharacters: 0 },
+      { hint: "results", totalCharacters: 100, selectedCharacters: 100 },
+    ],
+  } });
+  const text = textOf(descendants(h.document.body, node =>
+    node.classList.contains("rr-coverage"))[0]);
+  assert.ok(text.includes("选中文字：650 / 1,000 字符"));
+  assert.ok(text.includes("PDF 文本抽取：18 / 20 页"));
+  assert.match(text, /有 350 字符未进入本次分析/);
+  assert.ok(text.includes("实验选中 0 / 250 字符 · 未选中"));
+  assert.ok(text.includes("附录选中 0 / 250 字符 · 未选中"));
+  assert.equal(text.includes("已提交全部可提取文字"), false);
+  assert.equal(/没有实验|实验未报告/.test(text), false);
+});
+
+test("coverage clamps malformed counts and shows only known section labels as text", async () => {
+  const h = await fixture({ cached: true, cachedCoverage: {
+    analysisPlanVersion: 1,
+    selectionStrategy: "section-position-heuristic",
+    analyzedCharacters: Infinity,
+    extractedCharacters: 12,
+    omittedCharacters: -4,
+    extractedPages: 3,
+    totalPages: 4,
+    sections: [
+      { hint: "<img src=x onerror=alert(1)>", totalCharacters: 30, selectedCharacters: 30 },
+      { hint: "methods", totalCharacters: Infinity, selectedCharacters: 4 },
+    ],
+  } });
+  const panel = descendants(h.document.body, node =>
+    node.classList.contains("rr-coverage"))[0];
+  const text = textOf(panel);
+  assert.ok(text.includes("选中文字：0 / 12 字符"));
+  assert.match(text, /未识别段落/);
+  assert.ok(text.includes("方法选中 0 / 0 字符 · 未选中"));
+  assert.equal(descendants(panel, node => node.localName === "img").length, 0);
+  assert.equal(text.includes("onerror"), false);
 });

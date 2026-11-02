@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseTaskInput, createHarness, loadCore, plain } from "./fixtures/harness.mjs";
+import { parseTaskInput, createHarness, loadCore, plain, paper } from "./fixtures/harness.mjs";
+
+const firstSource = input => input.excerpts[0];
+const multiPacketPaper = { ...paper, text: paper.text.split("\f").map(page => page.padEnd(9000, " ")).join("\f") };
 
 const Core = loadCore();
 const providers = ["openai", "anthropic", "gemini", "ollama"];
@@ -31,7 +34,7 @@ function submittedChunk(options, provider) {
   return parseTaskInput(provider === "gemini" ? payload.contents[0].parts[0].text : payload.messages.find(entry => entry.role === "user").content);
 }
 function outputFor(task, chunk) {
-  const excerpt = task === "chat" ? chunk.excerpts[0] : chunk.stage === "synthesis" ? chunk.excerpts[0] : chunk;
+  const excerpt = firstSource(chunk);
   const evidence = excerpt ? [{ quote: (excerpt.text || excerpt.quote).slice(0, 80), pageIndex: excerpt.pageIndex }] : [];
   return task === "chat" ? { answer: prose, evidence } : {
     dimensions: ["problem", "novelty", "contributions", "prior-work", "superiority", "technical-uniqueness"]
@@ -53,7 +56,7 @@ function fakeHTTP(h, respond) {
 
 for (const provider of providers) {
   test(`${provider}: a gateway ignoring system fields still receives explicit frozen tasks and output contracts`, async () => {
-    const h = createHarness();
+    const h = createHarness({ extracted: multiPacketPaper });
     await configureProvider(h, provider);
     const config = await h.service.savePromptConfig({
       systemPrompt: "Frozen scholarly preference: discuss uncertainty in Chinese.",
@@ -71,7 +74,7 @@ for (const provider of providers) {
       const stage = task === "chat" ? "chat" : chunk.stage;
       stages.push(stage);
       assert.ok(user.startsWith(stage === "synthesis" ? "Synthesize the supplied verified excerpts"
-        : stage === "reading" ? "Analyze the supplied paper excerpt" : "Answer the supplied question"));
+        : stage === "reading" ? "Extract supported technical findings" : "Answer the supplied question"));
       assert.ok(user.includes(task === "chat" ? config.effectiveChatSystemPrompt : config.effectiveAnalysisSystemPrompt));
       if (stage === "synthesis") {
         assert.ok(user.includes("Saved synthesis instruction:\n" + config.synthesisInstruction));
@@ -107,7 +110,7 @@ for (const provider of providers) {
   });
 
   test(`${provider}: synthesis prose or truncation preserves the prior cache without repair requests`, async () => {
-    const h = createHarness();
+    const h = createHarness({ extracted: multiPacketPaper });
     await configureProvider(h, provider);
     fakeHTTP(h, ({ options }) => modelReply(provider, JSON.stringify(outputFor("analysis", submittedChunk(options, provider)))));
     await invokeTask(h, "analysis");
@@ -211,8 +214,8 @@ for (const provider of providers) {
       assert.equal(method, "POST");
       const payload = JSON.parse(options.body);
       const chunk = parseTaskInput(provider === "gemini" ? payload.contents[0].parts[0].text : payload.messages[provider === "anthropic" ? 0 : 1].content);
-      const quote = chunk.stage === "synthesis" ? chunk.excerpts[0].quote : chunk.text.slice(0, 80);
-      const pageIndex = chunk.stage === "synthesis" ? chunk.excerpts[0].pageIndex : chunk.pageIndex;
+      const quote = chunk.stage === "synthesis" ? chunk.excerpts[0].quote : firstSource(chunk).text.slice(0, 80);
+      const pageIndex = chunk.stage === "synthesis" ? chunk.excerpts[0].pageIndex : firstSource(chunk).pageIndex;
       assert.ok(quote.length > 30);
       if (provider === "anthropic") {
         assert.equal(payload.model, "demo");
@@ -234,7 +237,7 @@ for (const provider of providers) {
       }
       const text = "```json\n" + JSON.stringify({ dimensions: [
         { id: "problem", summary: "有引文支持的候选解释", evidence: [{ quote, pageIndex }] },
-        { id: "novelty", summary: "杜撰结论", evidence: [{ quote: "Fabricated quotation outside the paper.", pageIndex: chunk.pageIndex }] }
+        { id: "novelty", summary: "杜撰结论", evidence: [{ quote: "Fabricated quotation outside the paper.", pageIndex: firstSource(chunk).pageIndex }] }
       ] }) + "\n```";
       const middle = Math.floor(text.length / 2);
       const blocks = [{ type: "text", text: text.slice(0, middle) }, { type: "text", text: text.slice(middle) }];
@@ -253,7 +256,7 @@ for (const provider of providers) {
     assert.ok(result.dimensions[1].evidence.every(entry => !entry.verified));
     assert.equal(result.coverage.ratio, 1);
     assert.equal(result.coverage.completeDocument, true);
-    assert.equal(h.calls.requests.length, 3);
+    assert.equal(h.calls.requests.length, 1);
     assert.equal(h.calls.requests[0].url, provider === "gemini" ? "http://localhost:8123/proxy/v1beta/models/demo:generateContent" : endpointFor(provider));
     assert.equal(h.calls.requests[0].options.timeout, 120000);
     assert.equal(h.calls.noteSaves, 0);
@@ -422,7 +425,7 @@ for (const provider of providers) {
       const chunk = parseTaskInput(provider === "gemini" ? payload.contents[0].parts[0].text
         : payload.messages[provider === "anthropic" ? 0 : 1].content);
       const content = JSON.stringify({ dimensions: [{ id: "problem", summary: secret,
-        evidence: [{ quote: chunk.text.slice(0, 80), pageIndex: chunk.pageIndex }] }] })
+        evidence: [{ quote: firstSource(chunk).text.slice(0, 80), pageIndex: firstSource(chunk).pageIndex }] }] })
         .replace(secret, "\\u0073" + secret.slice(1));
       const response = provider === "anthropic" ? { content: [{ type: "text", text: content }] }
         : provider === "gemini" ? { candidates: [{ content: { parts: [{ text: content }] } }] }
@@ -448,28 +451,38 @@ test("model discovery checks credentials after decoding string JSON responses", 
   assert.equal(h.calls.writes.length, 0);
 });
 
-test("cancelling an active model upload preserves previous analysis and ignores a late response", async () => {
-  const h = createHarness();
-  const earlier = await h.service.analyze(h.parent);
-  let release;
-  let cancelled = 0;
-  let started;
-  const ready = new Promise(resolve => { started = resolve; });
-  h.Zotero.HTTP.request = async (_method, _url, options) => {
-    options.cancellerReceiver(() => { cancelled++; });
-    started();
-    return new Promise(resolve => { release = resolve; });
-  };
-  const pending = h.service.analyze(h.parent, { force: true, mode: "model", provider: "ollama", model: "demo", endpoint: "http://localhost" });
-  await ready;
-  assert.equal(h.service.cancelAnalysis(h.parent), true);
-  await assert.rejects(pending, { code: "CANCELLED" });
-  release({ status: 200, response: { message: { content: '{"dimensions":[]}' } } });
-  assert.equal(cancelled, 1);
-  assert.equal(h.service.getState(h.parent).analysis.id, earlier.id);
-  assert.equal(h.service.getState(h.parent).analysisJob.status, "cancelled");
-  assert.equal(h.service._controllers.size, 0);
-});
+for (const provider of providers) {
+  test(`${provider}: cancelling synthesis preserves cached bytes and ignores a late valid response`, async () => {
+    const h = createHarness({ extracted: multiPacketPaper });
+    await configureProvider(h, provider);
+    fakeHTTP(h, ({ options }) => modelReply(provider, JSON.stringify(outputFor("analysis", submittedChunk(options, provider)))));
+    const earlier = await invokeTask(h, "analysis");
+    const bytes = h.files.get(h.statePath), writes = h.calls.writes.length, requests = h.calls.requests.length;
+    let release;
+    let cancelled = 0;
+    let started;
+    const ready = new Promise(resolve => { started = resolve; });
+    fakeHTTP(h, ({ options }) => {
+      const input = submittedChunk(options, provider);
+      if (input.stage === "reading") return modelReply(provider, JSON.stringify(outputFor("analysis", input)));
+      options.cancellerReceiver(() => { cancelled++; });
+      started();
+      return new Promise(resolve => { release = resolve; });
+    });
+    const pending = invokeTask(h, "analysis");
+    await ready;
+    assert.equal(h.service.cancelAnalysis(h.parent), true);
+    await assert.rejects(pending, { code: "CANCELLED" });
+    release(modelReply(provider, '{"dimensions":[]}'));
+    assert.equal(cancelled, 1);
+    assert.equal(h.calls.requests.length, requests + 3);
+    assert.equal(h.service.getState(h.parent).analysis.id, earlier.id);
+    assert.equal(h.files.get(h.statePath), bytes);
+    assert.equal(h.calls.writes.length, writes);
+    assert.equal(h.service.getState(h.parent).analysisJob.status, "cancelled");
+    assert.equal(h.service._controllers.size, 0);
+  });
+}
 
 test("native Zotero timeout exceptions receive safe timeout codes", async () => {
   for (const listing of [true, false]) {
@@ -656,7 +669,7 @@ test("format compatibility still rejects citations from actual PDF regions absen
       const evidence = [{ quote: unseen, pageIndex: 11 }];
       // Analysis only tries the unseen quote in page 0 and synthesis, never where it was admitted.
       const raw = task === "chat" ? { answer: prose, evidence } : { dimensions: [{ id: "problem", summary: prose,
-        evidence: chunk.pageIndex === 0 || chunk.stage === "synthesis" ? evidence : [] }] };
+        evidence: chunk.excerpts.some(entry => entry.pageIndex === 0) || chunk.stage === "synthesis" ? evidence : [] }] };
       if (task === "chat") assert.equal(JSON.stringify(chunk.excerpts).includes(unseen), false);
       return modelReply("openai", outputWrappers[2][1](JSON.stringify(raw)));
     });

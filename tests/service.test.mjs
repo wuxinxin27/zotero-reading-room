@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { parseTaskInput, createHarness, paper, plain } from "./fixtures/harness.mjs";
 
+const firstSource = input => input.excerpts[0];
+
 test("initialization and description do not extract, index, upload, or create notes", async () => {
   const h = createHarness();
   await h.service.init();
@@ -84,7 +86,7 @@ test("default AI analysis preserves reading state, persists results, and writes 
   const progress = [];
   const result = await h.service.analyze(h.attachment, { onProgress: job => progress.push(job.status) });
   assert.equal(h.calls.extracts, 1);
-  assert.equal(h.calls.requests.length, 3);
+  assert.equal(h.calls.requests.length, 1);
   assert.equal(result.mode, "model");
   assert.equal(h.calls.noteSaves, 0);
   assert.equal(result.dimensions.length, 6);
@@ -206,16 +208,16 @@ test("genuine model HTTP requests are bounded and validated; API keys are never 
     h.calls.requests.push({ method, url, options });
     const sent = JSON.parse(options.body);
     const chunk = parseTaskInput(sent.messages[1].content);
-    const validQuote = chunk.stage === "synthesis" ? chunk.excerpts[0].quote : chunk.text.slice(0, 80);
-    const pageIndex = chunk.stage === "synthesis" ? chunk.excerpts[0].pageIndex : chunk.pageIndex;
+    const validQuote = chunk.stage === "synthesis" ? chunk.excerpts[0].quote : firstSource(chunk).text.slice(0, 80);
+    const pageIndex = chunk.stage === "synthesis" ? chunk.excerpts[0].pageIndex : firstSource(chunk).pageIndex;
     return { status: 200, response: { choices: [{ message: { content: JSON.stringify({ dimensions: [
       { id: "problem", summary: "模型候选解释", evidence: [{ quote: validQuote, pageIndex }] },
-      { id: "novelty", summary: "不能凭空确认的创新", evidence: [{ quote: "A fabricated quotation not in this paper.", pageIndex: chunk.pageIndex }] }
+      { id: "novelty", summary: "不能凭空确认的创新", evidence: [{ quote: "A fabricated quotation not in this paper.", pageIndex: firstSource(chunk).pageIndex }] }
     ] }) } }] } };
   };
   const secret = "unit-test-memory-key-ONLY";
   const result = await h.service.analyze(h.parent, { mode: "model", model: "synthetic-model", apiKey: secret });
-  assert.equal(h.calls.requests.length, 3);
+  assert.equal(h.calls.requests.length, 1);
   assert.equal(result.mode, "model");
   assert.equal(result.dimensions[0].summary, "模型候选解释");
   assert.equal(result.dimensions[1].summary, "信息不足");

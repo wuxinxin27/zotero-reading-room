@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { parseTaskInput, createHarness, plain, paper } from "./fixtures/harness.mjs";
 
+const firstSource = input => input.excerpts[0];
+const multiPacketPaper = { ...paper, text: paper.text.split("\f").map(page => page.padEnd(9000, " ")).join("\f") };
+
 const localConfig = { provider: "openai", endpoint: "http://localhost:8123/v1", model: "synthetic" };
 const remoteConfig = { ...localConfig, endpoint: "https://api.synthetic.example/v1", consentOrigin: "https://api.synthetic.example",
   consentProvider: "openai", allowRemoteDiscovery: true, allowRemoteAnalysis: true };
@@ -469,24 +472,25 @@ test("reader attachment paths are restricted to matching local PDF children and 
 });
 
 test("bounded final synthesis uses verified excerpts, writes natural narrative and preserves real figure references", async () => {
-  const h = createHarness();
+  const h = createHarness({ extracted: multiPacketPaper });
   let stages = [];
   h.Zotero.HTTP.request = async (method, url, options) => {
     h.calls.requests.push({ method, url, options });
     const chunk = parseTaskInput(JSON.parse(options.body).messages[1].content);
     stages.push(chunk.stage);
-    const quote = chunk.stage === "synthesis" ? chunk.excerpts[0] : { quote: chunk.text.split("\n").find(line => /Figure 1|Table 2/.test(line)), pageIndex: chunk.pageIndex };
+    const candidates = chunk.stage === "synthesis" ? chunk.excerpts : chunk.excerpts.flatMap(entry =>
+      entry.text.split("\n").filter(line => /Figure 1|Table 2/.test(line)).map(quote => ({ quote, pageIndex: entry.pageIndex })));
     if (chunk.stage === "synthesis") {
       assert.ok(JSON.stringify(chunk).length < 48000);
       assert.ok(chunk.excerpts.every(entry => paper.text.includes(entry.quote)));
       assert.equal(Object.hasOwn(chunk, "text"), false);
     }
-    const evidence = [{ quote: quote.quote, pageIndex: quote.pageIndex }];
+    const evidence = candidates.map(({ quote, pageIndex }) => ({ quote, pageIndex }));
     const response = { dimensions: [{ id: "problem", summary: chunk.stage === "synthesis" ? "从动机到技术的连贯学术解释。" : "逐段发现", evidence }],
       overview: "论文围绕校准问题展开，并需要结合实验条件理解其结论。", overviewEvidence: evidence,
       readingGuide: "结合原文的图表引用，先理解表示方法，再核对比较条件。", readingGuideEvidence: evidence,
-      figureTableReferences: chunk.stage === "synthesis" ? [] : [{ reference: chunk.pageIndex === 0 ? "Figure 1" : "Table 2",
-        kind: chunk.pageIndex === 0 ? "figure" : "table", explanation: "与方法或比较条件相关的图表文字候选。", ...evidence[0] }] };
+      figureTableReferences: chunk.stage === "synthesis" ? [] : evidence.map(entry => ({ reference: entry.pageIndex === 0 ? "Figure 1" : "Table 2",
+        kind: entry.pageIndex === 0 ? "figure" : "table", explanation: "与方法或比较条件相关的图表文字候选。", ...entry })) };
     return { status: 200, response: { choices: [{ message: { content: JSON.stringify(response) } }] } };
   };
   const result = await h.service.analyze(h.parent);
@@ -551,7 +555,7 @@ test("nested escaped credentials are rejected in narrative, figure explanations 
 });
 
 test("final synthesis cannot smuggle real but unsubmitted quotes or escaped credentials into a saved analysis", async () => {
-  const h = createHarness();
+  const h = createHarness({ extracted: multiPacketPaper });
   const saved = await h.service.analyze(h.parent);
   const writes = h.calls.writes.length;
   for (const echoCredential of [false, true]) {
@@ -559,7 +563,7 @@ test("final synthesis cannot smuggle real but unsubmitted quotes or escaped cred
       const chunk = parseTaskInput(JSON.parse(options.body).messages[1].content);
       const evidence = chunk.stage === "synthesis"
         ? [{ quote: "The main limitation is reduced accuracy when no calibration targets are visible.", pageIndex: 1 }]
-        : [{ quote: chunk.text.slice(0, 50), pageIndex: chunk.pageIndex }];
+        : [{ quote: firstSource(chunk).text.slice(0, 50), pageIndex: firstSource(chunk).pageIndex }];
       const response = { dimensions: [{ id: "problem", summary: chunk.stage === "synthesis" && echoCredential ? "\\u0073" + secret.slice(1) : "candidate", evidence }] };
       return { status: 200, response: { choices: [{ message: { content: JSON.stringify(response) } }] } };
     };
@@ -576,23 +580,161 @@ test("final synthesis cannot smuggle real but unsubmitted quotes or escaped cred
   }
 });
 
-test("long papers cap reading uploads and final synthesis size while reporting incomplete coverage", async () => {
-  const pages = Array.from({ length: 20 }, (_, index) => "Page " + index + " " + 'A"\\'.repeat(1800));
+test("a 20-page 76000-character source submits late experiments and end failures, then saves their verified evidence", async () => {
+  const experiment = "The experiment on page sixteen reports error 0.14 against baseline 0.28 at equal compute.";
+  const failure = "The end-of-paper failure case is unstable calibration under complete target occlusion.";
+  const pages = Array.from({ length: 20 }, (_, index) =>
+    ((index === 0 ? "Abstract\n" : index === 3 ? "Methods\n" : index === 16 ? "Experiments\n" : index === 19 ? "Limitations\n" : "")
+      + "Physical page " + index + ". " + (index === 16 ? experiment : index === 19 ? failure : "Synthetic source description.")
+      + "\n" + "Ordinary source context. ".repeat(180)).slice(0, 3800).padEnd(3800, " "));
   const h = createHarness({ extracted: { text: pages.join("\f"), extractedPages: 20, totalPages: 20 } });
-  let reading = 0;
-  let finalSize = 0;
+  const submitted = [];
+  const stages = [];
+  let finalInput;
   h.Zotero.HTTP.request = async (_method, _url, options) => {
     const input = parseTaskInput(JSON.parse(options.body).messages[1].content);
-    const evidence = input.stage === "synthesis" ? [input.excerpts[0]] : [{ quote: input.text.slice(0, 3900), pageIndex: input.pageIndex }];
-    if (input.stage === "synthesis") finalSize = JSON.stringify(input).length;
-    else reading++;
-    return { status: 200, response: { choices: [{ message: { content: JSON.stringify({ dimensions: [{ id: "problem", summary: "bounded", evidence }] }) } }] } };
+    stages.push(input.stage);
+    if (input.stage === "reading") submitted.push(...input.excerpts);
+    else finalInput = input;
+    const evidenceFor = quote => input.excerpts.filter(entry => (entry.text || entry.quote).includes(quote))
+      .map(entry => ({ quote, pageIndex: entry.pageIndex }));
+    return { status: 200, response: { choices: [{ message: { content: JSON.stringify({ dimensions: [
+      { id: "superiority", summary: "在明确的同等计算条件下，给出了实验误差比较。", evidence: evidenceFor(experiment) },
+      { id: "technical-uniqueness", summary: "该方法在目标完全遮挡时仍有失稳的适用限制。", evidence: evidenceFor(failure) }
+    ] }) } }] } };
   };
   const result = await h.service.analyze(h.parent);
-  assert.equal(reading, 12);
-  assert.ok(finalSize > 0 && finalSize <= 48000);
+  assert.equal(submitted.reduce((sum, entry) => sum + entry.text.length, 0), 76000);
+  assert.ok(submitted.some(entry => entry.pageIndex === 16 && entry.text.includes(experiment)));
+  assert.ok(submitted.some(entry => entry.pageIndex === 19 && entry.text.includes(failure)));
+  assert.equal(result.coverage.packetsAnalyzed, 5);
+  assert.deepEqual(stages, [...Array(5).fill("reading"), "synthesis"]);
+  assert.equal(result.coverage.analyzedCharacters, 76000);
+  assert.equal(result.coverage.omittedCharacters, 0);
+  assert.equal(result.coverage.completeDocument, true);
+  assert.equal(result.coverage.selectionStrategy, "complete-source");
+  assert.equal(result.coverage.analysisPlanVersion, 1);
+  assert.equal(result.coverage.sourceExcerpts, submitted.length);
+  assert.ok(result.coverage.sections.some(entry => entry.hint === "experiments" && entry.selectedCharacters > 0));
+  assert.ok(finalInput.excerpts.some(entry => entry.quote === experiment && entry.pageIndex === 16));
+  assert.ok(finalInput.excerpts.some(entry => entry.quote === failure && entry.pageIndex === 19));
+  const persisted = JSON.parse(h.files.get(h.statePath)).items["1:PAPER001"].analysis;
+  assert.ok(persisted.dimensions[4].evidence.some(entry => entry.verified && entry.pageIndex === 16));
+  assert.ok(persisted.dimensions[5].evidence.some(entry => entry.verified && entry.pageIndex === 19));
+});
+
+test("over-budget sources keep upload and synthesis limits, and cannot admit an unsubmitted appendix window", async () => {
+  const pages = Array.from({ length: 24 }, (_, page) => (page === 23 ? "Appendix\n" : page === 15 ? "Experiments\n" : "Methods\n")
+    + Array.from({ length: 60 }, (_, line) => "Physical page " + page + " row " + line + ": "
+      + "Numerical source context with escaped values \" \\ . ".repeat(5) + "\n").join(""));
+  const appendixQuotes = pages[23].split("\n").filter(line => line.length > 100);
+  const h = createHarness({ extracted: { text: pages.join("\f"), extractedPages: 24, totalPages: 24 } });
+  const submitted = [];
+  let finalInput;
+  let omitted;
+  h.Zotero.HTTP.request = async (_method, _url, options) => {
+    const input = parseTaskInput(JSON.parse(options.body).messages[1].content);
+    let evidence;
+    if (input.stage === "reading") {
+      submitted.push(...input.excerpts);
+      assert.ok(input.excerpts.reduce((sum, entry) => sum + entry.text.length, 0) <= 16000);
+      evidence = input.excerpts.map(entry => ({ quote: entry.text.slice(0, 320), pageIndex: entry.pageIndex }));
+    }
+    else {
+      finalInput = input;
+      omitted = appendixQuotes.find(quote => !submitted.some(entry => entry.text.includes(quote)));
+      assert.ok(omitted, "the fixture contains an appendix window absent from actual requests");
+      evidence = [{ quote: omitted, pageIndex: 23 }];
+    }
+    return { status: 200, response: { choices: [{ message: { content: JSON.stringify({ dimensions: [
+      { id: "problem", summary: "candidate appendix finding", evidence }
+    ] }) } }] } };
+  };
+  const result = await h.service.analyze(h.parent);
+  assert.ok(result.coverage.packetsAnalyzed <= 12);
+  assert.equal(submitted.reduce((sum, entry) => sum + entry.text.length, 0), 120000);
+  assert.ok(JSON.stringify(finalInput).length <= 48000);
+  assert.ok(finalInput.excerpts.length <= 48);
+  assert.ok(finalInput.excerpts.reduce((sum, entry) => sum + entry.quote.length, 0) <= 28000);
   assert.equal(result.coverage.completeDocument, false);
-  assert.equal(result.coverage.chunksAvailable, 20);
-  assert.ok(result.coverage.ratio < 1);
+  assert.ok(result.coverage.omittedCharacters > 0);
+  assert.equal(result.coverage.selectionStrategy, "section-position-heuristic");
   assert.ok(result.limitations.some(value => value.includes("仅分析了部分原文")));
+  assert.equal(result.dimensions[0].summary, "信息不足");
+  assert.equal(result.dimensions[0].evidence.length, 0);
+  assert.ok(!JSON.stringify(result).includes(omitted));
+});
+
+test("synthesis budget pressure retains linked late experiments and limits before abundant early figure references", async () => {
+  const experiment = "The late experiment measures 0.14 error versus baseline 0.28 under the same compute budget.";
+  const failure = "The final failure analysis reports unstable calibration when all targets are occluded.";
+  const figures = Array.from({ length: 40 }, (_, index) => "Figure " + (index + 1) + " describes synthetic module " + index + " and its explicit input representation.");
+  const pages = Array.from({ length: 20 }, (_, index) =>
+    ((index === 0 ? "Abstract\n" : index === 2 ? "Methods\n" : index === 16 ? "Experiments\n" : index === 19 ? "Limitations\n" : "")
+      + "Physical page " + index + ". " + (index === 0 ? figures.join("\n") : index === 16 ? experiment : index === 19 ? failure : "Synthetic technical source.")
+      + "\n" + ("Source detail on page " + index + ". ").repeat(400)).slice(0, 6000).padEnd(6000, " "));
+  const h = createHarness({ extracted: { text: pages.join("\f"), extractedPages: 20, totalPages: 20 } });
+  let finalInput;
+  h.Zotero.HTTP.request = async (_method, _url, options) => {
+    const input = parseTaskInput(JSON.parse(options.body).messages[1].content);
+    let raw;
+    if (input.stage === "reading") {
+      const evidence = input.excerpts.slice(0, 3).map(entry => ({ quote: entry.text.slice(0, 320), pageIndex: entry.pageIndex }));
+      const evidenceFor = quote => input.excerpts.filter(entry => entry.text.includes(quote)).map(entry => ({ quote, pageIndex: entry.pageIndex }));
+      raw = { dimensions: [
+        ...["problem", "novelty", "contributions", "prior-work"].map(id => ({ id,
+          summary: "Candidate local technical interpretation " + id + '"\\'.repeat(900), evidence })),
+        { id: "superiority", summary: "Late comparison with explicit resource conditions.", evidence: evidenceFor(experiment) },
+        { id: "technical-uniqueness", summary: "End failure condition limits the mechanism.", evidence: evidenceFor(failure) }
+      ], figureTableReferences: figures.flatMap(quote => input.excerpts.filter(entry => entry.text.includes(quote))
+        .map(entry => ({ reference: quote.match(/^Figure \d+/)[0], explanation: "Early figure candidate.", quote, pageIndex: entry.pageIndex }))) };
+    }
+    else {
+      finalInput = input;
+      raw = { dimensions: [] };
+    }
+    return { status: 200, response: { choices: [{ message: { content: JSON.stringify(raw) } }] } };
+  };
+  await h.service.analyze(h.parent);
+  assert.ok(JSON.stringify(finalInput).length <= 48000);
+  assert.ok(finalInput.excerpts.length <= 48);
+  assert.ok(finalInput.excerpts.reduce((sum, entry) => sum + entry.quote.length, 0) <= 28000);
+  assert.ok(finalInput.findings.length < 34, "large candidate summaries create real synthesis budget pressure");
+  const ids = new Set(finalInput.excerpts.map(entry => entry.id));
+  assert.equal(ids.size, finalInput.excerpts.length);
+  assert.equal(new Set(finalInput.excerpts.map(entry => entry.pageIndex + ":" + entry.quote)).size, ids.size);
+  assert.ok(finalInput.findings.every(entry => entry.evidenceIds.length && entry.evidenceIds.every(id => ids.has(id))));
+  assert.ok(finalInput.excerpts.every(entry => finalInput.findings.some(finding => finding.evidenceIds.includes(entry.id))));
+  for (const [quote, page, hint] of [[experiment, 16, "experiments"], [failure, 19, "limitations"]]) {
+    const excerpt = finalInput.excerpts.find(entry => entry.quote === quote);
+    assert.ok(excerpt);
+    assert.equal(excerpt.pageIndex, page);
+    assert.equal(excerpt.sectionHint, hint);
+    assert.ok(excerpt.sourceExcerptId);
+    assert.ok(finalInput.findings.some(entry => entry.evidenceIds.includes(excerpt.id)
+      && entry.pageIndices.includes(page) && entry.sectionHints.includes(hint)));
+  }
+  assert.ok(new Set(finalInput.findings.map(entry => entry.packetIndex)).size >= 4);
+});
+
+test("reading packets reject wrong physical pages and quotes crossing source excerpt boundaries", async () => {
+  const first = "Synthetic observations conclude with a crossing marker.";
+  const second = "Another independent method description begins here.";
+  const pages = ["Abstract\n" + first + "\nMethods\n" + second,
+    "Experiments\nA separate physical page contains a different source observation."];
+  const crossing = "a crossing marker.\nMethods\nAnother independent method";
+  assert.ok(pages[0].includes(crossing));
+  const h = createHarness({ extracted: { text: pages.join("\f"), extractedPages: 2, totalPages: 2 } });
+  h.Zotero.HTTP.request = async (_method, _url, options) => {
+    const input = parseTaskInput(JSON.parse(options.body).messages[1].content);
+    assert.ok(input.excerpts.some(entry => entry.pageIndex === 0 && entry.text.includes(first)));
+    assert.ok(!input.excerpts.some(entry => entry.text.includes(crossing)));
+    return { status: 200, response: { choices: [{ message: { content: JSON.stringify({ dimensions: [
+      { id: "problem", summary: "wrong-page claim", evidence: [{ quote: first, pageIndex: 1 }] },
+      { id: "novelty", summary: "cross-excerpt claim", evidence: [{ quote: crossing, pageIndex: 0 }] },
+      { id: "contributions", summary: "missing physical-page claim", evidence: [{ quote: first, pageIndex: null }] }
+    ] }) } }] } };
+  };
+  const result = await h.service.analyze(h.parent);
+  assert.ok(result.dimensions.slice(0, 3).every(entry => entry.summary === "信息不足" && entry.evidence.length === 0));
 });

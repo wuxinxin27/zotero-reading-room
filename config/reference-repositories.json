@@ -7,6 +7,28 @@
   },
   "repositories": [
     {
+      "id": "paperqa",
+      "repository": "Future-House/paper-qa",
+      "branch": "main",
+      "commit": "c692d0dfeac4a0296599f7fe21a253a58b7ac12a",
+      "sourcePaths": ["LICENSE", "src/paperqa/prompts.py", "src/paperqa/docs.py", "src/paperqa/settings.py", "src/paperqa/core.py", "src/paperqa/types.py"],
+      "license": "Apache-2.0",
+      "prefix": "zrrpaperqa",
+      "purpose": "先提取证据再综合、保留数值与上下文、限制引用为已知证据 ID；仅借鉴行为，不复制 QA 的 top-k 默认值。",
+      "queries": ["map_fxn_summary contexts", "citation context", "specific numbers equations"]
+    },
+    {
+      "id": "scientificskills",
+      "repository": "K-Dense-AI/scientific-agent-skills",
+      "branch": "main",
+      "commit": "a25cf9ec00e2745d03f8704acf6f6919694ccd9a",
+      "sourcePaths": ["LICENSE.md", "skills/scientific-critical-thinking/SKILL.md", "skills/scientific-critical-thinking/references/statistical_pitfalls.md", "skills/peer-review/SKILL.md", "skills/peer-review/references/statistical_reproducibility.md", "skills/peer-review/assets/claim_evidence_matrix_template.csv", "skills/peer-review/scripts/validate_claim_evidence.py"],
+      "license": "MIT",
+      "prefix": "zrrscientificskills",
+      "purpose": "主张、机制与实证证据分离，统计及复现报告检查，区分未报告与未执行；只读参考，不安装或执行上游技能。",
+      "queries": ["evidence_ids supported alignment", "missing reporting", "random seeds reproducibility"]
+    },
+    {
       "id": "zotero",
       "repository": "zotero/zotero",
       "branch": "main",

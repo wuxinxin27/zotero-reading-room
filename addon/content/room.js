@@ -431,6 +431,114 @@
     return Number.isFinite(number)
       ? Math.max(0, Math.min(100, Math.round(number * 100))) : 0;
   }
+  const COVERAGE_SECTION_LABELS = Object.freeze({
+    unknown: "未识别段落",
+    abstract: "摘要",
+    introduction: "引言",
+    "related-work": "相关工作 / 背景",
+    methods: "方法",
+    experiments: "实验",
+    evaluation: "评估",
+    results: "结果",
+    discussion: "讨论",
+    limitations: "局限",
+    conclusion: "结论",
+    appendix: "附录",
+    references: "参考文献",
+  });
+  function nonnegativeCount(value, cap = Number.MAX_SAFE_INTEGER) {
+    const number = Number(value);
+    return Number.isFinite(number)
+      ? Math.max(0, Math.min(cap, Math.floor(number))) : 0;
+  }
+  function formatCount(value) {
+    return nonnegativeCount(value).toLocaleString("zh-CN");
+  }
+  function coverageVersion(coverage, analysis) {
+    return nonnegativeCount(
+      coverage.analysisPlanVersion ?? analysis.analysisPlanVersion,
+      1000000,
+    );
+  }
+  function coverageSectionEntry(entry) {
+    if (!entry || typeof entry !== "object") return null;
+    const hint = typeof entry.hint === "string"
+      && Object.hasOwn(COVERAGE_SECTION_LABELS, entry.hint)
+      ? entry.hint : "unknown";
+    const totalCharacters = nonnegativeCount(entry.totalCharacters);
+    const selectedCharacters = Math.min(
+      totalCharacters, nonnegativeCount(entry.selectedCharacters),
+    );
+    return { hint, totalCharacters, selectedCharacters };
+  }
+  function renderCoverageDetails(coverage, version) {
+    const panel = make("details", "rr-coverage");
+    panel.append(make("summary", null, "选中文字范围"));
+    const body = make("div", "rr-coverage-body");
+    const totalCharacters = nonnegativeCount(coverage.extractedCharacters);
+    const selectedCharacters = Math.min(
+      totalCharacters, nonnegativeCount(coverage.analyzedCharacters),
+    );
+    const range = make("p", "rr-coverage-range");
+    range.append(make("span", null,
+      `选中文字：${formatCount(selectedCharacters)} / ${formatCount(totalCharacters)} 字符`));
+    if (coverage.extractedPages != null || coverage.totalPages != null) {
+      range.append(make("span", "rr-coverage-muted",
+        `PDF 文本抽取：${formatCount(coverage.extractedPages)} / ${formatCount(coverage.totalPages)} 页`));
+    }
+    body.append(range);
+    if (coverage.selectionStrategy === "complete-source"
+        && totalCharacters > 0 && selectedCharacters === totalCharacters) {
+      body.append(make("p", "rr-coverage-note",
+        "已提交全部可提取文字。这里的“文字”指本次可提取的 PDF 文本，不含图像内容。"));
+    }
+    else {
+      const omitted = Math.max(
+        nonnegativeCount(coverage.omittedCharacters),
+        totalCharacters - selectedCharacters,
+      );
+      body.append(make("p", "rr-coverage-warning", omitted > 0
+        ? `有 ${formatCount(omitted)} 字符未进入本次分析；相关部分可能未被涵盖。`
+        : "文字选取范围可能不完整；相关部分可能未被涵盖。"));
+    }
+    if (Array.isArray(coverage.sections) && coverage.sections.length) {
+      const groups = new Map();
+      for (const rawEntry of coverage.sections) {
+        const entry = coverageSectionEntry(rawEntry);
+        if (!entry) continue;
+        const old = groups.get(entry.hint)
+          || { hint: entry.hint, totalCharacters: 0, selectedCharacters: 0 };
+        old.totalCharacters = nonnegativeCount(
+          old.totalCharacters + entry.totalCharacters,
+        );
+        old.selectedCharacters = nonnegativeCount(
+          old.selectedCharacters + entry.selectedCharacters,
+        );
+        groups.set(entry.hint, old);
+      }
+      if (groups.size) {
+        const sections = make("div", "rr-coverage-sections");
+        sections.append(make("strong", null, "结构线索覆盖（自动识别，需核对）"));
+        for (const entry of groups.values()) {
+          const missing = entry.selectedCharacters === 0;
+          const row = make("div", "rr-coverage-section"
+            + (missing ? " rr-missing" : ""));
+          row.append(
+            make("span", null, COVERAGE_SECTION_LABELS[entry.hint]),
+            make("span", null,
+              `选中 ${formatCount(entry.selectedCharacters)} / ${formatCount(entry.totalCharacters)} 字符`
+              + (missing ? " · 未选中" : "")),
+          );
+          sections.append(row);
+        }
+        body.append(sections);
+      }
+    }
+    body.append(make("p", "rr-coverage-note",
+      `结构线索由标题文字自动匹配，不是已核实的分节；字符覆盖范围也不能证明模型已理解全文。分析计划 v${version}。`));
+    panel.append(body);
+    return panel;
+  }
   function syncActionLocks() {
     if (!state) return;
     const locked = !!state.analyzing || !!state.contextSwitching;
@@ -1093,13 +1201,15 @@
         `提示词保存：${formatDate(analysis.promptSnapshot.updatedAt)}`));
     }
     const coverage = analysis.coverage || {};
-    source.append(make("span", null,
+    const version = coverageVersion(coverage, analysis);
+    if (!version) source.append(make("span", null,
       `覆盖：${Number(coverage.analyzedCharacters || 0).toLocaleString()} / ${Number(coverage.extractedCharacters || 0).toLocaleString()} 字符 · ${percent(coverage.ratio)}%`));
-    if (coverage.extractedPages != null) {
+    if (!version && coverage.extractedPages != null) {
       source.append(make("span", null,
         `页：${coverage.extractedPages}${coverage.totalPages ? ` / ${coverage.totalPages}` : ""}`));
     }
     target.append(source);
+    if (version) target.append(renderCoverageDetails(coverage, version));
     if (analysis.overview || analysis.readingGuide) {
       const narrative = make("div", "rr-narrative-grid");
       narrative.append(narrativeSection(

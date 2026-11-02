@@ -71,6 +71,8 @@ npm run xref -- search zotero 'OSKeyStore Services logins'
 npm run xref -- search toolkit 'ReaderTool dialog unregisterAll'
 npm run xref -- search template 'onStartup onShutdown registerChrome'
 npm run xref -- search papersgpt 'getResponseByOnlineModel'
+npm run xref -- search paperqa 'map_fxn_summary contexts'
+npm run xref -- search scientificskills 'evidence_ids supported alignment'
 npm run xref -- search references 'PDF getFullText text'
 npm run xref -- def zotero ReaderInstance
 ```
@@ -80,6 +82,8 @@ npm run xref -- def zotero ReaderInstance
 | ID / 前缀 | 公开仓库与固定提交 | 用途与许可记录 |
 | --- | --- | --- |
 | `project` / `zrrlocal` | 本项目当前受限快照 | 本地实现、契约和测试，MIT |
+| `paperqa` / `zrrpaperqa` | [Future-House/paper-qa](https://github.com/Future-House/paper-qa/tree/c692d0dfeac4a0296599f7fe21a253a58b7ac12a) / `c692d0dfeac4a0296599f7fe21a253a58b7ac12a` | 证据提取与有界综合分离、已知引用 ID；Apache-2.0 |
+| `scientificskills` / `zrrscientificskills` | [K-Dense-AI/scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills/tree/a25cf9ec00e2745d03f8704acf6f6919694ccd9a) / `a25cf9ec00e2745d03f8704acf6f6919694ccd9a` | 主张—证据—限制、统计与复现报告；仓库及所选两项技能显式 MIT，仅只读参考 |
 | `zotero` / `zrrzotero` | [zotero/zotero](https://github.com/zotero/zotero/tree/212a7d6a585d1209bc4e698a904490205f139500) / `212a7d6a585d1209bc4e698a904490205f139500` | ReaderInstance、Items/Search、凭据、PDFWorker；相关源码头为 AGPL-3.0-or-later |
 | `reader` / `zrrreader` | [zotero/reader](https://github.com/zotero/reader/tree/b10db2071013d3c8b8db86e28c657621d75d8620) / `b10db2071013d3c8b8db86e28c657621d75d8620` | 页索引、导航、查找、清理；COPYING 声明 AGPLv3，按 AGPL-3.0-only 保守记录 |
 | `toolkit` / `zrrtoolkit` | [windingwind/zotero-plugin-toolkit](https://github.com/windingwind/zotero-plugin-toolkit/tree/0fbfd0258921044de1854b89d66b27762b10ee0a) / `0fbfd0258921044de1854b89d66b27762b10ee0a` | ReaderTool、对话框、事件注册和清理；MIT |
@@ -87,6 +91,19 @@ npm run xref -- def zotero ReaderInstance
 | `papersgpt` / `zrrpapersgpt` | [papersgpt/papersgpt-for-zotero](https://github.com/papersgpt/papersgpt-for-zotero/tree/e2706780651bf4af439e2a703a5b595d5ca0b910) / `e2706780651bf4af439e2a703a5b595d5ca0b910` | AI 请求、模型响应、PDF 文本；package.json 声明 AGPL-3.0-or-later |
 
 这些固定提交均不能直接当作 Zotero 10.0.7 稳定版的 API 证据。内部接口、页索引语义、事件和生命周期必须对照实际安装的宿主版本验证。本项目目前为 MIT；AGPL 参考仅用于理解 API/行为，未经许可证处理不得直接复制其代码或引入派生实现。具体文件和第三方组件的许可仍需逐一核对。
+
+## 工科证据提取与综合参考（2026-11-03）
+
+两个新增参考库使用清单内固定 SHA、受限源码路径与独立索引，不安装或执行上游技能。每次代码任务仍须先检索本项目，再检索相关上游；新增参考不豁免上述顺序。公开项目星数、比较和实际改动见 [ENGINEERING-READING.md](ENGINEERING-READING.md)。以下都是概念与行为参考，本插件实现及提示词为原创 MIT 内容。
+
+| 固定来源与原始位置 | 参考行为 | 本项目适配及边界 |
+| --- | --- | --- |
+| PaperQA `c692d0dfeac4a0296599f7fe21a253a58b7ac12a`，[src/paperqa/prompts.py:6](https://github.com/Future-House/paper-qa/blob/c692d0dfeac4a0296599f7fe21a253a58b7ac12a/src/paperqa/prompts.py#L6)、[同文件:52](https://github.com/Future-House/paper-qa/blob/c692d0dfeac4a0296599f7fe21a253a58b7ac12a/src/paperqa/prompts.py#L52)，Apache-2.0 | 提取证据时不直接作答，保留数值与方程；综合仅使用给定上下文和已知引用键 | 先按阅读包提取候选技术发现，再从本地匹配引文综合；不照搬 QA 的 top-k 或短摘要配置 |
+| 同一 PaperQA SHA，[src/paperqa/docs.py:551](https://github.com/Future-House/paper-qa/blob/c692d0dfeac4a0296599f7fe21a253a58b7ac12a/src/paperqa/docs.py#L551)、[同文件:643](https://github.com/Future-House/paper-qa/blob/c692d0dfeac4a0296599f7fe21a253a58b7ac12a/src/paperqa/docs.py#L643)、[src/paperqa/types.py:474](https://github.com/Future-House/paper-qa/blob/c692d0dfeac4a0296599f7fe21a253a58b7ac12a/src/paperqa/types.py#L474) | 分别处理来源后序列化证据、单独综合；引用限制到已知上下文 | 本项目采用确定性覆盖规划和有界 `findings.evidenceIds`，不增加并发模型、自动重试或外部检索；已知 ID 不代表语义支持已成立 |
+| Scientific skills `a25cf9ec00e2745d03f8704acf6f6919694ccd9a`，[skills/scientific-critical-thinking/SKILL.md:30](https://github.com/K-Dense-AI/scientific-agent-skills/blob/a25cf9ec00e2745d03f8704acf6f6919694ccd9a/skills/scientific-critical-thinking/SKILL.md#L30)、[skills/peer-review/SKILL.md:131](https://github.com/K-Dense-AI/scientific-agent-skills/blob/a25cf9ec00e2745d03f8704acf6f6919694ccd9a/skills/peer-review/SKILL.md#L131)，MIT | 先取证再判断；区分未报告和未执行；将主张、来源、幅度、不确定性及限制联系起来 | 原创工科提示词要求机制、作者主张与实证支持分开；保留现有六维结构，没有新增自动 supported/unsupported 学术裁决或临床审查表 |
+| 同一 skills SHA，[skills/peer-review/references/statistical_reproducibility.md:240](https://github.com/K-Dense-AI/scientific-agent-skills/blob/a25cf9ec00e2745d03f8704acf6f6919694ccd9a/skills/peer-review/references/statistical_reproducibility.md#L240)、[skills/peer-review/scripts/validate_claim_evidence.py:187](https://github.com/K-Dense-AI/scientific-agent-skills/blob/a25cf9ec00e2745d03f8704acf6f6919694ccd9a/skills/peer-review/scripts/validate_claim_evidence.py#L187) | 复现记录需版本、硬件、种子等；结构和自报对齐检查不证明真伪或复现成功 | 将这些内容作为有原文依据的阅读问题；只读该脚本，不执行或复制，不宣称完成代码复现、数值核验或论文质量评估 |
+
+本次没有复制 GPL 的 gpt_academic 或 CC-BY-NC-ND-4.0 的 ChatPaper 源码/提示词，也未引入 Docling/MinerU。MinerU 固定 SHA 的许可证带额外商业门槛和署名要求，不能按纯 Apache-2.0 处理。所有外部原文仅作资料，不能改变本项目权限或触发数据外发。
 
 ## Codex 项目级 MCP
 
