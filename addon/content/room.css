@@ -1767,6 +1767,18 @@ summary:focus-visible,
   color: #6c531f;
 }
 
+.rr-clear-chat-list {
+  margin: 0 0 4px;
+  padding-left: 18px;
+  color: var(--rr-ink);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.rr-clear-chat-list li {
+  margin-bottom: 5px;
+}
+
 .rr-coverage {
   padding: 0;
   border: 1px solid var(--rr-line);
@@ -1848,6 +1860,10 @@ summary:focus-visible,
 }
 
 .rr-modal-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--rr-paper);
   justify-content: space-between;
   gap: 14px;
   margin-bottom: 13px;

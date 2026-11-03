@@ -41,6 +41,14 @@ function tagAdapter(h, initial = [], parent = h.parent) {
   parent.reload = async (types, force) => { assert.deepEqual(plain(types), ["tags"]); assert.equal(force, true); state.reloads++; state.tags = plain(state.stored); };
   return state;
 }
+async function holdWrites(h) {
+  const gate = deferred(), started = deferred(), queued = deferred();
+  const serialize = h.service._serialize.bind(h.service);
+  const pending = serialize(async () => { started.resolve(); await gate.promise; });
+  await started.promise;
+  h.service._serialize = operation => { queued.resolve(); return serialize(operation); };
+  return { pending, queued: queued.promise, release() { h.service._serialize = serialize; gate.resolve(); } };
+}
 
 test("history loads without file checks, extraction, model/configuration/key reads, HTTP, or writes", async () => {
   const h = createHarness({ configured: false });
@@ -125,6 +133,162 @@ test("successful pairs reload per parent/library/attachment without overwriting 
   assert.equal((await reloaded.getConversation(h.parent, { attachmentID: 3 })).messages[0].content, "第二个附件");
   const state = reloaded.getState(h.parent);
   assert.equal(state.notes, "Keep my notes"); assert.equal(state.status, "reading"); assert.equal(state.analysis.id, "existing-analysis"); assert.equal(state.checklist.own, true);
+});
+
+test("clear removes only the frozen PDF conversation, preserves all other stored fields and reloads empty", async () => {
+  const h = createHarness(); mockChat(h);
+  const native = tagAdapter(h, [{ tag: "user-tag", type: 1 }]);
+  await h.service.setState(h.parent, { status: "reading", notes: "Keep my notes", checklist: { own: true } });
+  const note = new h.Note("note");
+  note.libraryID = 1; note.parentID = h.parent.id; note.setNote("<p>Previously exported note</p>"); await note.saveTx();
+  Object.assign(h.service._document.items["1:PAPER001"], {
+    analysis: { id: "keep-analysis", source: { attachmentKey: "ATTACH01" } },
+    analyses: { ATTACH01: { id: "first-analysis" }, ATTACH02: { id: "second-analysis" } },
+    _syncNote: { key: note.key, baseHash: "saved-note-hash" }, _analysisNotes: { "keep-analysis": { key: note.key } }
+  });
+  await h.service.askPaper(h.parent, "Delete this PDF pair", { attachmentID: 2 });
+  const otherPDF = { ...h.attachment, id: 3, key: "ATTACH02", localPath: "/synthetic/library/second.pdf" };
+  h.records.set(3, otherPDF); h.files.set(otherPDF.localPath, "synthetic");
+  await h.service.askPaper(h.parent, "Keep the other PDF pair", { attachmentID: 3 });
+  const other = addPaper(h, 10);
+  await h.service.askPaper(other.parent, "Keep the other paper pair");
+  h.libraries.set(2, { libraryID: 2, libraryType: "user", editable: true });
+  const otherLibrary = addPaper(h, 20, 2, h.parent.key);
+  await h.service.askPaper(otherLibrary.parent, "Keep the other library pair");
+  const prompts = await h.service.getPromptConfig();
+  await h.service.savePromptConfig({ ...prompts, chatSystemPrompt: "Keep the custom chat prompt" });
+  await h.service.saveAIConfig({ provider: "openai", endpoint: "http://127.0.0.1:11434", model: "keep-model" }, { apiKey: "synthetic-clear-key", rememberKey: true });
+  const before = h.files.get(h.statePath), expected = JSON.parse(before), tags = plain(native.tags), logins = plain(h.logins);
+  assert.equal(expected.items["1:PAPER001"].conversations.ATTACH01.messages.length, 2);
+  delete expected.items["1:PAPER001"].conversations.ATTACH01;
+  const calls = { writes: h.calls.writes.length, extracts: h.calls.extracts, requests: h.calls.requests.length,
+    fileChecks: h.calls.fileChecks, noteSaves: h.calls.noteSaves, tagSaves: native.saves };
+  h.files.delete(h.attachment.localPath);
+  h.service._config = h.service._findCredential = h.service._available = () => { throw new Error("clear must remain local metadata only"); };
+  const held = await holdWrites(h), options = { attachmentID: 2 };
+  const clearing = h.service.clearConversation(h.attachment, options);
+  await held.queued;
+  options.attachmentID = 3;
+  held.release(); await held.pending;
+  assert.deepEqual(plain(await clearing), { attachmentID: 2, attachmentKey: "ATTACH01", messages: [] });
+  assert.equal(h.files.get(h.statePath), JSON.stringify(expected, null, 2));
+  assert.deepEqual(plain(h.service._document), expected);
+  assert.equal(h.files.get(h.statePath + ".bak"), before);
+  assert.equal(h.calls.writes.length, calls.writes + 1);
+  for (const name of ["extracts", "fileChecks", "noteSaves"]) assert.equal(h.calls[name], calls[name]);
+  assert.equal(h.calls.requests.length, calls.requests); assert.equal(native.saves, calls.tagSaves);
+  assert.deepEqual(native.tags, tags); assert.deepEqual(plain(h.logins), logins);
+  assert.equal(h.records.get(note.id).getNote(), "<p>Previously exported note</p>");
+  const reloaded = new h.Service(h.Zotero);
+  assert.deepEqual(plain(await reloaded.getConversation(h.parent, { attachmentID: 2 })), { attachmentID: 2, attachmentKey: "ATTACH01", messages: [] });
+  assert.equal((await reloaded.getConversation(h.parent, { attachmentID: 3 })).messages.length, 2);
+  const writes = h.calls.writes.length;
+  await h.service.clearConversation(h.parent, { attachmentID: 2 });
+  assert.equal(h.calls.writes.length, writes);
+});
+
+test("clear of missing history is idempotent without model, key, local PDF or persistence access", async () => {
+  const h = createHarness({ configured: false });
+  h.files.delete(h.attachment.localPath);
+  h.service._config = h.service._findCredential = h.service._available = () => { throw new Error("clear must not inspect model or PDF availability"); };
+  for (let i = 0; i < 2; i++) {
+    assert.deepEqual(plain(await h.service.clearConversation(h.parent)), { attachmentID: 2, attachmentKey: "ATTACH01", messages: [] });
+  }
+  assert.deepEqual(plain(h.service._document.items), {});
+  assert.equal(h.calls.fileChecks + h.calls.extracts + h.calls.requests.length + h.calls.writes.length + h.calls.noteSaves, 0);
+});
+
+test("clear rejects wrong PDFs and queued attachment or parent identity changes without altering history", async () => {
+  for (const kind of ["wrong-id", "other-parent", "attachment-key", "attachment-parent", "attachment-library", "attachment-type", "attachment-deleted", "parent-key", "parent-id", "parent-library", "parent-deleted"]) {
+    const h = createHarness(); mockChat(h); await h.service.askPaper(h.parent, "Keep this saved pair");
+    const other = addPaper(h, 10);
+    const before = h.files.get(h.statePath), document = plain(h.service._document), writes = h.calls.writes.length;
+    if (kind === "wrong-id" || kind === "other-parent") {
+      await assert.rejects(h.service.clearConversation(h.parent, { attachmentID: kind === "wrong-id" ? 999 : other.attachment.id }), { code: "ATTACHMENT_NOT_FOUND" });
+    }
+    else {
+      const held = await holdWrites(h);
+      const clearing = h.service.clearConversation(h.parent, { attachmentID: 2 });
+      await held.queued;
+      if (kind === "attachment-key") h.attachment.key = "CHANGED1";
+      if (kind === "attachment-parent") h.attachment.parentItemID = other.parent.id;
+      if (kind === "attachment-library") h.attachment.libraryID = 2;
+      if (kind === "attachment-type") h.attachment.attachmentContentType = "text/plain";
+      if (kind === "attachment-deleted") h.attachment.deleted = true;
+      if (kind === "parent-key") h.parent.key = "CHANGED1";
+      if (kind === "parent-id") h.parent.id = 30;
+      if (kind === "parent-library") h.parent.libraryID = 2;
+      if (kind === "parent-deleted") h.parent.deleted = true;
+      held.release(); await held.pending;
+      await assert.rejects(clearing, { code: kind.startsWith("parent-") ? "INVALID_ITEM" : "ATTACHMENT_NOT_FOUND" });
+    }
+    assert.equal(h.files.get(h.statePath), before, kind);
+    assert.deepEqual(plain(h.service._document), document, kind);
+    assert.equal(h.calls.writes.length, writes, kind);
+  }
+});
+
+test("clear refuses any active chat for the parent without cancelling it, then succeeds after it finishes", async () => {
+  const h = createHarness(); mockChat(h); await h.service.askPaper(h.parent, "Earlier saved question");
+  const otherPDF = { ...h.attachment, id: 3, key: "ATTACH02", localPath: "/synthetic/library/second.pdf" };
+  h.records.set(3, otherPDF); h.files.set(otherPDF.localPath, "synthetic");
+  const gate = deferred(), started = deferred();
+  h.Zotero.HTTP.request = async () => { started.resolve(); return gate.promise; };
+  const pending = h.service.askPaper(h.parent, "Question for the other PDF", { attachmentID: 3 });
+  await started.promise;
+  const before = h.files.get(h.statePath), writes = h.calls.writes.length;
+  await assert.rejects(h.service.clearConversation(h.parent, { attachmentID: 2 }), { code: "CHAT_RUNNING" });
+  assert.equal(h.service._chatControllers.get("1:PAPER001").cancelled, false);
+  assert.equal(h.files.get(h.statePath), before); assert.equal(h.calls.writes.length, writes);
+  gate.resolve(response()); await pending;
+  assert.deepEqual(plain(await h.service.clearConversation(h.parent, { attachmentID: 2 })), { attachmentID: 2, attachmentKey: "ATTACH01", messages: [] });
+  assert.equal((await h.service.getConversation(h.parent, { attachmentID: 3 })).messages.length, 2);
+});
+
+test("a chat claiming the parent after clear resolves its target prevents the queued clear from writing", async () => {
+  const h = createHarness(); mockChat(h); await h.service.askPaper(h.parent, "Earlier saved question");
+  const before = h.files.get(h.statePath), document = plain(h.service._document), writes = h.calls.writes.length;
+  const held = await holdWrites(h), gate = deferred(), started = deferred();
+  const clearing = h.service.clearConversation(h.parent, { attachmentID: 2 });
+  await held.queued;
+  h.Zotero.HTTP.request = async () => { started.resolve(); return gate.promise; };
+  const pending = h.service.askPaper(h.parent, "New in-flight question");
+  await started.promise;
+  held.release(); await held.pending;
+  await assert.rejects(clearing, { code: "CHAT_RUNNING" });
+  assert.equal(h.files.get(h.statePath), before); assert.deepEqual(plain(h.service._document), document);
+  assert.equal(h.calls.writes.length, writes);
+  gate.resolve(response()); await pending;
+  assert.equal((await h.service.getConversation(h.parent)).messages.length, 4);
+  await h.service.clearConversation(h.parent);
+  assert.equal((await h.service.getConversation(h.parent)).messages.length, 0);
+});
+
+test("clear checks abort before starting and again before a queued persistence write", async () => {
+  for (const boundary of ["before-start", "queued"]) {
+    const h = createHarness(); mockChat(h); await h.service.askPaper(h.parent, "Keep this saved pair");
+    const before = h.files.get(h.statePath), document = plain(h.service._document), writes = h.calls.writes.length;
+    const controller = new AbortController();
+    const held = boundary === "queued" ? await holdWrites(h) : null;
+    if (!held) controller.abort();
+    const clearing = h.service.clearConversation(h.parent, { attachmentID: 2, signal: controller.signal });
+    if (held) { await held.queued; controller.abort(); held.release(); await held.pending; }
+    await assert.rejects(clearing, { code: "CANCELLED" });
+    assert.equal(h.files.get(h.statePath), before); assert.deepEqual(plain(h.service._document), document);
+    assert.equal(h.calls.writes.length, writes);
+  }
+});
+
+test("a failed atomic clear preserves cached and persisted history and leaves the write queue usable", async () => {
+  const h = createHarness(); mockChat(h); await h.service.askPaper(h.parent, "Keep this saved pair");
+  const before = h.files.get(h.statePath), document = plain(h.service._document), backup = h.files.get(h.statePath + ".bak");
+  h.io.failWrite = true;
+  await assert.rejects(h.service.clearConversation(h.parent, { attachmentID: 2 }), { code: "STATE_WRITE_FAILED" });
+  assert.equal(h.files.get(h.statePath), before); assert.deepEqual(plain(h.service._document), document);
+  assert.equal(h.files.get(h.statePath + ".bak"), backup);
+  assert.equal((await h.service.getConversation(h.parent)).messages.length, 2);
+  h.io.failWrite = false;
+  assert.equal((await h.service.clearConversation(h.parent)).messages.length, 0);
 });
 
 test("context is at most 24000 characters, selects late relevant pages and rejects genuine but unseen or wrong-page quotes", async () => {

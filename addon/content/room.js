@@ -44,10 +44,14 @@
   let checklistDirty = false;
   let aiConfigSession = null;
   let dialogSequence = 0;
+  const dialogClosers = new Set();
   let loadGeneration = 0;
   let started = false;
   let choiceSequence = 0;
   let chatController = null;
+  let chatClearController = null;
+  let chatClearSession = null;
+  let chatClearDialog = null;
   let chatGeneration = 0;
   let ownsShutdown = false;
   const choiceBindings = new WeakMap();
@@ -398,6 +402,24 @@
       ? "对话未完成；此前保存的问答仍保留。"
       : "分析未完成；此前的阅读状态与分析仍保留。";
   }
+  // Clearing is destructive, so it never forwards a backend or transport
+  // message: only a fixed, user-facing sentence per known code.
+  function clearChatErrorText(error) {
+    const code = safeError(error).code;
+    if (code === "CHAT_RUNNING") {
+      return "清空对话失败 [CHAT_RUNNING]：此文献在其他标签页仍有对话请求；"
+        + "请等待它结束或取消后再清空。此前保存的问答仍保留。";
+    }
+    if (code === "CANCELLED") {
+      return "已取消清空对话；此前保存的问答仍保留。";
+    }
+    if (code === "ATTACHMENT_NOT_FOUND" || code === "INVALID_ITEM"
+        || code === "PDF_MISSING") {
+      return "清空对话失败：当前 PDF 或文献标识已改变；"
+        + "请重新打开这篇论文的当前 PDF 后重试。此前保存的问答仍保留。";
+    }
+    return "清空对话失败；此前保存的问答仍保留。请稍后重试。";
+  }
   function visibleAnalysisError(job) {
     const code = String(job && job.code || "ANALYSIS_FAILED");
     const message = code === "AI_CONFIG_REQUIRED" || code === "AI_NOT_CONFIGURED"
@@ -543,11 +565,16 @@
     if (!state) return;
     const locked = !!state.analyzing || !!state.contextSwitching;
     const bound = !!currentNativeBinding();
+    const chatLocked = locked || !!state.chatLoading || !!state.chatClearing;
+    const chatBound = !!state.currentItem && !!state.currentAttachmentID && bound;
     setBooleanAttribute(state.modelButton, "disabled", locked);
     setBooleanAttribute(state.promptButton, "disabled", locked);
     setBooleanAttribute(state.chatSendButton, "disabled",
-      locked || !!state.chatLoading || !state.currentItem
-      || !state.currentAttachmentID || !bound);
+      chatLocked || !chatBound);
+    if (state.chatClearButton) {
+      setBooleanAttribute(state.chatClearButton, "disabled",
+        chatLocked || !chatBound);
+    }
     setBooleanAttribute(state.aiButton, "disabled",
       locked || !state.currentItem || !state.currentAttachmentID || !bound);
     setBooleanAttribute(state.reanalyzeButton, "disabled",
@@ -555,7 +582,7 @@
     setBooleanAttribute(state.chatCancelButton, "disabled",
       !state.chatLoading);
     setBooleanAttribute(state.chatInput, "disabled",
-      locked || !!state.chatLoading || !state.currentAttachmentID || !bound);
+      chatLocked || !state.currentAttachmentID || !bound);
   }
   function checkedCount(checklist) {
     return CHECKLIST.reduce(
@@ -898,7 +925,8 @@
       state.chatMessages.append(article);
     }
   }
-  async function loadConversation(generation = loadGeneration) {
+  async function loadConversation(generation = loadGeneration,
+    chatSnapshot = chatGeneration) {
     if (!state || !state.currentItem) {
       renderChat(null);
       return;
@@ -916,12 +944,15 @@
       const conversation = typeof state.service.getConversation === "function"
         ? await state.service.getConversation(item, { attachmentID })
         : null;
-      if (!state || generation !== loadGeneration || state.currentItem !== item
+      if (!state || generation !== loadGeneration
+          || chatSnapshot !== chatGeneration || state.currentItem !== item
           || state.currentAttachmentID !== attachmentID) return;
       renderChat(conversation);
     }
     catch (error) {
-      if (!state || generation !== loadGeneration || state.currentItem !== item) return;
+      if (!state || generation !== loadGeneration
+          || chatSnapshot !== chatGeneration
+          || state.currentItem !== item) return;
       renderChat(null);
       setStatus(state.chatStatus,
         taskErrorText("对话", error), "error");
@@ -941,13 +972,19 @@
   }
   function cancelOwnedRequests() {
     try { chatController?.abort(); } catch (_) {}
+    // A queued clear is owned by this view too: the backend checks the signal
+    // before committing, so aborting it leaves the saved history untouched.
+    try { chatClearController?.abort(); } catch (_) {}
     try { analysisController?.abort(); } catch (_) {}
-    chatController = analysisController = null;
+    chatController = chatClearController = analysisController = null;
+    // The aborted session can no longer own the chat locks.
+    chatClearSession = null;
     activeJob = null;
-    if (state) state.chatLoading = state.analyzing = false;
+    if (state) state.chatLoading = state.chatClearing = state.analyzing = false;
   }
   async function sendChat() {
-    if (!state || !state.currentItem || state.chatLoading || !isEmbedded()) return;
+    if (!state || !state.currentItem || state.chatLoading
+        || state.chatClearing || !isEmbedded()) return;
     if (state.contextSwitching || !state.currentAttachmentID || !currentNativeBinding()) {
       setStatus(state.chatStatus,
         "当前原生标签页没有匹配这篇论文的本地 PDF；不能向模型提交原文。",
@@ -1016,6 +1053,132 @@
           state.chatLoading = false;
           syncActionLocks();
         }
+      }
+    }
+  }
+  function clearChatUnavailable(message, kind) {
+    if (state) setStatus(state.chatStatus, message, kind || "warning");
+    return null;
+  }
+  function requestClearChat() {
+    if (!state || !state.currentItem) return null;
+    const view = state;
+    if (chatClearDialog) return chatClearDialog;
+    if (view.chatLoading || view.chatClearing || view.analyzing
+        || view.contextSwitching) {
+      return null;
+    }
+    if (!isEmbedded() || !view.currentAttachmentID || !currentNativeBinding()) {
+      return clearChatUnavailable(
+        "当前原生标签页没有匹配这篇论文的本地 PDF；无法清空对话。");
+    }
+    if (typeof view.service.clearConversation !== "function") {
+      return clearChatUnavailable("当前服务版本不提供清空对话。", "error");
+    }
+    // Freeze the exact paper, PDF and generations the user is confirming.
+    const item = view.currentItem;
+    const attachmentID = view.currentAttachmentID;
+    const documentGeneration = loadGeneration;
+    const chatSnapshot = chatGeneration;
+    const shell = dialogShell("清空当前 PDF 对话", () => {
+      if (chatClearDialog === shell) chatClearDialog = null;
+    });
+    chatClearDialog = shell;
+    const { modal } = shell;
+    const intro = make("div", "rr-callout rr-warning");
+    intro.textContent =
+      "清空这篇论文当前 PDF 已保存的问题与回答；插件内无法撤销。原有备份、导出文件和 Zotero 笔记不会被清理。";
+    const scope = currentDocument().createElementNS(XHTML_NS, "ul");
+    setClass(scope, "rr-clear-chat-list");
+    for (const text of [
+      "删除范围：仅这篇论文当前 PDF 的对话；同一论文的其他 PDF 与其他论文的对话不受影响。",
+      "之后向模型发送新问题时，不再包含已清空的问答；此前记录不会作为模型历史继续发送。",
+      "保持不变：AI 解读、阅读笔记、阅读状态与检查清单都不会被修改。",
+      "其他标签页正在进行的对话不会被取消；此时需要等待其结束或先取消。",
+    ]) {
+      const entry = currentDocument().createElementNS(XHTML_NS, "li");
+      entry.textContent = text;
+      scope.append(entry);
+    }
+    const actions = make("div", "rr-modal-actions");
+    const cancel = makeApiButton("取消", "rr-secondary", () => shell.close(),
+      "关闭对话框，不删除任何已保存的问答");
+    const confirm = makeApiButton("确认清空", "rr-danger",
+      () => submitClearChat());
+    actions.append(cancel, confirm);
+    modal.append(intro, scope, actions);
+    const submitClearChat = () => {
+      // The dialog can outlive its binding: only an unchanged paper, PDF,
+      // document generation and chat generation may still clear.
+      const stale = !state || state !== view
+        || loadGeneration !== documentGeneration
+        || chatGeneration !== chatSnapshot
+        || state.currentItem !== item
+        || state.currentAttachmentID !== attachmentID
+        || state.chatLoading || state.chatClearing;
+      shell.close();
+      if (stale) {
+        if (state === view) {
+          setStatus(view.chatStatus,
+            "当前论文或 PDF 已改变；未清空对话。", "warning");
+        }
+        return;
+      }
+      void clearChat(view, { item, attachmentID });
+    };
+    cancel.focus?.();
+    return shell;
+  }
+  async function clearChat(view, binding) {
+    if (!state || state !== view) return;
+    const { item, attachmentID } = binding;
+    const documentGeneration = loadGeneration;
+    // Invalidate pending history loads and progress for this PDF so a stale
+    // response cannot restore the history this clear removes.
+    const clearGeneration = ++chatGeneration;
+    const Controller = view.window.AbortController || scope.AbortController;
+    const controller = Controller ? new Controller() : null;
+    const session = { controller, generation: clearGeneration };
+    chatClearSession = session;
+    chatClearController = controller;
+    view.chatClearing = true;
+    syncActionLocks();
+    setStatus(view.chatStatus, "正在清空当前 PDF 的对话…", "pending");
+    try {
+      const result = await view.service.clearConversation(item, {
+        attachmentID,
+        signal: controller && controller.signal,
+      });
+      if (!state || state !== view
+          || chatGeneration !== session.generation
+          || loadGeneration !== documentGeneration
+          || state.currentItem !== item
+          || state.currentAttachmentID !== attachmentID) return;
+      renderChat(result);
+      setValue(state.chatInput, "");
+      setStatus(state.chatStatus,
+        "已清空当前 PDF 的对话；AI 解读、笔记与阅读状态保持不变。",
+        "success");
+    }
+    catch (error) {
+      if (!state || state !== view
+          || chatGeneration !== session.generation
+          || loadGeneration !== documentGeneration
+          || state.currentItem !== item) return;
+      // Keep whatever is on screen and re-read the authoritative history so a
+      // failed or refused clear never looks like a successful one.
+      setStatus(state.chatStatus, clearChatErrorText(error), "error");
+      await loadConversation(loadGeneration, chatGeneration);
+    }
+    finally {
+      // A newer clear (or context change) owns the locks now; only the session
+      // that still holds them may release them.
+      if (chatClearSession !== session) return;
+      chatClearSession = null;
+      chatClearController = null;
+      if (state === view) {
+        view.chatClearing = false;
+        syncActionLocks();
       }
     }
   }
@@ -1551,6 +1714,34 @@
     heading.append(close);
     modal.append(heading);
     overlay.append(modal);
+    // The native item pane can clip a tall iframe. Use its visible intersection
+    // for dialogs rather than centering them in the iframe's full viewport.
+    const frame = doc.defaultView?.frameElement;
+    const host = frame?.ownerDocument?.defaultView;
+    const positionDialog = () => {
+      if (closed || !frame?.getBoundingClientRect || !host?.getComputedStyle) return;
+      const rect = frame.getBoundingClientRect();
+      let top = Math.max(0, rect.top);
+      let bottom = Math.min(host.innerHeight, rect.bottom);
+      for (let node = frame.parentElement; node; node = node.parentElement) {
+        const style = host.getComputedStyle(node);
+        if (!/(auto|scroll|hidden|clip)/.test(style.overflowY || style.overflow || "")) continue;
+        const clip = node.getBoundingClientRect();
+        top = Math.max(top, clip.top);
+        bottom = Math.min(bottom, clip.bottom);
+      }
+      if (!Number.isFinite(top) || !Number.isFinite(bottom) || bottom <= top) return;
+      const height = bottom - top;
+      overlay.style.top = `${top - rect.top}px`;
+      overlay.style.bottom = "auto";
+      overlay.style.height = `${height}px`;
+      overlay.style.padding = "8px";
+      modal.style.maxHeight = `${Math.max(0, height - 16)}px`;
+    };
+    if (host) {
+      host.addEventListener("scroll", positionDialog, true);
+      host.addEventListener("resize", positionDialog);
+    }
     const onKeyDown = event => {
       if (event.key !== "Escape") return;
       const openChoice = [...choiceInstances].find(binding =>
@@ -1568,6 +1759,9 @@
     const closeDialog = () => {
       if (closed) return;
       closed = true;
+      dialogClosers.delete(closeDialog);
+      host?.removeEventListener("scroll", positionDialog, true);
+      host?.removeEventListener("resize", positionDialog);
       disposeChoices(modal);
       overlay.removeEventListener("click", onOverlayClick);
       overlay.removeEventListener("keydown", onKeyDown, true);
@@ -1580,6 +1774,9 @@
     overlay.addEventListener("click", onOverlayClick);
     overlay.addEventListener("keydown", onKeyDown, true);
     body.append(overlay);
+    dialogClosers.add(closeDialog);
+    positionDialog();
+    doc.defaultView?.requestAnimationFrame?.(positionDialog);
     return { overlay, modal, close: closeDialog };
   }
   function promptLengthLabel(textarea, limit) {
@@ -2708,7 +2905,11 @@
     if (!state) return;
     const generation = ++loadGeneration;
     const nextParent = item && state.service.normalizeItem(item);
-    state.chatLoading = false;
+    // A clear bound to the previous paper must not commit after this switch.
+    try { chatClearController?.abort(); } catch (_) {}
+    chatClearController = null;
+    chatClearSession = null;
+    state.chatLoading = state.chatClearing = false;
     renderChat(null);
     await destroyPdf();
     if (!state || generation !== loadGeneration) return;
@@ -3052,7 +3253,10 @@
     const chatCancelButton = makeApiButton(
       "取消对话", "rr-danger", cancelOwnedChat);
     setBooleanAttribute(chatCancelButton, "disabled", true);
-    chatActions.append(chatCancelButton, chatSendButton);
+    const chatClearButton = makeApiButton(
+      "清空对话", "rr-secondary", () => void requestClearChat(),
+      "删除这篇论文当前 PDF 已保存的问题与回答；AI 解读、笔记与阅读状态不受影响");
+    chatActions.append(chatClearButton, chatCancelButton, chatSendButton);
     const chatStatus = make("div", "rr-message");
     setHidden(chatStatus, true);
     chatSection.append(
@@ -3173,8 +3377,10 @@
       chatInput,
       chatSendButton,
       chatCancelButton,
+      chatClearButton,
       chatStatus,
       chatLoading: false,
+      chatClearing: false,
       noteButton,
       syncButton,
       noteStatus,
@@ -3273,10 +3479,16 @@
   function disposeRuntime() {
     const view = state;
     if (!view) return;
+    for (const close of [...dialogClosers]) close();
     loadGeneration++;
     chatGeneration++;
     contextGeneration++;
     closeOpenChoices();
+    if (chatClearDialog) {
+      const dialog = chatClearDialog;
+      chatClearDialog = null;
+      try { dialog.close(); } catch (_) {}
+    }
     disposeChoices(view.document && view.document.documentElement);
     if (noteTimer) clearTimeout(noteTimer);
     if (checklistTimer) clearTimeout(checklistTimer);

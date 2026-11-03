@@ -230,6 +230,8 @@ async function fixture({
   promptConfig = null,
   contextOverrides = {},
   sharedService = null,
+  chatStore = null,
+  failClear = null,
 } = {}) {
   const windowListeners = new Map();
   const document = new Document();
@@ -343,6 +345,27 @@ async function fixture({
   if (cachedCoverage) {
     cachedAnalysis.coverage = { ...cachedAnalysis.coverage, ...cachedCoverage };
   }
+  // Opt-in per-parent/per-PDF conversation store so clear/dialog scoping is
+  // exercised against real saved state instead of always-empty history.
+  const conversationKey = attachmentID =>
+    attachmentID === 102 ? "ATTACH02" : "ATTACH01";
+  const savedMessages = (item, attachmentID) => structuredClone(
+    chatStore?.[item.id]?.[conversationKey(attachmentID)] || [],
+  );
+  const storeChat = (item, attachmentID, messages) => {
+    if (!chatStore) return;
+    chatStore[item.id] = chatStore[item.id] || {};
+    chatStore[item.id][conversationKey(attachmentID)] = structuredClone(messages);
+  };
+  const pair = question => ([
+    { id: "u1", role: "user", content: question,
+      createdAt: "2026-11-01T03:00:00.000Z" },
+    { id: "a1", role: "assistant", content: "Synthetic grounded answer.",
+      createdAt: "2026-11-01T03:00:01.000Z", grounded: true,
+      verificationNotice: "Synthetic verification notice.",
+      evidence: [{ quote: "Synthetic source quote", pageIndex: 4,
+        attachmentKey: "ATTACH01", verified: true }] },
+  ]);
   const service = {
     calls,
     savedConfigs,
@@ -396,26 +419,32 @@ async function fixture({
       calls.push({ type: "getConversation", item, options });
       return {
         attachmentID: options.attachmentID,
-        attachmentKey: "ATTACH01",
-        messages: [],
+        attachmentKey: conversationKey(options.attachmentID),
+        messages: chatStore ? savedMessages(item, options.attachmentID) : [],
       };
     },
     async askPaper(item, question, options) {
       calls.push({ type: "askPaper", item, question, options });
       options.onProgress?.({ status: "extracting", detail: "extracting synthetic text" });
       if (failChat) throw failChat;
+      const messages = chatStore
+        ? [...savedMessages(item, options.attachmentID), ...pair(question)]
+        : pair(question);
+      storeChat(item, options.attachmentID, messages);
       return {
         attachmentID: options.attachmentID,
-        attachmentKey: "ATTACH01",
-        messages: [
-          { id: "u1", role: "user", content: question,
-            createdAt: "2026-11-01T03:00:00.000Z" },
-          { id: "a1", role: "assistant", content: "Synthetic grounded answer.",
-            createdAt: "2026-11-01T03:00:01.000Z", grounded: true,
-            verificationNotice: "Synthetic verification notice.",
-            evidence: [{ quote: "Synthetic source quote", pageIndex: 4,
-              attachmentKey: "ATTACH01", verified: true }] },
-        ],
+        attachmentKey: conversationKey(options.attachmentID),
+        messages,
+      };
+    },
+    async clearConversation(item, options) {
+      calls.push({ type: "clearConversation", item, options });
+      if (failClear) throw failClear;
+      storeChat(item, options.attachmentID, []);
+      return {
+        attachmentID: options.attachmentID,
+        attachmentKey: conversationKey(options.attachmentID),
+        messages: [],
       };
     },
     cancelChat(item) {
@@ -1239,6 +1268,281 @@ test("idle view disposal leaves another view's chat request untouched", async ()
   for (const listener of h.windowListeners.get("unload") || []) listener();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(h.service.calls.some(call => call.type === "cancelChat"), false);
+});
+
+function clearDialog(h) {
+  return descendants(h.document.body,
+    node => node.getAttribute("role") === "dialog")[0];
+}
+async function seedChat(h, question, input = questionInput(h),
+  send = button(h.document.body, "发送")) {
+  input.value = question;
+  send.click();
+  await tick();
+}
+
+test("clear dialog confirms the current PDF and cancel never calls the service", async () => {
+  const store = {};
+  const h = await fixture({ chatStore: store });
+  await seedChat(h, "First saved question");
+  assert.ok(textOf(h.document.body).includes("Synthetic grounded answer."));
+  const clear = button(h.document.body, "清空对话");
+  assert.ok(clear, "missing clear button");
+  assert.equal(clear.disabled, false);
+  const chatActions = descendants(h.document.body, node =>
+    node.getAttribute("class") === "rr-chat-actions")[0];
+  assert.ok(chatActions.children.includes(clear),
+    "clear must live with the chat controls");
+
+  clear.click();
+  const dialog = clearDialog(h);
+  assert.ok(dialog, "missing clear confirmation dialog");
+  const dialogText = textOf(dialog);
+  assert.ok(dialogText.includes("清空当前 PDF 对话"));
+  assert.ok(dialogText.includes("仅这篇论文当前 PDF 的对话"));
+  assert.ok(dialogText.includes("其他 PDF 与其他论文的对话不受影响"));
+  assert.ok(dialogText.includes("不再包含已清空的问答"));
+  assert.ok(dialogText.includes("阅读笔记"));
+  assert.ok(dialogText.includes("阅读状态"));
+  assert.ok(dialogText.includes("不会被取消"));
+  assert.equal(button(dialog, "取消").focused, true,
+    "cancel must hold the default focus");
+
+  // Cancel is inert: no service call, no history change, dialog gone.
+  button(dialog, "取消").click();
+  await tick();
+  assert.equal(clearDialog(h), undefined);
+  assert.equal(h.service.calls.some(call => call.type === "clearConversation"), false);
+  assert.ok(textOf(h.document.body).includes("Synthetic grounded answer."));
+  assert.equal(store[2].ATTACH01.length, 2);
+
+  // Confirm clears exactly the bound paper and PDF, then renders empty.
+  button(h.document.body, "清空对话").click();
+  questionInput(h).value = "unsent draft";
+  const before = h.service.calls.length;
+  button(clearDialog(h), "确认清空").click();
+  await tick();
+  await tick();
+  const calls = h.service.calls.slice(before);
+  const call = calls.find(entry => entry.type === "clearConversation");
+  assert.ok(call, "confirm must call the clear service");
+  assert.equal(call.item.id, 2);
+  assert.equal(call.options.attachmentID, 101);
+  assert.ok(call.options.signal, "clear must carry an abort signal");
+  const text = textOf(h.document.body);
+  assert.equal(text.includes("Synthetic grounded answer."), false);
+  assert.ok(text.includes("基于当前 PDF 提问"));
+  assert.ok(text.includes("已清空当前 PDF 的对话"));
+  assert.ok(text.includes("AI 解读、笔记与阅读状态保持不变"));
+  assert.equal(questionInput(h).value, "");
+  assert.deepEqual(store[2].ATTACH01, []);
+  // Clearing is metadata only: no model, extraction or discovery call.
+  assert.equal(calls.some(entry => ["askPaper", "analyze", "listModels",
+    "listConfiguredModels", "getAIConfig", "describe"].includes(entry.type)), false);
+});
+
+test("native confirmation uses the visible clipped iframe area and releases its positioning listeners", async () => {
+  const h = await fixture({ chatStore: {} });
+  await seedChat(h, "Keep this pair");
+  const listeners = new Map();
+  const host = {
+    innerHeight: 803,
+    getComputedStyle() { return { overflowY: "auto" }; },
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) { assert.equal(listeners.get(type), listener); listeners.delete(type); },
+  };
+  let clipTop = 453;
+  h.win.frameElement = {
+    ownerDocument: { defaultView: host },
+    getBoundingClientRect() { return { top: 200, bottom: 823 }; },
+    parentElement: { parentElement: null, getBoundingClientRect() { return { top: clipTop, bottom: 757 }; } },
+  };
+  button(h.document.body, "清空对话").click();
+  const dialog = clearDialog(h), overlay = dialog.parentNode;
+  assert.equal(overlay.style.top, "253px");
+  assert.equal(overlay.style.height, "304px");
+  assert.equal(dialog.style.maxHeight, "288px");
+  clipTop = 503;
+  listeners.get("scroll")();
+  assert.equal(overlay.style.top, "303px");
+  assert.equal(dialog.style.maxHeight, "238px");
+  button(dialog, "取消").click();
+  assert.equal(listeners.size, 0);
+  assert.equal(h.service.calls.some(entry => entry.type === "clearConversation"), false);
+  await h.openSettings();
+  assert.equal(listeners.size, 2);
+  h.win.ReadingRoomWindow.dispose();
+  assert.equal(listeners.size, 0, "disposal releases listeners even for an open settings dialog");
+});
+
+test("clear removes only the current PDF conversation and leaves the sibling PDF intact", async () => {
+  const store = {};
+  const h = await fixture({ chatStore: store });
+  await seedChat(h, "First PDF question");
+  await h.switchContext(secondPDFContext(h));
+  await tick();
+  assert.equal(textOf(h.document.body).includes("First PDF question"), false);
+  await seedChat(h, "Second PDF question");
+  assert.ok(textOf(h.document.body).includes("Second PDF question"));
+  assert.equal(button(h.document.body, "清空对话").disabled, false);
+  button(h.document.body, "清空对话").click();
+  button(clearDialog(h), "确认清空").click();
+  await tick();
+  await tick();
+  const call = h.service.calls.filter(entry => entry.type === "clearConversation").at(-1);
+  assert.equal(call.item.id, 2);
+  assert.equal(call.options.attachmentID, 102);
+  assert.equal(store[2].ATTACH02.length, 0);
+  assert.equal(store[2].ATTACH01.length, 2,
+    "the same paper's other PDF conversation must survive");
+  assert.equal(textOf(h.document.body).includes("Second PDF question"), false);
+  h.readers.set("reader-tab-2", { itemID: 101, async navigate() {} });
+  await h.switchContext(h.nativeContext);
+  await tick();
+  assert.ok(textOf(h.document.body).includes("First PDF question"));
+});
+
+test("a refused clear keeps the visible history and shows only a fixed safe error", async () => {
+  for (const [error, expected] of [
+    [Object.assign(new Error("RAW transport detail key=sk-secret"), {
+      code: "CHAT_RUNNING" }, ), "清空对话失败 [CHAT_RUNNING]"],
+    [new Error("RAW disk detail /home/user/secret.json"), "请稍后重试"],
+  ]) {
+    const store = {};
+    const h = await fixture({ chatStore: store, failClear: error });
+    await seedChat(h, "Keep this pair");
+    button(h.document.body, "清空对话").click();
+    button(clearDialog(h), "确认清空").click();
+    await tick();
+    await tick();
+    const text = textOf(h.document.body);
+    assert.ok(text.includes(expected), expected);
+    assert.ok(text.includes("此前保存的问答仍保留"));
+    assert.equal(/RAW transport detail|RAW disk detail|sk-secret/.test(text), false,
+      "raw backend or transport text must never reach the UI");
+    assert.ok(text.includes("Keep this pair"),
+      "a failed clear must not remove the visible history");
+    assert.ok(text.includes("Synthetic grounded answer."));
+    assert.equal(store[2].ATTACH01.length, 2);
+    assert.equal(button(h.document.body, "清空对话").disabled, false);
+    assert.equal(button(h.document.body, "发送").disabled, false);
+  }
+});
+
+test("clear is disabled while a chat runs and unavailable without a bound PDF", async () => {
+  const h = await fixture({ chatStore: {} });
+  let release;
+  h.service.askPaper = (item, question, options) => new Promise(resolve => {
+    h.service.calls.push({ type: "askPaper", item, question, options });
+    release = () => resolve({ messages: [] });
+  });
+  await seedChat(h, "pending question");
+  assert.equal(button(h.document.body, "清空对话").disabled, true,
+    "clear must be disabled while a same-parent chat is running");
+  assert.equal(button(h.document.body, "发送").disabled, true);
+  release();
+  await tick();
+  await tick();
+  assert.equal(button(h.document.body, "清空对话").disabled, false);
+
+  const unbound = await fixture({
+    chatStore: {}, contextOverrides: { attachmentKey: "WRONGKEY" },
+  });
+  assert.equal(button(unbound.document.body, "清空对话").disabled, true);
+  button(unbound.document.body, "清空对话").click();
+  await tick();
+  assert.equal(unbound.service.calls.some(call => call.type === "clearConversation"), false);
+  assert.equal(clearDialog(unbound), undefined);
+});
+
+test("switching the PDF before confirming closes the stale dialog without clearing", async () => {
+  const store = {};
+  const h = await fixture({ chatStore: store });
+  await seedChat(h, "Belongs to the first PDF");
+  button(h.document.body, "清空对话").click();
+  const dialog = clearDialog(h);
+  assert.ok(dialog);
+  await h.switchContext(secondPDFContext(h));
+  await tick();
+  button(dialog, "确认清空").click();
+  await tick();
+  await tick();
+  assert.equal(h.service.calls.some(call => call.type === "clearConversation"), false);
+  assert.equal(store[2].ATTACH01.length, 2);
+  assert.equal(clearDialog(h), undefined);
+});
+
+test("switching the PDF during a queued clear aborts it and keeps the saved history", async () => {
+  const store = {};
+  const h = await fixture({ chatStore: store });
+  await seedChat(h, "Keep across the switch");
+  let finish;
+  h.service.clearConversation = (item, options) => {
+    h.service.calls.push({ type: "clearConversation", item, options });
+    return new Promise((resolve, reject) => {
+      finish = resolve;
+      options.signal?.addEventListener("abort", () => reject(Object.assign(
+        new Error("cancelled"), { code: "CANCELLED" },
+      )));
+    });
+  };
+  button(h.document.body, "清空对话").click();
+  button(clearDialog(h), "确认清空").click();
+  await tick();
+  const call = h.service.calls.filter(entry => entry.type === "clearConversation").at(-1);
+  assert.equal(call.options.attachmentID, 101);
+  // While the clear is in flight both chat actions stay locked.
+  assert.equal(button(h.document.body, "清空对话").disabled, true);
+  assert.equal(button(h.document.body, "发送").disabled, true);
+  await h.switchContext(secondPDFContext(h));
+  assert.equal(call.options.signal.aborted, true,
+    "a context switch must abort the queued clear");
+  assert.equal(store[2].ATTACH01.length, 2);
+  finish({ messages: [] });
+  await tick();
+  await tick();
+  const text = textOf(h.document.body);
+  assert.equal(text.includes("已清空当前 PDF 的对话"), false);
+  assert.equal(text.includes("清空对话失败"), false);
+});
+
+test("a stale history load cannot restore the conversation a clear removed", async () => {
+  const store = {};
+  const h = await fixture({ chatStore: store });
+  await seedChat(h, "Should disappear");
+  assert.ok(textOf(h.document.body).includes("Should disappear"));
+  const staleSnapshot = {
+    attachmentID: 101,
+    attachmentKey: "ATTACH01",
+    messages: structuredClone(store[2].ATTACH01),
+  };
+  const pending = [];
+  h.service.getConversation = (item, options) => {
+    h.service.calls.push({ type: "getConversation", item, options });
+    return new Promise(resolve => pending.push({ options, resolve }));
+  };
+  // Leaving and returning leaves a history load in flight for the *same*
+  // PDF: its document generation is still current when the clear runs, so only
+  // the chat generation can reject its stale result.
+  await h.switchContext(secondPDFContext(h));
+  h.readers.set("reader-tab-2", { itemID: 101, async navigate() {} });
+  await h.switchContext(h.nativeContext);
+  await tick();
+  const stale = pending.filter(entry => entry.options.attachmentID === 101).at(-1);
+  assert.ok(stale, "the history load must still be in flight");
+  button(h.document.body, "清空对话").click();
+  button(clearDialog(h), "确认清空").click();
+  await tick();
+  await tick();
+  assert.ok(textOf(h.document.body).includes("已清空当前 PDF 的对话"));
+  stale.resolve(staleSnapshot);
+  await tick();
+  await tick();
+  const text = textOf(h.document.body);
+  assert.equal(text.includes("Should disappear"), false,
+    "a pre-clear load result must not restore cleared history");
+  assert.equal(text.includes("Synthetic grounded answer."), false);
+  assert.ok(text.includes("基于当前 PDF 提问"));
 });
 
 test("source uses safe DOM APIs and has no extractive mode entry", () => {

@@ -20,9 +20,15 @@ const outputWrappers = [
   ["leading thinking and fence", text => "<think>Private reasoning { incomplete lure, never source evidence.</think>\n```json\n" + text + "\n```"],
   ["fenced thinking", text => "```\n<think>Private reasoning.</think>\n" + text + "\n```"],
   ["single double encoding", text => JSON.stringify(text)],
-  ["one object surrounded by prose", text => '说明 "quoted {decoy}"：\n' + text + "\n以上为返回结果。"]
+  ["one object surrounded by prose", text => '说明 "quoted {decoy}"：\n' + text + "\n以上为返回结果。"],
+  ["complete unlabelled fence", text => "```\n" + text + "\n```"],
+  ["fence with leading prose", text => '说明 "quoted {decoy}"：\n```json\n' + text + "\n```"],
+  ["fence with trailing prose", text => "```json\n" + text + "\n```\n以上为返回结果。"],
+  ["unlabelled fence surrounded by prose", text => "返回结果：\n```\n" + text + "\n```\n以上为返回结果。"],
+  ["single encoding inside fence", text => "```json\n" + JSON.stringify(text) + "\n```"],
+  ["single encoding around fence", text => JSON.stringify("```json\n" + text + "\n```")]
 ];
-const prose = '候选解释含括号 {literal}、数组 [literal] 和引号 "quoted"；仍需核对。';
+const prose = '候选解释含括号 {literal}、数组 [literal] 和引号 "quoted"；代码 `inline` 与 ```json\n{"literal":true}\n``` 仍需核对。';
 function modelReply(provider, content) {
   if (provider === "anthropic") return { stop_reason: "end_turn", content: [{ type: "thinking", thinking: "hidden reasoning" }, { type: "text", text: content }] };
   if (provider === "gemini") return { candidates: [{ finishReason: "STOP", content: { parts: [{ thought: true, text: "hidden reasoning" }, { text: content }] } }] };
@@ -46,6 +52,77 @@ async function configureProvider(h, provider, apiKey) {
   await h.service.saveAIConfig({ provider, endpoint: endpointFor(provider), model: "demo" }, { apiKey, rememberKey: false });
 }
 const invokeTask = (h, task) => task === "chat" ? h.service.askPaper(h.parent, "论文的方法是什么？") : h.service.analyze(h.parent, { force: true });
+
+for (const provider of providers) {
+  test(`${provider}: a single format regeneration retains frozen source and task for reading, synthesis and chat`, async () => {
+    for (const stage of ["reading", "synthesis", "chat"]) {
+      const h = createHarness({ extracted: stage === "synthesis" ? multiPacketPaper : paper });
+      await configureProvider(h, provider, secret);
+      const prompts = await h.service.getPromptConfig();
+      const task = stage === "chat" ? "chat" : "analysis";
+      const sends = [];
+      const progress = [];
+      let failed = false;
+      fakeHTTP(h, async ({ options }) => {
+        const payload = JSON.parse(options.body);
+        const user = provider === "gemini" ? payload.contents[0].parts[0].text
+          : payload.messages.find(entry => entry.role === "user").content;
+        const input = submittedChunk(options, provider);
+        const currentStage = task === "chat" ? "chat" : input.stage;
+        sends.push({ user, input, stage: currentStage });
+        if (!failed && currentStage === stage) {
+          failed = true;
+          // A configuration edit between sends must not alter this task's prompt.
+          await h.service.savePromptConfig({ ...prompts, systemPrompt: "changed after the original request" });
+          return modelReply(provider, "private-malformed-output { unfinished");
+        }
+        return modelReply(provider, JSON.stringify(outputFor(task, input)));
+      });
+      const options = { onProgress: entry => progress.push(entry.detail) };
+      const result = task === "chat" ? await h.service.askPaper(h.parent, "论文的方法是什么？", options)
+        : await h.service.analyze(h.parent, { force: true, ...options });
+      const matching = sends.filter(entry => entry.stage === stage);
+      assert.equal(matching.length, 2);
+      assert.deepEqual(matching[1].input, matching[0].input);
+      assert.ok(matching[1].user.endsWith(matching[0].user));
+      assert.ok(matching[1].user.startsWith("FORMAT RETRY (1 of 1):"));
+      assert.equal(matching[1].user.includes("private-malformed-output"), false);
+      assert.equal(matching[1].user.includes("changed after the original request"), false);
+      assert.ok(progress.some(detail => detail.includes("重新生成一次（1/1）")));
+      assert.equal(sends.length, stage === "synthesis" ? 4 : 2);
+      assert.equal(h.calls.extracts, 1);
+      assert.equal(h.service._controllers.size, 0);
+      if (task === "chat") {
+        assert.equal(result.messages.length, 2);
+        assert.equal(result.reply.effectiveSystemPrompt, prompts.effectiveChatSystemPrompt);
+      }
+      else assert.equal(result.dimensions.length, 6);
+      assert.equal(JSON.stringify(result).includes("private-malformed-output"), false);
+    }
+  });
+
+  test(`${provider}: cancellation before format regeneration preserves saved bytes with one send`, async () => {
+    for (const task of ["analysis", "chat"]) {
+      const h = createHarness();
+      await configureProvider(h, provider);
+      fakeHTTP(h, ({ options }) => modelReply(provider, JSON.stringify(outputFor(task, submittedChunk(options, provider)))));
+      await invokeTask(h, task);
+      const bytes = h.files.get(h.statePath), writes = h.calls.writes.length;
+      const before = h.calls.requests.length;
+      const controller = new AbortController();
+      fakeHTTP(h, () => modelReply(provider, "private-malformed-output"));
+      const options = { signal: controller.signal, onProgress(entry) {
+        if (entry.detail.includes("重新生成一次")) controller.abort();
+      } };
+      await assert.rejects(task === "chat" ? h.service.askPaper(h.parent, "retry", options)
+        : h.service.analyze(h.parent, { force: true, ...options }), { code: "CANCELLED" });
+      assert.equal(h.calls.requests.length, before + 1);
+      assert.equal(h.files.get(h.statePath), bytes);
+      assert.equal(h.calls.writes.length, writes);
+      assert.equal(h.service._controllers.size, 0);
+    }
+  });
+}
 
 function fakeHTTP(h, respond) {
   h.Zotero.HTTP.request = async (method, url, options) => {
@@ -102,14 +179,14 @@ for (const provider of providers) {
       fakeHTTP(h, () => modelReply(provider, content));
       const count = h.calls.requests.length;
       await assert.rejects(invokeTask(h, "analysis"), { code });
-      assert.equal(h.calls.requests.length, count + 1); // no hidden repair request
+      assert.equal(h.calls.requests.length, count + (code == "MODEL_JSON_INVALID" ? 2 : 1)); // only JSON syntax gets one regeneration
       assert.equal(h.service.getState(h.parent).analysisJob.code, code);
       assert.equal(h.files.get(h.statePath), bytes);
       assert.equal(h.calls.writes.length, writes);
     }
   });
 
-  test(`${provider}: synthesis prose or truncation preserves the prior cache without repair requests`, async () => {
+  test(`${provider}: synthesis prose gets one regeneration while truncation never retries or changes the prior cache`, async () => {
     const h = createHarness({ extracted: multiPacketPaper });
     await configureProvider(h, provider);
     fakeHTTP(h, ({ options }) => modelReply(provider, JSON.stringify(outputFor("analysis", submittedChunk(options, provider)))));
@@ -130,7 +207,7 @@ for (const provider of providers) {
       });
       const count = h.calls.requests.length;
       await assert.rejects(invokeTask(h, "analysis"), { code: truncated ? "MODEL_OUTPUT_TRUNCATED" : "MODEL_JSON_INVALID" });
-      assert.equal(h.calls.requests.length, count + 3);
+      assert.equal(h.calls.requests.length, count + (truncated ? 3 : 4));
       assert.equal(h.files.get(h.statePath), bytes);
       assert.equal(h.calls.writes.length, writes);
     }
@@ -544,11 +621,32 @@ for (const provider of providers) {
         "说明 {broken]} " + text,
         "```javascript\n" + text + "\n```",
         "```json\n" + text,
+        "说明\n```javascript\n" + text + "\n```",
+        "说明\n```json\n" + text,
+        text + "\n```",
+        "```json\n" + text + "\n```\n" + text,
+        "```json\n" + text + '\n```\n{"truncated":',
+        "说明 [\n```json\n" + text + "\n```",
+        "```json\n" + text + "\n```\n说明 [",
+        "```json\n" + text + "\n```\n```\n```",
+        "说明\n```json\n" + text + "\n```\n```json\n" + text + "\n```",
+        "```json\n```json\n" + text + "\n```\n```",
+        "```json\n" + text + "```\n说明",
+        "说明\n```JSON5\n" + text + "\n```",
+        "说明\n```json\n" + JSON.stringify(text) + "\n```\n完毕",
+        '说明 "```json\n' + text + '\n```" 完毕',
+        "```json\n" + JSON.stringify("```json\n" + text + "\n```") + "\n```",
+        "<think>Private reasoning.</think>" + JSON.stringify("<think>More private reasoning.</think>" + text),
+        "<think>Private reasoning only, no answer.</think>",
+        text.slice(0, -1) + ",}",
         JSON.stringify(JSON.stringify(text)),
         "[]", "null", "42", "false", JSON.stringify("free text")
       ]) {
         fakeHTTP(h, () => modelReply(provider, content));
-        await assert.rejects(invokeTask(h, task), { code: "MODEL_JSON_INVALID" }, content.slice(0, 70));
+        const requests = h.calls.requests.length;
+        await assert.rejects(invokeTask(h, task), error => error.code === "MODEL_JSON_INVALID"
+          && !error.message.includes(content) && !error.message.includes("Private reasoning"));
+        assert.equal(h.calls.requests.length, requests + 2);
         assert.equal(h.files.get(h.statePath), bytes);
         assert.equal(h.calls.writes.length, writes);
       }
@@ -563,8 +661,10 @@ for (const provider of providers) {
           const raw = JSON.stringify(task === "chat" ? { answer: secret, evidence: [] } : { dimensions: [], overview: secret });
           const content = wrap(encoded ? raw.replace(secret, "\\u0073" + secret.slice(1)) : raw);
           fakeHTTP(h, () => modelReply(provider, content));
+          const requests = h.calls.requests.length;
           await assert.rejects(invokeTask(h, task), error => error.code === "INVALID_MODEL_OUTPUT"
             && !error.message.includes(secret) && !error.message.includes("Private reasoning"));
+          assert.equal(h.calls.requests.length, requests + 1);
           assert.equal(h.files.get(h.statePath), bytes);
           assert.equal(h.calls.writes.length, writes);
         }
