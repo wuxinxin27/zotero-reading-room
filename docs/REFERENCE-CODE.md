@@ -145,3 +145,5 @@ npm run xref -- configure-mcp
 Zotero 固定提交 `212a7d6a585d1209bc4e698a904490205f139500` 的 `chrome/content/zotero/xpcom/http.js` 用于核对 JSON 响应、取消及日志选项，`sync.js:174` 的错误处理用于参考固定用户提示与内部错误分离。本项目继续拒绝向用户或日志转发接口正文、隐藏推理和密钥，未照搬上游的原始响应日志行为。XERJ 仅定位获准的源码，实际模型和 Zotero 主配置诊断不加入索引。
 
 显示验收追加查询本项目 `rr-reading-workspace rr-app overflow`，定位 `room.js:2818` 的当前 DOM 构造；Toolkit `iframe overflow height` 仅命中 `src/helpers/settingsDialog.ts:346` 等对话框内容，没有直接可复用的侧栏解法。随后直接核对本项目 CSS 祖先选择器与实际只读布局数据，给现有嵌入自动高度规则补上当前 DOM 选择器；未采用上游对话框的 overflow 设置。
+
+2026-11-03 实际论文复查前，项目查询 `synthesisInput matchingExcerpt` 命中 `service.js:113/70`（该轮修改前位置）。PaperQA 查询 `source context specific numbers` 命中固定 SHA 的 `prompts.py:103`：答案限于上下文，来源不足时明确说明。原文核对窗口与按贡献编号去重均为本项目原创的有界检索；只复用已经提交的独立来源，不把关键词匹配当作研究结论，也不复制上游实现。

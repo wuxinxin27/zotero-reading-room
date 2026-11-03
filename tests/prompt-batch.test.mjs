@@ -49,7 +49,7 @@ test("prompt defaults, editing, reset and reload are independent of model config
   assert.equal(defaults.isCustom, false);
   assert.equal(defaults.updatedAt, null);
   assert.equal(defaults.systemPrompt, defaults.defaultSystemPrompt);
-  assert.equal(defaults.outputContractVersion, "3");
+  assert.equal(defaults.outputContractVersion, "4");
   assert.equal(defaults.effectiveAnalysisSystemPrompt, defaults.systemPrompt + "\n\n" + defaults.analysisOutputContract);
   assert.equal(defaults.effectiveChatSystemPrompt, defaults.chatSystemPrompt + "\n\n" + defaults.chatOutputContract);
   assert.equal(defaults.promptHash, h.Core.hash(JSON.stringify([defaults.effectiveAnalysisSystemPrompt, defaults.synthesisInstruction])));

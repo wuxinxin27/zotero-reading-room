@@ -482,7 +482,7 @@ test("bounded final synthesis uses verified excerpts, writes natural narrative a
       entry.text.split("\n").filter(line => /Figure 1|Table 2/.test(line)).map(quote => ({ quote, pageIndex: entry.pageIndex })));
     if (chunk.stage === "synthesis") {
       assert.ok(JSON.stringify(chunk).length < 48000);
-      assert.ok(chunk.excerpts.every(entry => paper.text.includes(entry.quote)));
+      assert.ok(chunk.excerpts.every(entry => multiPacketPaper.text.includes(entry.quote)));
       assert.equal(Object.hasOwn(chunk, "text"), false);
     }
     const evidence = candidates.map(({ quote, pageIndex }) => ({ quote, pageIndex }));
@@ -555,14 +555,18 @@ test("nested escaped credentials are rejected in narrative, figure explanations 
 });
 
 test("final synthesis cannot smuggle real but unsubmitted quotes or escaped credentials into a saved analysis", async () => {
-  const h = createHarness({ extracted: multiPacketPaper });
+  const unsubmitted = "This distinct middle-window sentence was not admitted to the final synthesis.";
+  const pages = multiPacketPaper.text.split("\f");
+  pages[1] = pages[1].slice(0, 6500) + unsubmitted + pages[1].slice(6500 + unsubmitted.length);
+  const h = createHarness({ extracted: { ...multiPacketPaper, text: pages.join("\f") } });
   const saved = await h.service.analyze(h.parent);
   const writes = h.calls.writes.length;
   for (const echoCredential of [false, true]) {
     h.Zotero.HTTP.request = async (_method, _url, options) => {
       const chunk = parseTaskInput(JSON.parse(options.body).messages[1].content);
+      if (chunk.stage === "synthesis") assert.ok(!chunk.excerpts.some(entry => entry.quote.includes(unsubmitted)));
       const evidence = chunk.stage === "synthesis"
-        ? [{ quote: "The main limitation is reduced accuracy when no calibration targets are visible.", pageIndex: 1 }]
+        ? [{ quote: unsubmitted, pageIndex: 1 }]
         : [{ quote: firstSource(chunk).text.slice(0, 50), pageIndex: firstSource(chunk).pageIndex }];
       const response = { dimensions: [{ id: "problem", summary: chunk.stage === "synthesis" && echoCredential ? "\\u0073" + secret.slice(1) : "candidate", evidence }] };
       return { status: 200, response: { choices: [{ message: { content: JSON.stringify(response) } }] } };
@@ -665,6 +669,61 @@ test("over-budget sources keep upload and synthesis limits, and cannot admit an 
   assert.ok(!JSON.stringify(result).includes(omitted));
 });
 
+test("synthesis rechecks reporting and table context omitted by reading summaries without extra model calls", async () => {
+  const seeds = "We use random seeds 2 through 18 and exclude seeds 6 and 12 in both control conditions.";
+  const cost = "The complete study used 12M input tokens and about 3 USD on one CPU server.";
+  const table = "Table 9\nSystem | Solved | 95% CI | Run 2 | Subgroup\nController | 84/100 | [0.76,0.90] | 83/100 | 0.97";
+  const pages = Array.from({ length: 20 }, (_, i) => ((i === 0
+    ? "Contribution 1: definition.\n" : i === 5 ? "Contribution 2: mechanism.\n" : i === 7 ? "Contribution 3: evaluation.\n"
+    : i === 16 ? seeds + "\n" + table + "\n" : i === 18 ? cost + "\n" : "")
+    + "Physical page " + i + ": independently supplied engineering source.\n").padEnd(3800, " "));
+  const h = createHarness({ extracted: { text: pages.join("\f"), extractedPages: 20, totalPages: 20 } });
+  let synthesis;
+  let sourceCheckAssertion;
+  let requests = 0;
+  const submitted = [];
+  h.Zotero.HTTP.request = async (_method, _url, options) => {
+    try {
+      requests++;
+      const input = parseTaskInput(JSON.parse(options.body).messages[1].content);
+      let evidence;
+      if (input.stage === "reading") {
+        submitted.push(...input.excerpts);
+        assert.ok(input.excerpts.every(entry => entry.pageNumber === entry.pageIndex + 1));
+        // A plausible incomplete reading summary never returns the reporting facts.
+        const source = input.excerpts.find(entry => entry.text.includes("independently supplied"));
+        evidence = [{ quote: "independently supplied engineering source.", pageIndex: source.pageIndex }];
+      }
+      else {
+        synthesis = input;
+        const checks = input.excerpts.filter(entry => entry.sourceCheckTopic);
+        assert.ok(checks.length > 0 && checks.length <= 12);
+        assert.ok(checks.some(entry => entry.quote.includes(seeds)));
+        assert.ok(checks.some(entry => entry.quote.includes(cost)));
+        assert.ok(checks.some(entry => entry.quote.includes(table)));
+        assert.ok(checks.some(entry => entry.quote.includes("Contribution 3: evaluation.")));
+        assert.ok(checks.some(entry => entry.quote.includes("Contribution 2: mechanism.")));
+        assert.ok(checks.every(entry => entry.pageNumber === entry.pageIndex + 1
+          && submitted.some(source => source.pageIndex === entry.pageIndex && source.text.includes(entry.quote))));
+        assert.ok(input.excerpts.length <= 48);
+        assert.ok(input.excerpts.reduce((sum, entry) => sum + entry.quote.length, 0) <= 28000);
+        assert.ok(JSON.stringify(input).length <= 48000);
+        evidence = [{ quote: seeds, pageIndex: 16 }, { quote: cost, pageIndex: 18 }];
+      }
+      return { status: 200, response: { choices: [{ message: { content: JSON.stringify({ dimensions: [
+        { id: "contributions", summary: "The supplied source reports seeds and total resource costs.", evidence }
+      ] }) } }] } };
+    } catch (error) { sourceCheckAssertion = error; throw error; }
+  };
+  let result;
+  try { result = await h.service.analyze(h.parent); } catch (error) { throw sourceCheckAssertion || error; }
+  assert.equal(requests, 6);
+  assert.ok(synthesis);
+  assert.equal(result.dimensions[2].summary, "The supplied source reports seeds and total resource costs.");
+  assert.ok(result.dimensions[2].evidence.every(entry => entry.verified));
+  assert.equal(result.coverage.ratio, 1);
+});
+
 test("synthesis budget pressure retains linked late experiments and limits before abundant early figure references", async () => {
   const experiment = "The late experiment measures 0.14 error versus baseline 0.28 under the same compute budget.";
   const failure = "The final failure analysis reports unstable calibration when all targets are occluded.";
@@ -704,7 +763,8 @@ test("synthesis budget pressure retains linked late experiments and limits befor
   assert.equal(ids.size, finalInput.excerpts.length);
   assert.equal(new Set(finalInput.excerpts.map(entry => entry.pageIndex + ":" + entry.quote)).size, ids.size);
   assert.ok(finalInput.findings.every(entry => entry.evidenceIds.length && entry.evidenceIds.every(id => ids.has(id))));
-  assert.ok(finalInput.excerpts.every(entry => finalInput.findings.some(finding => finding.evidenceIds.includes(entry.id))));
+  assert.ok(finalInput.excerpts.every(entry => entry.sourceCheckTopic
+    || finalInput.findings.some(finding => finding.evidenceIds.includes(entry.id))));
   for (const [quote, page, hint] of [[experiment, 16, "experiments"], [failure, 19, "limitations"]]) {
     const excerpt = finalInput.excerpts.find(entry => entry.quote === quote);
     assert.ok(excerpt);
