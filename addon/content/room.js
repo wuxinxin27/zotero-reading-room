@@ -10,13 +10,6 @@
     read: "已读",
     parked: "搁置",
   });
-  const CHECKLIST = Object.freeze([
-    ["problem", "确认研究问题与范围"],
-    ["evidence", "核对关键证据与页码"],
-    ["method", "理解方法与技术机制"],
-    ["comparison", "比较基线、优势与边界"],
-    ["notes", "整理可复用的阅读笔记"],
-  ]);
   const DIMENSION_IDS = Object.freeze([
     "problem", "novelty", "contributions",
     "prior-work", "superiority", "technical-uniqueness",
@@ -39,9 +32,7 @@
   let contextGeneration = 0;
   let contextUpdate = Promise.resolve();
   let noteTimer = null;
-  let checklistTimer = null;
   let notesDirty = false;
-  let checklistDirty = false;
   let aiConfigSession = null;
   let dialogSequence = 0;
   const dialogClosers = new Set();
@@ -453,21 +444,6 @@
     return Number.isFinite(number)
       ? Math.max(0, Math.min(100, Math.round(number * 100))) : 0;
   }
-  const COVERAGE_SECTION_LABELS = Object.freeze({
-    unknown: "未识别段落",
-    abstract: "摘要",
-    introduction: "引言",
-    "related-work": "相关工作 / 背景",
-    methods: "方法",
-    experiments: "实验",
-    evaluation: "评估",
-    results: "结果",
-    discussion: "讨论",
-    limitations: "局限",
-    conclusion: "结论",
-    appendix: "附录",
-    references: "参考文献",
-  });
   function nonnegativeCount(value, cap = Number.MAX_SAFE_INTEGER) {
     const number = Number(value);
     return Number.isFinite(number)
@@ -476,90 +452,23 @@
   function formatCount(value) {
     return nonnegativeCount(value).toLocaleString("zh-CN");
   }
-  function coverageVersion(coverage, analysis) {
-    return nonnegativeCount(
-      coverage.analysisPlanVersion ?? analysis.analysisPlanVersion,
-      1000000,
+  function submittedCharacters(coverage) {
+    return Math.min(
+      nonnegativeCount(coverage.extractedCharacters),
+      nonnegativeCount(coverage.analyzedCharacters),
     );
   }
-  function coverageSectionEntry(entry) {
-    if (!entry || typeof entry !== "object") return null;
-    const hint = typeof entry.hint === "string"
-      && Object.hasOwn(COVERAGE_SECTION_LABELS, entry.hint)
-      ? entry.hint : "unknown";
-    const totalCharacters = nonnegativeCount(entry.totalCharacters);
-    const selectedCharacters = Math.min(
-      totalCharacters, nonnegativeCount(entry.selectedCharacters),
-    );
-    return { hint, totalCharacters, selectedCharacters };
+  function submittedPercent(coverage) {
+    const extracted = nonnegativeCount(coverage.extractedCharacters);
+    if (extracted > 0) return Math.round(submittedCharacters(coverage) / extracted * 100);
+    const ratio = coverage.ratio == null ? NaN : Number(coverage.ratio);
+    return Number.isFinite(ratio) && ratio >= 0 ? percent(ratio) : null;
   }
-  function renderCoverageDetails(coverage, version) {
-    const panel = make("details", "rr-coverage");
-    panel.append(make("summary", null, "选中文字范围"));
-    const body = make("div", "rr-coverage-body");
-    const totalCharacters = nonnegativeCount(coverage.extractedCharacters);
-    const selectedCharacters = Math.min(
-      totalCharacters, nonnegativeCount(coverage.analyzedCharacters),
-    );
-    const range = make("p", "rr-coverage-range");
-    range.append(make("span", null,
-      `选中文字：${formatCount(selectedCharacters)} / ${formatCount(totalCharacters)} 字符`));
-    if (coverage.extractedPages != null || coverage.totalPages != null) {
-      range.append(make("span", "rr-coverage-muted",
-        `PDF 文本抽取：${formatCount(coverage.extractedPages)} / ${formatCount(coverage.totalPages)} 页`));
-    }
-    body.append(range);
-    if (coverage.selectionStrategy === "complete-source"
-        && totalCharacters > 0 && selectedCharacters === totalCharacters) {
-      body.append(make("p", "rr-coverage-note",
-        "已提交全部可提取文字。这里的“文字”指本次可提取的 PDF 文本，不含图像内容。"));
-    }
-    else {
-      const omitted = Math.max(
-        nonnegativeCount(coverage.omittedCharacters),
-        totalCharacters - selectedCharacters,
-      );
-      body.append(make("p", "rr-coverage-warning", omitted > 0
-        ? `有 ${formatCount(omitted)} 字符未进入本次分析；相关部分可能未被涵盖。`
-        : "文字选取范围可能不完整；相关部分可能未被涵盖。"));
-    }
-    if (Array.isArray(coverage.sections) && coverage.sections.length) {
-      const groups = new Map();
-      for (const rawEntry of coverage.sections) {
-        const entry = coverageSectionEntry(rawEntry);
-        if (!entry) continue;
-        const old = groups.get(entry.hint)
-          || { hint: entry.hint, totalCharacters: 0, selectedCharacters: 0 };
-        old.totalCharacters = nonnegativeCount(
-          old.totalCharacters + entry.totalCharacters,
-        );
-        old.selectedCharacters = nonnegativeCount(
-          old.selectedCharacters + entry.selectedCharacters,
-        );
-        groups.set(entry.hint, old);
-      }
-      if (groups.size) {
-        const sections = make("div", "rr-coverage-sections");
-        sections.append(make("strong", null, "结构线索覆盖（自动识别，需核对）"));
-        for (const entry of groups.values()) {
-          const missing = entry.selectedCharacters === 0;
-          const row = make("div", "rr-coverage-section"
-            + (missing ? " rr-missing" : ""));
-          row.append(
-            make("span", null, COVERAGE_SECTION_LABELS[entry.hint]),
-            make("span", null,
-              `选中 ${formatCount(entry.selectedCharacters)} / ${formatCount(entry.totalCharacters)} 字符`
-              + (missing ? " · 未选中" : "")),
-          );
-          sections.append(row);
-        }
-        body.append(sections);
-      }
-    }
-    body.append(make("p", "rr-coverage-note",
-      `结构线索由标题文字自动匹配，不是已核实的分节；字符覆盖范围也不能证明模型已理解全文。分析计划 v${version}。`));
-    panel.append(body);
-    return panel;
+  function extractionPagesText(coverage) {
+    if (coverage.extractedPages == null && coverage.totalPages == null) return "";
+    return `可提取 PDF 文本：${formatCount(coverage.extractedPages)}`
+      + (coverage.totalPages == null ? " 页"
+        : ` / ${formatCount(coverage.totalPages)} 页`);
   }
   function syncActionLocks() {
     if (!state) return;
@@ -583,11 +492,6 @@
       !state.chatLoading);
     setBooleanAttribute(state.chatInput, "disabled",
       chatLocked || !state.currentAttachmentID || !bound);
-  }
-  function checkedCount(checklist) {
-    return CHECKLIST.reduce(
-      (total, [id]) => total + (checklist && checklist[id] ? 1 : 0), 0,
-    );
   }
   function setStatus(element, message, kind) {
     if (!element) return;
@@ -1093,7 +997,7 @@
     for (const text of [
       "删除范围：仅这篇论文当前 PDF 的对话；同一论文的其他 PDF 与其他论文的对话不受影响。",
       "之后向模型发送新问题时，不再包含已清空的问答；此前记录不会作为模型历史继续发送。",
-      "保持不变：AI 解读、阅读笔记、阅读状态与检查清单都不会被修改。",
+      "保持不变：AI 解读、阅读笔记与阅读状态都不会被修改。",
       "其他标签页正在进行的对话不会被取消；此时需要等待其结束或先取消。",
     ]) {
       const entry = currentDocument().createElementNS(XHTML_NS, "li");
@@ -1223,9 +1127,10 @@
       setStatus(state.aiStatus, safeError(error).message, "error");
     }
   }
-  function narrativeSection(title, text, evidence) {
+  function narrativeSection(title, text, evidence, hint) {
     const section = make("section", "rr-narrative");
     section.append(make("h3", null, title));
+    if (hint) section.append(make("p", "rr-muted", hint));
     const paragraphs = String(text || "")
       .split(/\n{2,}/).map(value => value.trim()).filter(Boolean);
     if (!paragraphs.length) {
@@ -1243,79 +1148,8 @@
     }
     return section;
   }
-  function renderFigureCards(references) {
-    const section = make("section", "rr-figure-section");
-    section.append(
-      make("h3", null, "论文图表"),
-      make("p", "rr-muted",
-        "从原文文字引用定位到页面；预览仅显示“图表所在原文页”，不冒充裁图或视觉识别。"),
-    );
-    if (!Array.isArray(references) || !references.length) {
-      section.append(make("p", "rr-muted",
-        "本次分析未发现可验证的图表文字引用。"));
-      return section;
-    }
-    const grid = make("div", "rr-figure-grid");
-    for (const reference of references.slice(0, 12)) {
-      const card = make("article", "rr-figure-card");
-      card.append(make("strong", null,
-        reference.reference || (reference.kind === "table" ? "表格" : "图")));
-      card.append(make("p", null,
-        reference.explanation || "原文提到了此图表。"));
-      const meta = make("div", "rr-evidence-meta");
-      meta.append(make("span", null, reference.pageIndex == null
-        ? "页码未确认" : `图表所在原文页 ${reference.pageIndex + 1}`));
-      meta.append(make("span", "rr-unverified", "需人工核对"));
-      card.append(meta);
-      const preview = make("div", "rr-figure-preview");
-      preview.append(make("span", "rr-muted",
-        "预览将在需要时从本机 PDF 渲染。"));
-      card.append(preview);
-      const actions = make("div", "rr-figure-actions");
-      const load = makeApiButton("加载原页", "rr-secondary",
-        () => void renderFigurePreview(reference, preview));
-      load.setAttribute("data-page-index",
-        String(reference.pageIndex == null ? "" : reference.pageIndex));
-      setBooleanAttribute(load, "disabled", reference.pageIndex == null);
-      actions.append(load);
-      if (reference.pageIndex != null) {
-        actions.append(makeApiButton("跳回原文", "rr-link-button",
-          () => void openEvidence(reference)));
-      }
-      card.append(actions);
-      grid.append(card);
-    }
-    section.append(grid);
-    return section;
-  }
-  async function renderFigurePreview(reference, container) {
-    if (!state || !state.nativePDFAdapter
-        || !Number.isInteger(reference.pageIndex)) return;
-    const adapter = state.nativePDFAdapter;
-    const generation = loadGeneration;
-    try {
-      container.replaceChildren(make("span", "rr-muted",
-        "正在本机渲染原页…"));
-      const dataURL = await adapter.previewPage(reference.pageIndex, 420);
-      if (!state || generation !== loadGeneration
-          || state.nativePDFAdapter !== adapter) return;
-      const image = currentDocument().createElementNS(XHTML_NS, "img");
-      image.setAttribute("src", dataURL);
-      image.setAttribute("alt",
-        `论文第 ${reference.pageIndex + 1} 页，图表所在原文页`);
-      image.addEventListener("click",
-        () => openImageZoom(dataURL, reference));
-      container.replaceChildren(image);
-    }
-    catch (error) {
-      if (!state || generation !== loadGeneration
-          || state.nativePDFAdapter !== adapter) return;
-      container.replaceChildren(make("span", "rr-unverified",
-        safeError(error).message));
-    }
-  }
   function openImageZoom(dataURL, reference) {
-    const shell = dialogShell("图表所在原文页", () => {});
+    const shell = dialogShell("原文页预览", () => {});
     const image = currentDocument().createElementNS(XHTML_NS, "img");
     image.setAttribute("src", dataURL);
     image.setAttribute("alt", `论文第 ${reference.pageIndex + 1} 页`);
@@ -1364,22 +1198,25 @@
         `提示词保存：${formatDate(analysis.promptSnapshot.updatedAt)}`));
     }
     const coverage = analysis.coverage || {};
-    const version = coverageVersion(coverage, analysis);
-    if (!version) source.append(make("span", null,
-      `覆盖：${Number(coverage.analyzedCharacters || 0).toLocaleString()} / ${Number(coverage.extractedCharacters || 0).toLocaleString()} 字符 · ${percent(coverage.ratio)}%`));
-    if (!version && coverage.extractedPages != null) {
-      source.append(make("span", null,
-        `页：${coverage.extractedPages}${coverage.totalPages ? ` / ${coverage.totalPages}` : ""}`));
-    }
+    const share = submittedPercent(coverage);
+    source.append(make("span", null,
+      `已提交提取文字 ${share == null ? "比例未记录" : share + "%"}`
+      + ` · ${formatCount(submittedCharacters(coverage))} / ${formatCount(coverage.extractedCharacters)} 字符`));
+    const pages = extractionPagesText(coverage);
+    if (pages) source.append(make("span", null, pages));
     target.append(source);
-    if (version) target.append(renderCoverageDetails(coverage, version));
+    const omitted = Math.max(nonnegativeCount(coverage.omittedCharacters),
+      nonnegativeCount(coverage.extractedCharacters) - submittedCharacters(coverage));
+    if (omitted > 0) target.append(make("p", "rr-coverage-warning",
+      `有 ${formatCount(omitted)} 字符未提交；相关部分可能未被涵盖。`));
     if (analysis.overview || analysis.readingGuide) {
       const narrative = make("div", "rr-narrative-grid");
-      narrative.append(narrativeSection(
+      if (analysis.overview) narrative.append(narrativeSection(
         "论文概览", analysis.overview, analysis.overviewEvidence,
       ));
-      narrative.append(narrativeSection(
-        "阅读路径", analysis.readingGuide, analysis.readingGuideEvidence,
+      if (analysis.readingGuide) narrative.append(narrativeSection(
+        "精读重点", analysis.readingGuide, analysis.readingGuideEvidence,
+        "帮助你定位值得核查的问题及其原文依据。",
       ));
       target.append(narrative);
     }
@@ -1392,9 +1229,6 @@
       if (dimension) grid.append(dimensionCard(dimension));
     }
     target.append(grid);
-    target.append(renderFigureCards(
-      analysis.figureTableReferences || [],
-    ));
     const limitations = Array.isArray(analysis.limitations)
       ? analysis.limitations : [];
     if (limitations.length) {
@@ -1485,51 +1319,6 @@
       }
     }, 700);
   }
-  function scheduleChecklistSave(checklist) {
-    if (!state || !state.currentItem) return;
-    checklistDirty = true;
-    setStatus(state.checklistStatus, "正在保存清单…", "pending");
-    if (checklistTimer) clearTimeout(checklistTimer);
-    const item = state.currentItem;
-    const generation = loadGeneration;
-    checklistTimer = setTimeout(async () => {
-      checklistTimer = null;
-      if (!state || generation !== loadGeneration || state.currentItem !== item) return;
-      try {
-        const reading = await state.service.setState(item, { checklist });
-        if (!state || generation !== loadGeneration || state.currentItem !== item) return;
-        if (JSON.stringify(state.description.state.checklist || {}) === JSON.stringify(checklist)) checklistDirty = false;
-        state.description.state = reading;
-        setStatus(state.checklistStatus,
-          `清单已保存：${checkedCount(checklist)}/${CHECKLIST.length}`,
-          "success");
-      }
-      catch (error) {
-        if (!state || generation !== loadGeneration || state.currentItem !== item) return;
-        setStatus(state.checklistStatus,
-          safeError(error).message, "error");
-      }
-    }, 350);
-  }
-  function renderChecklist(checklist) {
-    state.checklist.replaceChildren();
-    for (const [id, label] of CHECKLIST) {
-      const wrapper = make("label", "rr-check");
-      const input = currentDocument().createElementNS(XHTML_NS, "input");
-      input.setAttribute("type", "checkbox");
-      setChecked(input, !!(checklist && checklist[id]));
-      input.addEventListener("change", () => {
-        const next = Object.assign(
-          {}, state.description.state.checklist || {},
-        );
-        next[id] = getChecked(input);
-        state.description.state.checklist = next;
-        scheduleChecklistSave(next);
-      });
-      wrapper.append(input, make("span", null, label));
-      state.checklist.append(wrapper);
-    }
-  }
   async function flushPendingEdits() {
     if (!state) return;
     const view = state;
@@ -1537,18 +1326,15 @@
     const patch = {};
     if (item && view.description) {
       if (notesDirty || noteTimer) patch.notes = getValue(view.notesInput);
-      if (checklistDirty || checklistTimer) patch.checklist = Object.assign({}, view.description.state.checklist || {});
     }
     if (noteTimer) clearTimeout(noteTimer);
-    if (checklistTimer) clearTimeout(checklistTimer);
-    noteTimer = checklistTimer = null;
+    noteTimer = null;
     // Capture edits before the first await, including during the unload event.
-    // Dirty flags survive a failed write so a second switch retries the save.
+    // The dirty flag survives a failed write so a second switch retries the save.
     if (item && Object.keys(patch).length) {
       const reading = await view.service.setState(item, patch);
       if (state === view && view.currentItem === item) {
         if (Object.hasOwn(patch, "notes") && getValue(view.notesInput) === patch.notes) notesDirty = false;
-        if (Object.hasOwn(patch, "checklist") && JSON.stringify(view.description.state.checklist || {}) === JSON.stringify(patch.checklist)) checklistDirty = false;
         view.description.state = reading;
       }
     }
@@ -2638,21 +2424,14 @@
       "",
       reading.notes || "尚未填写。",
       "",
-      "## 核对清单",
-      "",
     ];
-    for (const [id, label] of CHECKLIST) {
-      lines.push(
-        `- [${reading.checklist && reading.checklist[id] ? "x" : " "}] ${label}`,
-      );
-    }
     if (analysis && analysis.mode === "model") {
       lines.push("", "## AI 解读（待核对）", "");
       if (analysis.overview) {
         lines.push("### 概览", "", analysis.overview, "");
       }
       if (analysis.readingGuide) {
-        lines.push("### 阅读路径", "", analysis.readingGuide, "");
+        lines.push("### 精读重点", "", analysis.readingGuide, "");
       }
       for (const dimension of analysis.dimensions || []) {
         lines.push(
@@ -2671,10 +2450,13 @@
         }
       }
       const coverage = analysis.coverage || {};
+      const share = submittedPercent(coverage);
       lines.push(
         "## 覆盖范围与限制", "",
-        `- 分析字符：${coverage.analyzedCharacters || 0} / ${coverage.extractedCharacters || 0}`,
+        `- 已提交提取文字：${formatCount(submittedCharacters(coverage))} / ${formatCount(coverage.extractedCharacters)} 字符`
+          + (share == null ? "（比例未记录）" : `（${share}%）`),
         `- 页码边界：${coverage.pageAware ? "可用" : "未确认"}`,
+        "- 提交比例只说明送去多少可提取文字，不代表模型已理解全文。",
       );
       for (const limitation of analysis.limitations || []) {
         lines.push(`- ${limitation}`);
@@ -2940,7 +2722,7 @@
         title: description.item.title,
       };
       state.description = description;
-      notesDirty = checklistDirty = false;
+      notesDirty = false;
       const pdfs = description.attachments.filter(
         attachment => attachment.contentType === "application/pdf",
       );
@@ -2965,7 +2747,6 @@
         state.statusChoices, description.state.status,
       );
       setValue(state.notesInput, description.state.notes || "");
-      renderChecklist(description.state.checklist || {});
       state.updated.textContent =
         `本地保存于 ${formatDate(description.state.updatedAt)}`;
       state.counts.textContent =
@@ -3289,17 +3070,12 @@
     notesLabel.append(notesInput);
     const notesStatus = make("div", "rr-message");
     setHidden(notesStatus, true);
-    const checklist = make("div", "rr-checklist");
-    const checklistStatus = make("div", "rr-message");
-    setHidden(checklistStatus, true);
     notesSection.append(
       notesHead,
       statusChoices,
       attachmentField,
       notesLabel,
       notesStatus,
-      checklist,
-      checklistStatus,
     );
 
     const noteActions = make("div", "rr-note-actions");
@@ -3363,8 +3139,6 @@
       attachmentName,
       notesInput,
       notesStatus,
-      checklist,
-      checklistStatus,
       updated,
       globalStatus,
       aiButton,
@@ -3491,8 +3265,7 @@
     }
     disposeChoices(view.document && view.document.documentElement);
     if (noteTimer) clearTimeout(noteTimer);
-    if (checklistTimer) clearTimeout(checklistTimer);
-    noteTimer = checklistTimer = null;
+    noteTimer = null;
     cancelOwnedRequests();
     if (aiConfigSession) {
       const session = aiConfigSession;

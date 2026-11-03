@@ -155,3 +155,9 @@ Zotero 固定提交 `212a7d6a585d1209bc4e698a904490205f139500` 的 `chrome/conte
 PaperQA `c692d0dfeac4a0296599f7fe21a253a58b7ac12a` 的 [src/paperqa/core.py:19–87](https://github.com/Future-House/paper-qa/blob/c692d0dfeac4a0296599f7fe21a253a58b7ac12a/src/paperqa/core.py#L19) 用于理解模型输出包装识别。只借鉴完整包装的概念，不复制其宽松修补行为；本项目保持单对象、完整围栏、单层编码、凭据与结构校验，不补造 JSON 语法。格式重新生成另以原任务/来源和固定提醒完成，不回传无效原始响应。
 
 本轮原生验收的确认框裁切修复先检索项目 `dialogShell frameElement getBoundingClientRect` 与 Toolkit `dialog resize getBoundingClientRect`。Toolkit 固定 SHA `0fbfd0258921044de1854b89d66b27762b10ee0a` 的 `src/helpers/dialog.ts:591` 展示视口坐标换算，仅作 API 概念参考；本项目原创计算 iframe 与宿主滚动容器的可见交集，不复制弹出菜单实现。关闭时移除滚动/缩放监听。格式重新生成查询 `paperqa retry JSON` 仅命中 `core.py:19` 和 JSON 提示词，未发现可直接采用的重试实现；本项目自行限定为同一冻结任务的单次重新生成。
+
+## AI 展示精简参考（2026-11-03）
+
+本轮先检索本项目的 `renderChecklist`、清单自动保存及 Markdown 构造，再核对覆盖面板和 `renderFigureCards` / `renderAnalysis`；基线 `93bc2f4` 的位置为 `addon/content/room.js:1514`、`:2641`、`:485`、`:1246`、`:1329`。修改只去除固定人工框及详情/独立图表展示；侧文件与 Core/Service 的旧 `checklist`、完整覆盖和图表候选字段保留。`service.js:19` 的既有默认已要求 `readingGuide` 提出具体核对问题及可用章节/图表，显示标题改为“精读重点”不修改该提示词或输出协议。
+
+Zotero 固定提交 `212a7d6a585d1209bc4e698a904490205f139500` 的 [chrome/content/zotero/xpcom/server/saveSession.js:244](https://github.com/zotero/zotero/blob/212a7d6a585d1209bc4e698a904490205f139500/chrome/content/zotero/xpcom/server/saveSession.js#L244)、[同文件:253](https://github.com/zotero/zotero/blob/212a7d6a585d1209bc4e698a904490205f139500/chrome/content/zotero/xpcom/server/saveSession.js#L253)、[同文件:256](https://github.com/zotero/zotero/blob/212a7d6a585d1209bc4e698a904490205f139500/chrome/content/zotero/xpcom/server/saveSession.js#L256) 用于核对独立笔记及父条目关联的行为；不复制 AGPL 代码。PaperQA 固定提交 `c692d0dfeac4a0296599f7fe21a253a58b7ac12a` 的 [src/paperqa/prompts.py:164](https://github.com/Future-House/paper-qa/blob/c692d0dfeac4a0296599f7fe21a253a58b7ac12a/src/paperqa/prompts.py#L164) 仅提供已知有效引用键与给定上下文的概念参考；本项目继续保留内联引文和现有证据校验，已知键不证明语义支持或图表视觉理解。

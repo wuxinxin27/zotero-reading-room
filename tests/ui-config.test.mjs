@@ -225,6 +225,7 @@ function paper(id, title, focused = false) {
 async function fixture({
   cached = false,
   cachedCoverage = null,
+  cachedAnalysisPatch = null,
   failAnalysis = null,
   failChat = null,
   promptConfig = null,
@@ -232,6 +233,7 @@ async function fixture({
   sharedService = null,
   chatStore = null,
   failClear = null,
+  legacyChecklist = {},
 } = {}) {
   const windowListeners = new Map();
   const document = new Document();
@@ -345,6 +347,7 @@ async function fixture({
   if (cachedCoverage) {
     cachedAnalysis.coverage = { ...cachedAnalysis.coverage, ...cachedCoverage };
   }
+  if (cachedAnalysisPatch) Object.assign(cachedAnalysis, cachedAnalysisPatch);
   // Opt-in per-parent/per-PDF conversation store so clear/dialog scoping is
   // exercised against real saved state instead of always-empty history.
   const conversationKey = attachmentID =>
@@ -543,7 +546,8 @@ async function fixture({
   ].map(([id, attachment]) => [id, { ...attachment, libraryID: 1,
     attachmentContentType: "application/pdf", isAttachment() { return true; } }]));
   const readings = new Map(papers.map(metadata => [metadata.id, {
-    status: "unread", notes: "Unsaved synthetic note", checklist: {},
+    status: "unread", notes: "Unsaved synthetic note",
+    checklist: metadata.id === 2 ? structuredClone(legacyChecklist) : {},
     analysisJob: { status: "idle" },
     analysis: metadata.id === 2 && cached ? cachedAnalysis : null,
     analyses: metadata.id === 2 && cached ? {
@@ -687,7 +691,8 @@ test("missing configuration points to independent model settings", async () => {
 });
 
 test("closing a room flushes notes before its debounce timer", async () => {
-  const h = await fixture();
+  const legacyChecklist = { problem: true, evidence: false };
+  const h = await fixture({ legacyChecklist });
   const notes = descendants(h.document.body,
     node => node.localName === "textarea"
       && node.getAttribute("aria-label") !== "询问当前论文")[0];
@@ -697,6 +702,9 @@ test("closing a room flushes notes before its debounce timer", async () => {
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
   assert.ok(h.service.calls.some(call => call.type === "setState" && call.patch.notes === "last edit before closing"));
+  assert.deepEqual(h.readings.get(2).checklist, legacyChecklist);
+  assert.equal(h.service.calls.some(call => call.type === "setState"
+    && Object.hasOwn(call.patch, "checklist")), false);
 });
 
 test("settings load config without exposing plaintext key", async () => {
@@ -1591,7 +1599,7 @@ test("mount reuses only the current PDF cache and renders no catalog or attachme
   assert.ok(text.includes("Cached overview."));
   assert.equal(descendants(h.document.body, node =>
     node.classList.contains("rr-coverage")).length, 0);
-  assert.ok(text.includes("覆盖：10 / 20"));
+  assert.ok(text.includes("已提交提取文字 50% · 10 / 20 字符"));
   assert.equal(text.includes("Second PDF cached overview."), false);
   assert.equal(text.includes("Synthetic Alpha"), false);
   assert.equal(descendants(h.document.body, node => node.localName === "select"
@@ -1602,17 +1610,14 @@ test("mount reuses only the current PDF cache and renders no catalog or attachme
   assertNoCatalog(h);
 });
 
-test("status, notes, checklist, explicit notes, analysis and chat stay scoped without catalog enumeration", async () => {
-  const h = await fixture({ cached: true });
+test("status, notes, explicit notes, analysis and chat stay scoped without catalog enumeration", async () => {
+  const legacyChecklist = { problem: true, method: true };
+  const h = await fixture({ cached: true, legacyChecklist });
   button(h.document.body, "已读").click();
   await tick();
   const notes = notesInput(h);
   notes.value = "current-parent notes";
   notes.dispatchEvent({ type: "input" });
-  const checklist = descendants(h.document.body, node => node.localName === "input"
-    && node.getAttribute("type") === "checkbox")[0];
-  checklist.checked = true;
-  checklist.dispatchEvent({ type: "change" });
   button(h.document.body, "保存为新的 Zotero 分析笔记").click();
   button(h.document.body, "同步阅读记录到个人库笔记").click();
   button(h.document.body, "AI 分析").click();
@@ -1622,7 +1627,13 @@ test("status, notes, checklist, explicit notes, analysis and chat stay scoped wi
   await tick();
   await h.switchContext(gammaContext(h));
   assert.ok(h.service.calls.some(call => call.type === "setState"
-    && call.item.id === 2 && call.patch.notes === "current-parent notes" && call.patch.checklist.problem === true));
+    && call.item.id === 2 && call.patch.status === "read"));
+  assert.ok(h.service.calls.some(call => call.type === "setState"
+    && call.item.id === 2 && call.patch.notes === "current-parent notes"));
+  assert.equal(h.readings.get(2).status, "read");
+  assert.deepEqual(h.readings.get(2).checklist, legacyChecklist);
+  assert.equal(h.service.calls.some(call => call.type === "setState"
+    && Object.hasOwn(call.patch, "checklist")), false);
   for (const type of ["saveAnalysisNote", "syncStateNote", "analyze", "askPaper"]) {
     assert.equal(h.service.calls.find(call => call.type === type)?.item.id, 2, type);
   }
@@ -1748,28 +1759,33 @@ test("switching current Zotero context flushes dirty notes before reading the ne
   assertNoCatalog(h);
 });
 
-test("switching PDFs of the same parent shares notes and checklist while keeping attachment caches separate", async () => {
-  const h = await fixture({ cached: true });
+test("switching PDFs shares notes and preserves hidden legacy checklist data while keeping attachment caches separate", async () => {
+  const legacyChecklist = { problem: true, evidence: false, notes: true };
+  const h = await fixture({ cached: true, legacyChecklist });
+  assert.equal(descendants(h.document.body, node => node.localName === "input"
+    && node.getAttribute("type") === "checkbox").length, 0);
+  assert.equal(descendants(h.document.body, node => node.classList.contains("rr-checklist")).length, 0);
+  assert.equal(textOf(h.document.body).includes("确认研究问题与范围"), false);
   const notes = notesInput(h);
   notes.value = "shared parent notes";
   notes.dispatchEvent({ type: "input" });
-  const checklist = descendants(h.document.body, node => node.localName === "input"
-    && node.getAttribute("type") === "checkbox")[0];
-  checklist.checked = true;
-  checklist.dispatchEvent({ type: "change" });
   await h.switchContext(secondPDFContext(h));
   assert.equal(notes.value, "shared parent notes");
   assert.ok(textOf(h.document.body).includes("Second PDF cached overview."));
-  assert.equal(h.readings.get(2).checklist.problem, true);
+  assert.deepEqual(h.readings.get(2).checklist, legacyChecklist);
   h.readers.set("reader-tab-2", { itemID: 101, async navigate() {} });
   await h.switchContext(h.nativeContext);
   assert.equal(notes.value, "shared parent notes");
   assert.ok(textOf(h.document.body).includes("Cached overview."));
   assert.equal(textOf(h.document.body).includes("Second PDF cached overview."), false);
+  assert.deepEqual(h.readings.get(2).checklist, legacyChecklist);
+  assert.equal(h.service.calls.some(call => call.type === "setState"
+    && Object.hasOwn(call.patch, "checklist")), false);
 });
 
 test("a failed context switch retains dirty notes and retries the save on the next host update", async () => {
-  const h = await fixture();
+  const legacyChecklist = { evidence: true, comparison: false };
+  const h = await fixture({ legacyChecklist });
   const notes = notesInput(h);
   notes.value = "keep this after a disk failure";
   notes.dispatchEvent({ type: "input" });
@@ -1783,7 +1799,56 @@ test("a failed context switch retains dirty notes and retries the save on the ne
   h.service.setState = original;
   await h.switchContext(next);
   assert.equal(h.readings.get(2).notes, "keep this after a disk failure");
+  assert.deepEqual(h.readings.get(2).checklist, legacyChecklist);
   assert.equal(h.service.calls.filter(call => call.type === "describe").at(-1).item.id, 3);
+});
+
+test("exports retain saved notes, status and analysis while only JSON keeps legacy checklist data", async () => {
+  const legacyChecklist = { problem: true, evidence: false, method: true };
+  const h = await fixture({ cached: true, legacyChecklist,
+    contextOverrides: { embedded: false } });
+  const exports = [];
+  h.context.ChromeUtils = {
+    importESModule() {
+      return { FilePicker: class {
+        modeSave = 0;
+        returnOK = 0;
+        returnReplace = 1;
+        file = "/synthetic/export";
+        init() {}
+        appendFilter() {}
+        async show() { return this.returnOK; }
+      } };
+    },
+  };
+  h.context.IOUtils = {
+    async writeUTF8(_path, content) { exports.push(content); },
+  };
+  button(h.document.body, "已读").click();
+  await tick();
+  const notes = notesInput(h);
+  notes.value = "Author's actual notes.\n- [x] My own evidence reminder";
+  notes.dispatchEvent({ type: "input" });
+  await h.timers.at(-1)();
+  button(h.document.body, "导出 Markdown").click();
+  await tick();
+  const markdown = exports.at(-1);
+  assert.ok(markdown.includes(notes.value));
+  assert.ok(markdown.includes("阅读状态：已读"));
+  assert.ok(markdown.includes("## AI 解读（待核对）"));
+  assert.ok(markdown.includes("Cached overview."));
+  assert.ok(markdown.includes("## 覆盖范围与限制"));
+  assert.equal(markdown.includes("## 核对清单"), false);
+  assert.equal(markdown.includes("确认研究问题与范围"), false);
+  button(h.document.body, "导出 JSON").click();
+  await tick();
+  const exported = JSON.parse(exports.at(-1));
+  assert.equal(exported.state.notes, notes.value);
+  assert.equal(exported.state.status, "read");
+  assert.deepEqual(exported.state.checklist, legacyChecklist);
+  assert.deepEqual(h.readings.get(2).checklist, legacyChecklist);
+  assert.equal(h.service.calls.some(call => call.type === "setState"
+    && Object.hasOwn(call.patch, "checklist")), false);
 });
 
 test("changing context cancels only this view's owned signals and ignores late analysis and chat results", async () => {
@@ -1902,7 +1967,7 @@ test("a late status save from the previous parent cannot replace the current par
   assert.equal(textOf(h.document.body).includes("阅读状态已保存，并同步为原生标签"), false);
 });
 
-test("new analysis coverage discloses complete extraction separately from page coverage", async () => {
+test("new analysis coverage discloses complete text submission without a section matrix", async () => {
   const h = await fixture({ cached: true, cachedCoverage: {
     analysisPlanVersion: 1,
     selectionStrategy: "complete-source",
@@ -1917,20 +1982,25 @@ test("new analysis coverage discloses complete extraction separately from page c
     ],
   } });
   const panel = descendants(h.document.body, node =>
-    node.classList.contains("rr-coverage"))[0];
+    node.classList.contains("rr-analysis-source"))[0];
   assert.ok(panel);
-  assert.equal(panel.localName, "details");
+  assert.equal(descendants(h.document.body, node => node.classList.contains("rr-coverage")).length, 0);
   const text = textOf(panel);
-  assert.ok(text.includes("选中文字：200 / 200 字符"));
-  assert.ok(text.includes("PDF 文本抽取：20 / 20 页"));
-  assert.match(text, /已提交全部可提取文字/);
-  assert.match(text, /结构线索覆盖（自动识别，需核对）/);
-  assert.ok(text.includes("方法选中 100 / 100 字符"));
-  assert.match(text, /字符覆盖范围也不能证明模型已理解全文/);
+  assert.ok(text.includes("已提交提取文字 100%"));
+  assert.ok(text.includes("200 / 200 字符"));
+  assert.ok(text.includes("可提取 PDF 文本：20 / 20 页"));
+  assert.equal(text.includes("未提交；相关部分可能未被涵盖"), false);
+  // The section matrix and page ranges are gone, and saved section hints are
+  // not rendered even though they remain in stored coverage data.
+  assert.equal(/结构线索|方法选中|未选中/.test(text), false);
+  assert.equal(descendants(panel, node =>
+    node.classList.contains("rr-coverage-section")).length, 0);
+  assert.equal(descendants(panel, node =>
+    node.classList.contains("rr-coverage-sections")).length, 0);
   assert.equal(/synthetic|api.?key|path=/i.test(text), false);
 });
 
-test("sampled coverage marks omitted and unselected late sections without inferring absence", async () => {
+test("sampled coverage states omitted text without inferring absent sections", async () => {
   const h = await fixture({ cached: true, cachedCoverage: {
     analysisPlanVersion: 1,
     selectionStrategy: "section-position-heuristic",
@@ -1946,18 +2016,17 @@ test("sampled coverage marks omitted and unselected late sections without inferr
       { hint: "results", totalCharacters: 100, selectedCharacters: 100 },
     ],
   } });
-  const text = textOf(descendants(h.document.body, node =>
-    node.classList.contains("rr-coverage"))[0]);
-  assert.ok(text.includes("选中文字：650 / 1,000 字符"));
-  assert.ok(text.includes("PDF 文本抽取：18 / 20 页"));
-  assert.match(text, /有 350 字符未进入本次分析/);
-  assert.ok(text.includes("实验选中 0 / 250 字符 · 未选中"));
-  assert.ok(text.includes("附录选中 0 / 250 字符 · 未选中"));
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("已提交提取文字 65%"));
+  assert.ok(text.includes("650 / 1,000 字符"));
+  assert.ok(text.includes("可提取 PDF 文本：18 / 20 页"));
+  assert.match(text, /有 350 字符未提交；相关部分可能未被涵盖/);
   assert.equal(text.includes("已提交全部可提取文字"), false);
+  assert.equal(/实验选中|附录选中|未选中/.test(text), false);
   assert.equal(/没有实验|实验未报告/.test(text), false);
 });
 
-test("coverage clamps malformed counts and shows only known section labels as text", async () => {
+test("coverage clamps malformed counts and never prints unknown section hints", async () => {
   const h = await fixture({ cached: true, cachedCoverage: {
     analysisPlanVersion: 1,
     selectionStrategy: "section-position-heuristic",
@@ -1972,11 +2041,114 @@ test("coverage clamps malformed counts and shows only known section labels as te
     ],
   } });
   const panel = descendants(h.document.body, node =>
-    node.classList.contains("rr-coverage"))[0];
+    node.classList.contains("rr-analysis-source"))[0];
   const text = textOf(panel);
-  assert.ok(text.includes("选中文字：0 / 12 字符"));
-  assert.match(text, /未识别段落/);
-  assert.ok(text.includes("方法选中 0 / 0 字符 · 未选中"));
+  assert.ok(text.includes("已提交提取文字 0%"));
+  assert.ok(text.includes("0 / 12 字符"));
+  assert.ok(text.includes("可提取 PDF 文本：3 / 4 页"));
+  assert.equal(/未识别段落|方法选中|<img/.test(text), false);
   assert.equal(descendants(panel, node => node.localName === "img").length, 0);
   assert.equal(text.includes("onerror"), false);
+});
+
+test("standalone figure panel is gone while figure references keep inline page navigation", async () => {
+  const quote = "As shown in Figure 3, our method reduces latency by 41%.";
+  const h = await fixture({ cached: true, cachedAnalysisPatch: {
+    readingGuide: "Verify the latency baseline in Section 5.2 and the ablation in Table 4.",
+    overviewEvidence: [{ quote, pageIndex: 6, verified: true, attachmentKey: "ATTACH01" }],
+    figureTableReferences: [{
+      reference: "Figure 3", kind: "figure",
+      explanation: "Reports the latency comparison.", quote,
+      pageIndex: 6, verified: true, candidate: true,
+      requiresVerification: true, visualVerified: false,
+    }],
+  } });
+  const text = textOf(h.document.body);
+  // The standalone 论文图表 section, its cards and its preview container are
+  // not rendered at all.
+  assert.equal(text.includes("论文图表"), false);
+  assert.equal(/预览仅显示|加载原页|图表所在原文页|rr-figure/.test(text), false);
+  for (const className of ["rr-figure-section", "rr-figure-card",
+    "rr-figure-grid", "rr-figure-preview"]) {
+    assert.equal(descendants(h.document.body,
+      node => node.classList.contains(className)).length, 0, className);
+  }
+  // Model evidence remains inside its analysis paragraph; no replacement
+  // standalone figure-reference list is introduced.
+  assert.equal(text.includes("图表文字引用"), false);
+  const savedReferences = structuredClone(h.readings.get(2).analysis.figureTableReferences);
+  const navigations = [];
+  h.context.Zotero.Reader.getByTabID = tabID => ({
+    tabID, itemID: 101, async navigate(location) { navigations.push(location); },
+  });
+  const inline = button(h.document.body, `“${quote}”`);
+  assert.ok(inline);
+  inline.click();
+  await tick();
+  await tick();
+  assert.deepEqual(JSON.parse(JSON.stringify(navigations)),
+    [{ pageIndex: 6 }]);
+  assert.ok(textOf(h.document.body).includes("已跳到 Zotero 原生 PDF 第 7 页。"));
+  assert.deepEqual(h.readings.get(2).analysis.figureTableReferences, savedReferences);
+});
+
+test("reading guidance is labelled as specific verification targets, not a page route", async () => {
+  const h = await fixture({ cached: true });
+  const text = textOf(h.document.body);
+  assert.ok(text.includes("精读重点"));
+  assert.ok(text.includes("Read methods first."));
+  assert.ok(text.includes("帮助你定位值得核查的问题及其原文依据"));
+  assert.equal(text.includes("阅读路径"), false);
+});
+
+test("viewing a saved analysis issues no further HTTP or model requests", async () => {
+  const h = await fixture({ cached: true, cachedCoverage: {
+    analysisPlanVersion: 1,
+    selectionStrategy: "complete-source",
+    analyzedCharacters: 200,
+    extractedCharacters: 200,
+    omittedCharacters: 0,
+    extractedPages: 20,
+    totalPages: 20,
+  } });
+  const requests = [];
+  h.context.fetch = (input) => {
+    requests.push(input);
+    throw new Error("viewing a cached analysis must not fetch");
+  };
+  assert.equal(descendants(h.document.body, node => node.classList.contains("rr-coverage")).length, 0);
+  await tick();
+  await h.switchContext(secondPDFContext(h));
+  await tick();
+  assert.deepEqual(requests, []);
+  assert.equal(h.service.calls.some(call => call.type === "analyze"), false);
+  assert.equal(h.service.calls.some(call =>
+    ["listModels", "listConfiguredModels", "askPaper"].includes(call.type)), false);
+});
+
+test("legacy coverage figures are shown inline without mutating the saved analysis", async () => {
+  const savedAnalysis = {
+    ...structuredClone({
+      mode: "model", model: "cached-model", provider: "openai",
+      overview: "Cached overview.", readingGuide: "Read methods first.",
+      overviewEvidence: [], readingGuideEvidence: [],
+      dimensions: [], figureTableReferences: [], limitations: [],
+    }),
+    coverage: {
+      analyzedCharacters: 30, extractedCharacters: 120,
+      extractedPages: 5, totalPages: 9,
+      sections: [{ hint: "methods", totalCharacters: 60, selectedCharacters: 30 }],
+    },
+  };
+  const h = await fixture({ cached: true, cachedAnalysisPatch: savedAnalysis });
+  const savedSnapshot = structuredClone(h.readings.get(2).analysis);
+  const text = textOf(h.document.body);
+  // No versioned panel, but the same compact, honest submission numbers.
+  assert.equal(descendants(h.document.body, node =>
+    node.classList.contains("rr-coverage")).length, 0);
+  assert.ok(text.includes("已提交提取文字 25% · 30 / 120 字符"));
+  assert.equal(text.includes("论文图表"), false);
+  assert.equal(text.includes("结构线索"), false);
+  assert.deepEqual(h.readings.get(2).analysis, savedSnapshot);
+  assert.equal(h.service.calls.some(call => call.type === "setState"), false);
 });

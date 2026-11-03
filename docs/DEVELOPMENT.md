@@ -10,7 +10,7 @@
 | `addon/content/core.js` | 无文件/网络访问的状态、分页、AI 输出与证据校验、提供商和端点规范化；不生成抽取式预读 |
 | `addon/content/service.js` | 当前论文状态/笔记、配置和 OSKeyStore 凭据、AI 缓存/对话与多协议请求、PDF worker；旧目录/批量 API 仅兼容保留 |
 | `addon/content/reader.js` | 捆绑 PDF.js iframe、本机 PDF 字节、页码/查找、串行原页 PNG 和生命周期清理 |
-| `addon/content/room.*`、`addon/locale/` | 阅读室与宿主入口、样式、语言资源 |
+| `addon/content/room.*`、`addon/locale/` | 阅读室与宿主入口、样式、语言资源；展示概览、精读重点、六维和内联证据，不提供固定人工核对框、范围/章节矩阵或独立图表卡片 |
 | `addon/content/sidebar.js` | 正常 PDF Reader section、所属标签及附件校验、单篇打开入口和宿主生命周期；不注册文献树状态列 |
 | `tests/core.test.mjs`、`tests/service.test.mjs`、`tests/fixtures/` | 虚构文库、PDF 提取结果、存储与 HTTP 测试适配器 |
 | `tests/package.test.mjs` | 独立读取 ZIP 结构、检查标准 CRC 向量、复现性、源文件边界与发布校验 |
@@ -48,6 +48,8 @@ node scripts/check.mjs --tag v0.2.0
 `ReadingRoomCore` 是纯逻辑接口，`ReadingRoomService` 持有存储、分析与笔记方法，`ReadingRoomUI` 管理宿主入口。提供商元数据由 `Core.API_PROVIDERS` 提供；模型发现接口为 `service.listModels({ provider, endpoint, apiKey, allowRemote, signal, item })`，返回规范化端点和 `{ id, name }` 模型项。开始分析时在 options 中传 `provider`。这些接口的真实行为以源码为准，详细路由和返回格式见 [API 提供商说明](API-PROVIDERS.md)。
 
 当前产品只辅助当前论文：Zotero 负责文库、收藏夹、查找及切换。插件启动、挂载和切换不调用全库枚举、目录、关注或批量 API；这些旧服务接口及侧文件关注字段仅兼容保留，没有界面入口或后台触发，不做迁移和清理。手动状态标签仍保留，主文献树自定义阅读状态列已移除。
+
+本轮展示精简移除固定五项人工核对框及其自动保存、Markdown 固定清单；笔记中的用户复选项原样保留。`checklist` 在侧文件、Core/Service、JSON 及显式原生状态笔记快照中继续兼容。范围详情/章节矩阵和独立图表卡片移除后，简要提交／提取文字覆盖及限制、内联引文导航和按需原页预览仍保留；后端覆盖字段、图表候选、校验、缓存和 JSON 不变。`readingGuide` 的显示标题为“精读重点”，具体核对问题及章节/图表定位沿用现有默认指令，不修改提示词或输出协议、不刷新缓存，也不代表新增视觉理解或已验证模型质量提升。参考位置见 [REFERENCE-CODE.md](REFERENCE-CODE.md)，验收项见 [TESTING.md](TESTING.md)。
 
 `sidebar.viewContext` 仅接受 `props.tabType === "reader"`，从所属 `item-details.tabID` 调用 `Zotero.Reader.getByTabID(tabID)`，核对 Reader 的 PDF 附件、有效父论文、同库关系及 section 条目归属。传给 iframe 的身份字段为 `tabID`、`itemID`（兼容字段，值为父论文 ID）、`parentItemID`、`attachmentID`、`attachmentKey`，`mountWindow` 与 `updateContext` 保持同一契约。不能按父论文寻找第一个 PDF，也不能使用缓存的 tabID 代替缺失的宿主标签。缺失/不匹配时禁用并移除该视图；Reader 稍后就绪后允许 `onRender` 重试。工具菜单和所选条目右键仍可显式打开单篇正常 PDF，库列表不挂载阅读室，也不新建顶层阅读室窗口。
 
